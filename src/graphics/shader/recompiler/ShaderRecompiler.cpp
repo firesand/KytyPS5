@@ -524,7 +524,8 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 		return value;
 	};
 	Register = [&](uint32_t before, uint32_t code) -> Value {
-		const auto index = CFG::FindScalarDefinition(source.decoded, graph, before, code);
+		const auto index = CFG::FindScalarDefinition(source.decoded, graph, before, code,
+		                                               options.wave_size);
 		if (index == UINT32_MAX) {
 			EXIT_IF(code < query.user_data_base || code - query.user_data_base >= query.user_data_count);
 			return IREmitter(&block).GetUserData(static_cast<ScalarReg>(code));

@@ -3,6 +3,7 @@
 #include "common/assert.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <fmt/format.h>
 #include <iterator>
 #include <deque>
@@ -1680,34 +1681,68 @@ Graph Structurize(const Graph& graph) {
 	return GotoStructurizer(graph).Run();
 }
 
-bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code) {
+bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code, uint32_t wave_size) {
 	uint32_t destination = UINT32_MAX;
+	if (InstructionWritesScalarCode(inst, code)) return true;
+	if (!ScalarOperandCode(inst.dst, destination) || code != destination + 1u) return false;
 	// Scalar ALU pair widths are not all decoded. The typed producer must confirm this word.
-	return InstructionWritesScalarCode(inst, code) ||
-	       (ScalarOperandCode(inst.dst, destination) && code == destination + 1u);
+	// Scalar ALU/memory ops without a 64-bit operand size (S_MOV_B32, S_ADD_U32, ...) and lane
+	// reads write a single SGPR; a false pair hit here would hide definitions reaching from
+	// other paths.
+	const auto name = magic_enum::enum_name(inst.opcode);
+	if (name.starts_with("V_READLANE_") || name.starts_with("V_READFIRSTLANE_")) return false;
+	// Vector SGPR destinations are lane masks (compares, carries): one SGPR in wave32.
+	if (wave_size == 32u && name.starts_with("V_")) return false;
+	return !(name.starts_with("S_") && name.find("64") == std::string_view::npos);
 }
 
 uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
-                              uint32_t before, uint32_t code) {
+                              uint32_t before, uint32_t code, uint32_t wave_size) {
 	EXIT_IF(before >= program.instructions.size());
 	const auto found = std::ranges::find_if(graph.blocks, [before](const auto& block) {
 		return block.inst_begin <= before && before < block.inst_end;
 	});
 	EXIT_IF(found == graph.blocks.end());
-	const auto* block = &*found;
-	for (size_t depth = 0; depth < graph.blocks.size(); ++depth) {
-		for (uint32_t i = before; i > block->inst_begin;) {
+	// Join points are common (e.g. the call target is written once, ahead of an if/else that
+	// merges before the call). Every incoming path must reach the same definition; a path that
+	// re-enters a block already on the search stack contributes nothing (loop back edge).
+	constexpr uint32_t        no_path = UINT32_MAX - 1u;
+	std::map<uint32_t, uint32_t> block_result;
+	std::vector<uint32_t>        on_stack;
+	auto search = [&](auto& self, const BasicBlock* block, uint32_t end) -> uint32_t {
+		for (uint32_t i = end; i > block->inst_begin;) {
 			const auto& inst = program.instructions[--i];
 			EXIT_IF(inst.opcode == Opcode::S_SWAPPC_B64);
-			if (MayWriteScalarRegister(inst, code)) return i;
+			if (MayWriteScalarRegister(inst, code, wave_size)) return i;
 		}
 		if (block->id == graph.entry_block) return UINT32_MAX;
-		EXIT_IF(block->predecessors.size() != 1u);
-		block = graph.FindBlock(block->predecessors[0]);
-		EXIT_IF(block == nullptr);
-		before = block->inst_end;
-	}
-	EXIT("scalar shader call source has cyclic reaching definitions");
+		EXIT_IF(block->predecessors.empty());
+		auto result = no_path;
+		on_stack.push_back(block->id);
+		for (const auto id: block->predecessors) {
+			if (std::ranges::find(on_stack, id) != on_stack.end()) continue;
+			const auto* pred = graph.FindBlock(id);
+			EXIT_IF(pred == nullptr);
+			auto memo = block_result.find(id);
+			const auto found = memo != block_result.end()
+			                       ? memo->second
+			                       : block_result[id] = self(self, pred, pred->inst_end);
+			if (found == no_path) continue;
+			if (result != no_path && result != found) {
+				std::printf("%s\n%s\n", Decoder::ProgramToString(program).c_str(),
+				            GraphToString(graph).c_str());
+				EXIT("scalar shader call source s%u has conflicting reaching definitions "
+				     "(instructions %u and %u)\n",
+				     code, result, found);
+			}
+			result = found;
+		}
+		on_stack.pop_back();
+		return result;
+	};
+	const auto result = search(search, &*found, before);
+	EXIT_IF(result == no_path);
+	return result;
 }
 
 std::string BranchConditionToString(BranchCondition condition) {
