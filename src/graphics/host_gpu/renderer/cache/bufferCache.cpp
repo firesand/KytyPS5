@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/perfStats.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -144,6 +145,7 @@ void BufferCache::DeleteBuffer(BufferId id) {
 
 template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	PerfStats::Count(PerfStats::g_counters.downloads);
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -415,6 +417,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	                         vaddr >= buffer.clean_begin && vaddr <= buffer.clean_end &&
 	                         size <= buffer.clean_end - vaddr;
 	if (!known_clean) {
+		PerfStats::Count(PerfStats::g_counters.buffer_scans);
 		m_memory_tracker.ForEachUploadRange(
 		    vaddr, size, is_written,
 		    [&](uint64_t address, uint64_t bytes) noexcept {
@@ -493,6 +496,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
+	PerfStats::Count(PerfStats::g_counters.buffer_binds);
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");

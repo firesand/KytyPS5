@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
+#include "graphics/host_gpu/renderer/perfStats.h"
 
 #include "common/assert.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -46,6 +47,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	if (IsFree(tick)) {
 		return;
 	}
+	PerfStats::Count(PerfStats::g_counters.gpu_waits);
 
 	vk::SemaphoreWaitInfo wait_info {};
 	wait_info.semaphoreCount = 1;

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/sync.h"
+#include "graphics/host_gpu/renderer/perfStats.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -158,6 +159,7 @@ void WriteAtEndOfPipeWithInterrupt32(uint64_t submit_id, CommandBuffer& buffer,
 
 uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index, int flip_mode,
                              int64_t flip_arg) {
+	PerfStats::Frame();
 	for (;;) {
 		uint64_t   request_id = 0;
 		auto&      video_out  = buffer.GetContext().GetVideoOut();

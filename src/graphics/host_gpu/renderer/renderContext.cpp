@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/perfStats.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -58,6 +59,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
+	PerfStats::Count(PerfStats::g_counters.faults);
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
@@ -122,6 +124,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		unmap();
 		return;
 	}
+	PerfStats::Count(PerfStats::g_counters.unmaps);
 	m_gpu->SendCommandSync(unmap);
 }
 
@@ -138,6 +141,7 @@ void RenderContext::PrepareBda() {
 	if (generation == m_bda_synced_generation) {
 		return;
 	}
+	PerfStats::Count(PerfStats::g_counters.bda_walks);
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
 		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
