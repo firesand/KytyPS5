@@ -90,6 +90,7 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
+	g_cpu_dirty_generation.fetch_add(1, std::memory_order_release);
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -113,6 +114,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
+		g_cpu_dirty_generation.fetch_add(1, std::memory_order_release);
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.
@@ -128,11 +130,19 @@ void RenderContext::PrepareBda() {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
 	}
+	m_fault_process_pending = true;
+	// Every draw with direct memory access lands here. The walk below visits each mapped range
+	// and cached buffer, which is only needed after a page was dirtied, a mapping changed, or a
+	// buffer was (un)registered; all three advance the generation.
+	const auto generation = g_cpu_dirty_generation.load(std::memory_order_acquire);
+	if (generation == m_bda_synced_generation) {
+		return;
+	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
 		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
 	});
-	m_fault_process_pending = true;
+	m_bda_synced_generation = generation;
 }
 
 void RenderContext::RunGarbageCollector() {

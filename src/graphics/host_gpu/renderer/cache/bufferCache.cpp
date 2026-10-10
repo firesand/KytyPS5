@@ -13,6 +13,9 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "kernel/memory.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <chrono>
 #include <algorithm>
 #include <cinttypes>
 #include <cstring>
@@ -91,6 +94,8 @@ void BufferCache::ChangeRegister(BufferId id) {
 			m_page_table[page] = {};
 		}
 	}
+	// The set of cached buffers changed: ranges verified clean must be revisited.
+	g_cpu_dirty_generation.fetch_add(1, std::memory_order_release);
 	const auto size_pages = pages.last_exclusive - pages.first;
 	const auto table_offset = PageIndex(buffer.CpuAddress()) * sizeof(vk::DeviceAddress);
 	if constexpr (insert) {
@@ -402,13 +407,27 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
-	m_memory_tracker.ForEachUploadRange(
-	    vaddr, size, is_written,
-	    [&](uint64_t address, uint64_t bytes) noexcept {
-		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
-		    total_size += bytes;
-	    },
-	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+	// Games bind multi-gigabyte ranges on every draw; rescanning them for dirty pages each time
+	// costs far more than the uploads. Nothing can have become dirty in a range that was
+	// scanned at the current generation.
+	const auto generation = g_cpu_dirty_generation.load(std::memory_order_acquire);
+	const bool known_clean = !is_written && buffer.clean_generation == generation &&
+	                         vaddr >= buffer.clean_begin && vaddr <= buffer.clean_end &&
+	                         size <= buffer.clean_end - vaddr;
+	if (!known_clean) {
+		m_memory_tracker.ForEachUploadRange(
+		    vaddr, size, is_written,
+		    [&](uint64_t address, uint64_t bytes) noexcept {
+			    copies.emplace_back(total_size, buffer.Offset(address), bytes);
+			    total_size += bytes;
+		    },
+		    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+		const bool extends = buffer.clean_generation == generation &&
+		                     vaddr <= buffer.clean_end && vaddr + size >= buffer.clean_begin;
+		buffer.clean_begin      = extends ? std::min(buffer.clean_begin, vaddr) : vaddr;
+		buffer.clean_end        = extends ? std::max(buffer.clean_end, vaddr + size) : vaddr + size;
+		buffer.clean_generation = generation;
+	}
 	if (source) {
 		auto& command = m_scheduler.Current();
 		command.EndRendering();

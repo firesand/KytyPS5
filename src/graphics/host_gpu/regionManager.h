@@ -77,6 +77,10 @@ private:
 
 static_assert(std::atomic_uint32_t::is_always_lock_free);
 
+// Advances whenever a page becomes CPU-dirty (including regions created dirty). A range that
+// was scanned clean at generation G needs no rescan while the generation is still G.
+inline std::atomic_uint64_t g_cpu_dirty_generation {1};
+
 class RegionManager final {
 public:
 	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
@@ -84,6 +88,7 @@ public:
 		if (m_cpu_addr % TRACKER_REGION_SIZE != 0) {
 			EXIT("invalid region tracking manager construction\n");
 		}
+		g_cpu_dirty_generation.fetch_add(1, std::memory_order_release);
 		m_cpu_dirty.Fill();
 		m_writable.Fill();
 		m_readable.Fill();
@@ -118,6 +123,10 @@ public:
 			bits.UnsetRange(start, end);
 		}
 		if constexpr (source == DirtySource::Cpu) {
+			UpdateCpuDirtyHint();
+			if constexpr (enable) {
+				g_cpu_dirty_generation.fetch_add(1, std::memory_order_release);
+			}
 			UpdateProtection<!enable, false>();
 		} else {
 			UpdateProtection<enable, true>();
@@ -135,6 +144,7 @@ public:
 		if constexpr (clear) {
 			bits.UnsetRange(start, end);
 			if constexpr (source == DirtySource::Cpu) {
+				UpdateCpuDirtyHint();
 				UpdateProtection<true, false>();
 			} else {
 				UpdateProtection<false, true>();
@@ -145,9 +155,20 @@ public:
 		}
 	}
 
+	// Lock-free hint: false means no page of this region is CPU-dirty, so a read-only upload
+	// scan may skip the region without taking its lock. Buffers bound over multi-gigabyte
+	// ranges would otherwise lock and scan every region on every draw.
+	[[nodiscard]] bool MayHaveCpuDirty() const noexcept {
+		return m_any_cpu_dirty.load(std::memory_order_acquire);
+	}
+
 	TrackingSpinLock lock;
 
 private:
+	void UpdateCpuDirtyHint() noexcept {
+		m_any_cpu_dirty.store(m_cpu_dirty.Any(), std::memory_order_release);
+	}
+
 	template <bool track, bool is_read>
 	void UpdateProtection() {
 		const auto protection = is_read ? ~m_gpu_dirty : m_cpu_dirty;
@@ -194,6 +215,8 @@ private:
 	RegionBits   m_gpu_dirty;
 	RegionBits   m_writable;
 	RegionBits   m_readable;
+	// m_cpu_dirty starts filled.
+	std::atomic_bool m_any_cpu_dirty {true};
 };
 
 } // namespace Libs::Graphics

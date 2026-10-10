@@ -72,6 +72,10 @@ public:
 	bool   is_deleted   = false;
 	int    stream_score = 0;
 	size_t lru_id       = 0;
+	// [clean_begin, clean_end) held no CPU-dirty pages at g_cpu_dirty_generation clean_generation.
+	uint64_t clean_generation = 0;
+	uint64_t clean_begin      = 0;
+	uint64_t clean_end        = 0;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }

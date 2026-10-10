@@ -84,6 +84,9 @@ public:
 		CheckNotInUploadCallback();
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
 		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			if (!is_written && !manager->MayHaveCpuDirty()) {
+				return;
+			}
 			manager->lock.lock();
 			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
 			                                                      bytes, range_func);
