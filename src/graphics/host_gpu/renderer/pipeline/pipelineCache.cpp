@@ -25,6 +25,7 @@
 #include <atomic>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
@@ -110,6 +111,52 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
 	return !values.empty() &&
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
+}
+
+// Debug aid: KYTY_DUMP_SHADER_INPUT=<hex shader hash> writes that shader's user data and the
+// guest memory behind each plausible user-data pointer pair the first few times it is requested.
+void DumpShaderInput(uint64_t hash, std::span<const uint32_t> user_data) {
+	static const uint64_t wanted = [] {
+		const char* value = std::getenv("KYTY_DUMP_SHADER_INPUT");
+		return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+	}();
+	static std::atomic_uint dumps = 0;
+	if (wanted == 0 || hash != wanted) {
+		return;
+	}
+	const auto index = dumps.fetch_add(1);
+	if (index >= 4u) {
+		return;
+	}
+	const auto name = fmt::format("shader_input_{:016x}_{}.bin", hash, index);
+	auto*      file = std::fopen(name.c_str(), "wb");
+	if (file == nullptr) {
+		return;
+	}
+	const auto count = static_cast<uint32_t>(user_data.size());
+	std::fwrite(&count, sizeof(count), 1, file);
+	std::fwrite(user_data.data(), sizeof(uint32_t), user_data.size(), file);
+	constexpr uint32_t    chunk = 0x10000;
+	std::vector<uint32_t> words(chunk / sizeof(uint32_t));
+	for (uint32_t i = 0; i + 1u < count; ++i) {
+		const uint64_t address = user_data[i] | (uint64_t {user_data[i + 1u] & 0xffffu} << 32u);
+		if (address < 0x100000000ull || (address & 3u) != 0u) {
+			continue;
+		}
+		std::vector<uint32_t> data;
+		for (uint32_t offset = 0; offset < 0x200000u; offset += chunk) {
+			if (!ReadShaderGuestMemory(nullptr, address + offset, words)) {
+				break;
+			}
+			data.insert(data.end(), words.begin(), words.end());
+		}
+		const auto bytes = static_cast<uint32_t>(data.size() * sizeof(uint32_t));
+		std::fwrite(&i, sizeof(i), 1, file);
+		std::fwrite(&address, sizeof(address), 1, file);
+		std::fwrite(&bytes, sizeof(bytes), 1, file);
+		std::fwrite(data.data(), sizeof(uint32_t), data.size(), file);
+	}
+	std::fclose(file);
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
@@ -349,6 +396,11 @@ struct PipelineCache::ProgramCache {
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts = input_info.workgroup_counts;
 		}
+		DumpShaderInput(params.hash, user_data);
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			static const bool trace = std::getenv("KYTY_SYNC_DISPATCH") != nullptr;
+			if (trace) std::printf("CS program hash=0x%016" PRIx64 "\n", params.hash);
+		}
 		bool source_changed = false;
 		if (entry != programs.end()) {
 			auto& cached = entry->second;
@@ -485,6 +537,20 @@ struct PipelineCache::ProgramCache {
 
 	explicit ProgramCache(vk::Device device): device(device) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
+		// KYTY_SKIP_SHADERS=<hex hash>[,<hex hash>...]: compute shaders to skip outright, for
+		// working around shaders that hang or crash the host GPU.
+		if (const char* list = std::getenv("KYTY_SKIP_SHADERS"); list != nullptr) {
+			for (const char* cursor = list; *cursor != '\0';) {
+				char*      end  = nullptr;
+				const auto hash = std::strtoull(cursor, &end, 16);
+				if (end == cursor) break;
+				if (unsupported.insert(hash).second) {
+					std::printf("Warning: skipping shader 0x%016" PRIx64 " (KYTY_SKIP_SHADERS)\n",
+					            static_cast<uint64_t>(hash));
+				}
+				cursor = *end == ',' ? end + 1 : end;
+			}
+		}
 	}
 	~ProgramCache() {
 		for (const auto& [key, entry]: programs) {

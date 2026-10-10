@@ -27,6 +27,8 @@ namespace Libs::Graphics {
 vk::Format  VulkanFormat(Prospero::BufferFormat guest_format);
 void        RequireVulkanSuccess(vk::Result result, const char* operation);
 vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device);
+// Prints VK_EXT_device_fault details (faulting addresses, vendor codes) after a device loss.
+void        ReportDeviceFault(vk::Device device);
 
 template <typename Handle, typename... Args>
 void SetVulkanObjectNameF(vk::Device device, Handle handle, fmt::format_string<Args...> format,

@@ -4,6 +4,9 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 
 #include <array>
+#include <cinttypes>
+#include <cstdio>
+#include <vector>
 
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 
@@ -132,6 +135,41 @@ vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device) {
 	RequireVulkanSuccess(device.createShaderModule(&create_info, nullptr, &module),
 	                     "create SPIR-V shader module");
 	return module;
+}
+
+void ReportDeviceFault(vk::Device device) {
+	if (device == nullptr || VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT == nullptr) {
+		return;
+	}
+	vk::DeviceFaultCountsEXT counts {};
+	if (device.getFaultInfoEXT(&counts, nullptr) != vk::Result::eSuccess) {
+		return;
+	}
+	std::vector<vk::DeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+	std::vector<vk::DeviceFaultVendorInfoEXT>  vendors(counts.vendorInfoCount);
+	counts.vendorBinarySize = 0;
+	vk::DeviceFaultInfoEXT info {};
+	info.pAddressInfos = addresses.data();
+	info.pVendorInfos  = vendors.data();
+	const auto result  = device.getFaultInfoEXT(&counts, &info);
+	if (result != vk::Result::eSuccess && result != vk::Result::eIncomplete) {
+		return;
+	}
+	std::printf("Vulkan device fault: %s\n", info.description.data());
+	for (uint32_t i = 0; i < counts.addressInfoCount; ++i) {
+		const auto& address = addresses[i];
+		std::printf("  address fault: %s at 0x%016" PRIx64 " (precision 0x%" PRIx64 ")\n",
+		            vk::to_string(address.addressType).c_str(),
+		            static_cast<uint64_t>(address.reportedAddress),
+		            static_cast<uint64_t>(address.addressPrecision));
+	}
+	for (uint32_t i = 0; i < counts.vendorInfoCount; ++i) {
+		const auto& vendor = vendors[i];
+		std::printf("  vendor fault: %s code=0x%" PRIx64 " data=0x%" PRIx64 "\n",
+		            vendor.description.data(), static_cast<uint64_t>(vendor.vendorFaultCode),
+		            static_cast<uint64_t>(vendor.vendorFaultData));
+	}
+	std::fflush(stdout);
 }
 
 } // namespace Libs::Graphics

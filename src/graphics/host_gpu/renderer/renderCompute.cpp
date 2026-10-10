@@ -25,6 +25,9 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -222,6 +225,14 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 		}
 	}
 	bindings.shared_memory = {storage.Handle(), 0, size};
+}
+
+static bool SyncDispatchDebugEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SYNC_DISPATCH");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
 }
 
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
@@ -438,6 +449,17 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
+	if (SyncDispatchDebugEnabled()) {
+		// Debug aid (KYTY_SYNC_DISPATCH=1): run each dispatch to completion so a GPU hang or
+		// device loss is attributable to the last shader logged.
+		std::printf("CS dispatch shader=0x%016" PRIx64 " id=%" PRIu64 " groups=%ux%ux%u ...",
+		            cs_regs.cs_regs.data_addr, compute_program.id, thread_group_x, thread_group_y,
+		            thread_group_z);
+		std::fflush(stdout);
+		m_context.GetCommandScheduler().FlushAndWait();
+		std::printf(" done\n");
+		std::fflush(stdout);
+	}
 }
 
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
