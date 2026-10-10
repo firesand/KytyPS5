@@ -22,6 +22,10 @@
 #include <string>
 #include <thread>
 
+#ifndef KYTY_WIN_CS
+#include <pthread.h>
+#endif
+
 #ifdef KYTY_WIN_CS
 #include <windows.h> // IWYU pragma: keep
 // IWYU pragma: no_include <winbase.h>
@@ -380,6 +384,37 @@ void CondVar::SignalAll() {
 int Thread::GetThreadIdUnique() {
 	static thread_local int tid = ++g_thread_counter;
 	return tid;
+}
+
+void RunWithStack(size_t stack_bytes, const std::function<void()>& func) {
+	auto* arg = const_cast<std::function<void()>*>(&func);
+#ifdef KYTY_WIN_CS
+	auto* handle = ::CreateThread(
+	    nullptr, stack_bytes,
+	    [](LPVOID context) -> DWORD {
+		    (*static_cast<std::function<void()>*>(context))();
+		    return 0;
+	    },
+	    arg, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+	EXIT_IF(handle == nullptr);
+	::WaitForSingleObject(handle, INFINITE);
+	::CloseHandle(handle);
+#else
+	pthread_attr_t attr;
+	EXIT_IF(pthread_attr_init(&attr) != 0);
+	EXIT_IF(pthread_attr_setstacksize(&attr, stack_bytes) != 0);
+	pthread_t thread {};
+	const int result = pthread_create(
+	    &thread, &attr,
+	    [](void* context) -> void* {
+		    (*static_cast<std::function<void()>*>(context))();
+		    return nullptr;
+	    },
+	    arg);
+	pthread_attr_destroy(&attr);
+	EXIT_IF(result != 0);
+	pthread_join(thread, nullptr);
+#endif
 }
 
 } // namespace Common

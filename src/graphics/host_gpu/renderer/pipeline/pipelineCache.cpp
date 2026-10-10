@@ -28,6 +28,8 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
+#include <optional>
+#include <unordered_set>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
@@ -127,6 +129,8 @@ void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
 	}
 	file.Write(spirv.data(), spirv.size() * sizeof(uint32_t));
 }
+
+constexpr size_t ShaderCompileStackBytes = size_t {256} << 20u;
 
 void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
                         std::span<const uint32_t> code) {
@@ -404,20 +408,36 @@ struct PipelineCache::ProgramCache {
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
 		ShaderRecompiler::ShaderSource source;
-		if (entry == programs.end()) source = ShaderRecompiler::PrepareShaderSource(params.code, options);
+		if (entry == programs.end()) {
+			if (unsupported.contains(params.hash)) return {};
+			source = ShaderRecompiler::PrepareShaderSource(params.code, options);
+			if (!source.unsupported.empty()) {
+				std::printf("Warning: skipping %s shader 0x%016" PRIx64 ": %.*s\n", stage_name,
+				            params.hash, static_cast<int>(source.unsupported.size()),
+				            source.unsupported.data());
+				unsupported.insert(params.hash);
+				return {};
+			}
+		}
 		auto* current = entry == programs.end() ? &source : entry->second.call_source.get();
 		ShaderRecompiler::TranslateResult translated;
-		if (current != nullptr) {
-			if (current->call) {
-				if (entry == programs.end()) ShaderRecompiler::RefreshShaderSource(*current, runtime);
-				translated = ShaderRecompiler::TranslateProgram(current->linked->decoded, options);
-				translated.program.source_reads = current->reads;
-			} else {
-				translated = ShaderRecompiler::TranslateProgram(current->decoded, options);
-			}
-		} else {
-			translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		if (current != nullptr && current->call && entry == programs.end()) {
+			ShaderRecompiler::RefreshShaderSource(*current, runtime);
 		}
+		// The recompiler passes recurse over the IR; linked call tables can inline tens of
+		// thousands of instructions, far deeper than a default thread stack allows.
+		Common::RunWithStack(ShaderCompileStackBytes, [&] {
+			if (current != nullptr) {
+				if (current->call) {
+					translated = ShaderRecompiler::TranslateProgram(current->linked->decoded, options);
+					translated.program.source_reads = current->reads;
+				} else {
+					translated = ShaderRecompiler::TranslateProgram(current->decoded, options);
+				}
+			} else {
+				translated = ShaderRecompiler::TranslateProgram(params.code, options);
+			}
+		});
 		if (entry == programs.end()) {
 			auto retained = source.call ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
 			entry = programs.try_emplace(lookup_key,
@@ -433,9 +453,13 @@ struct PipelineCache::ProgramCache {
 				return permutation->handle;
 			}
 		}
-		entry->second.permutations.push_back(CompilePermutation(
-		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
-		    entry->second.FunctionCode()));
+		std::optional<Permutation> compiled;
+		Common::RunWithStack(ShaderCompileStackBytes, [&] {
+			compiled = CompilePermutation(stage_name, options, std::move(translated),
+			                              entry->second.specialization, push_data_cursor,
+			                              entry->second.FunctionCode());
+		});
+		entry->second.permutations.push_back(std::move(*compiled));
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
@@ -455,6 +479,9 @@ struct PipelineCache::ProgramCache {
 		            counts[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
 		return permutation.handle;
 	}
+
+	// Shaders the recompiler cannot translate yet; their work is skipped.
+	std::unordered_set<uint64_t> unsupported;
 
 	explicit ProgramCache(vk::Device device): device(device) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);

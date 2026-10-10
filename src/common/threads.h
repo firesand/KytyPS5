@@ -3,12 +3,18 @@
 
 #include "common/common.h"
 
+#include <cstddef>
+#include <functional>
 #include <memory>
 #include <string>
 
 namespace Common {
 
 void InitializeThreads();
+
+// Runs `func` to completion on a temporary thread whose stack reserves `stack_bytes`. For deeply
+// recursive work such as recompiling very large (linked) guest shaders.
+void RunWithStack(size_t stack_bytes, const std::function<void()>& func);
 
 using thread_func_t    = void (*)(void*);
 using wait_poll_func_t = void (*)();

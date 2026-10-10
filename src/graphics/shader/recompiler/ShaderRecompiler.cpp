@@ -23,6 +23,10 @@
 #include <fmt/format.h>
 #include <functional>
 #include <map>
+#include <cstdlib>
+#include <cstdio>
+#include <cinttypes>
+#include <optional>
 #include <span>
 #include <utility>
 
@@ -481,6 +485,69 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 	return result;
 }
 
+bool LinkCallTablesEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_LINK_CALL_TABLES");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+struct CallTableMatch {
+	uint32_t load         = 0;
+	uint32_t entry_offset = 0;
+	uint32_t entry_stride = 0;
+	uint32_t compare_reg  = 0;
+};
+
+// Matches a call target pair copied (through S_MOV_B32) from one S_BUFFER_LOAD with a dynamic
+// offset, e.g. a waterfall loop over `table[readfirstlane(index)]`.
+std::optional<CallTableMatch> MatchCallTable(const Decoder::Program& program,
+                                             const CFG::Graph& graph, uint32_t call, uint32_t reg,
+                                             uint32_t wave_size) {
+	using Decoder::Opcode;
+	std::array<std::pair<uint32_t, uint32_t>, 2> loaded {};
+	for (uint32_t i = 0; i < 2u; ++i) {
+		uint32_t before = call;
+		uint32_t code   = reg + i;
+		for (uint32_t depth = 0;; ++depth) {
+			if (depth >= 16u) return std::nullopt;
+			const auto index = CFG::FindScalarDefinition(program, graph, before, code, wave_size);
+			if (index == UINT32_MAX) return std::nullopt;
+			const auto& inst = program.instructions[index];
+			if (inst.opcode == Opcode::S_MOV_B32 && inst.src0.kind == Decoder::OperandKind::Sgpr) {
+				before = index;
+				code   = inst.src0.reg;
+				continue;
+			}
+			const bool table_load = inst.opcode == Opcode::S_BUFFER_LOAD_DWORDX2 ||
+			                        inst.opcode == Opcode::S_BUFFER_LOAD_DWORDX4 ||
+			                        inst.opcode == Opcode::S_BUFFER_LOAD_DWORDX8 ||
+			                        inst.opcode == Opcode::S_BUFFER_LOAD_DWORDX16;
+			if (!table_load || inst.dst.kind != Decoder::OperandKind::Sgpr ||
+			    inst.src0.kind != Decoder::OperandKind::Sgpr || code < inst.dst.reg ||
+			    code - inst.dst.reg >= inst.data_dwords) {
+				return std::nullopt;
+			}
+			loaded[i] = {index, code};
+			break;
+		}
+	}
+	if (loaded[0].first != loaded[1].first || loaded[1].second != loaded[0].second + 1u) {
+		return std::nullopt;
+	}
+	// The dispatch compares the loaded low dword; it must still hold the target at the call.
+	if (CFG::FindScalarDefinition(program, graph, call, loaded[0].second, wave_size) !=
+	    loaded[0].first) {
+		return std::nullopt;
+	}
+	const auto& load = program.instructions[loaded[0].first];
+	return CallTableMatch {.load         = loaded[0].first,
+	                       .entry_offset = load.offset + (loaded[0].second - load.dst.reg) * 4u,
+	                       .entry_stride = load.data_dwords * 4u,
+	                       .compare_reg  = loaded[0].second};
+}
+
 void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 	using namespace IR;
 	for (uint32_t i = 0; i < source.decoded.instructions.size(); ++i) {
@@ -558,18 +625,55 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 		EXIT_IF(!producer.ready || !producer.values.contains(code));
 		return producer.values.at(code).Resolve();
 	};
-	for (uint32_t i = 0; i < 2u; ++i) {
-		const auto value = Register(source.call->instruction, call.src0.reg + i);
-		EXIT_IF(!ValidateRuntimeValue(query, value, RuntimeValueType::Integer));
+	const auto keep = [&](Value value) {
 		auto& root = query.value_storage.emplace_back(ValueOpcode::ReferenceU32);
 		root.SetArg(0, value);
-		source.call->target[i] = Value(&root);
+		return Value(&root);
+	};
+	std::array<Value, 2> targets;
+	bool uniform = true;
+	for (uint32_t i = 0; i < 2u; ++i) {
+		targets[i] = Register(source.call->instruction, call.src0.reg + i);
+		uniform = uniform && ValidateRuntimeValue(query, targets[i], RuntimeValueType::Integer);
+	}
+	if (uniform) {
+		for (uint32_t i = 0; i < 2u; ++i) source.call->target[i] = keep(targets[i]);
+	} else {
+		const auto match = MatchCallTable(source.decoded, graph, source.call->instruction,
+		                                  call.src0.reg, options.wave_size);
+		if (!match) {
+			EXIT("shader call at pc 0x%08x has a non-uniform target that is not a function-table "
+			     "load\n",
+			     call.pc);
+		}
+		// Table functions read their resources through per-entry (per-wave) data pointers,
+		// which resource tracking cannot resolve yet. Linking is opt-in until it can.
+		if (!LinkCallTablesEnabled()) {
+			source.unsupported = "non-uniform function-table call";
+			return;
+		}
+		const auto& load = source.decoded.instructions[match->load];
+		ShaderSource::Table table {.entry_offset = match->entry_offset,
+		                           .entry_stride = match->entry_stride,
+		                           .compare_reg  = match->compare_reg,
+		                           .wave_size    = options.wave_size};
+		for (uint32_t i = 0; i < 4u; ++i) {
+			const auto value = Register(match->load, load.src0.reg + i);
+			EXIT_IF(!ValidateRuntimeValue(query, value, RuntimeValueType::Integer));
+			table.descriptor[i] = keep(value);
+		}
+		source.call->table = table;
 	}
 	RewriteToSsa(query.blocks);
 	ConstantPropagationPass(query.blocks, query.wave_size);
 	RemoveIdentities(query.blocks);
 	EliminateDeadCode(query.blocks);
-	for (auto& value: source.call->target) value = value.Instruction()->Arg(0).Resolve();
+	if (source.call->table) {
+		for (auto& value: source.call->table->descriptor)
+			value = value.Instruction()->Arg(0).Resolve();
+	} else {
+		for (auto& value: source.call->target) value = value.Instruction()->Arg(0).Resolve();
+	}
 	query.value_storage.clear();
 	for (auto& inst: block) {
 		inst.SetParent(nullptr);
@@ -578,6 +682,200 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 	}
 	query.value_storage.splice(query.value_storage.end(), block.Instructions());
 	source.call_targets = std::move(static_cast<ResourcePlan&>(query));
+}
+
+
+// Inlines every distinct function of a call table behind a scalar dispatch on the loaded low
+// target dword. Virtual PCs follow the caller's decoded instructions: dispatch, then bodies.
+const Decoder::Program& LinkCallTable(ShaderSource& source, const IR::SrtRuntime& runtime) {
+	using Decoder::Opcode;
+	auto& reads = source.reads;
+	reads.clear();
+	IR::SrtReadCapture capture(runtime, reads);
+	const auto    clean = IR::CleanRuntime(capture.ObservedRuntime());
+	IR::SrtWalker walker(source.call_targets, clean);
+	const auto&   call  = source.decoded.instructions[source.call->instruction];
+	const auto&   table = *source.call->table;
+	const auto    wave_size = table.wave_size;
+	EXIT_NOT_IMPLEMENTED(table.compare_reg == call.dst.reg ||
+	                     table.compare_reg == call.dst.reg + 1u);
+	std::array<uint32_t, 4> descriptor {};
+	for (uint32_t i = 0; i < 4u; ++i) {
+		if (!walker.Evaluate(table.descriptor[i], descriptor[i])) {
+			EXIT("shader call at pc 0x%08x has an unavailable function table descriptor\n",
+			     call.pc);
+		}
+	}
+	const auto query_reads = reads.size();
+	const auto read        = [&](uint64_t address, std::span<uint32_t> words) {
+        return clean.read_memory(clean.userdata, address, words);
+	};
+	const auto record = [&](const ShaderSource::Linked& linked) {
+		reads.resize(query_reads);
+		for (const auto& [address, words]: linked.observed) {
+			reads.emplace_back(address, words.size() * sizeof(uint32_t));
+		}
+	};
+
+	const uint64_t base   = descriptor[0] | (uint64_t {descriptor[1] & 0xffffu} << 32u);
+	const uint32_t stride = (descriptor[1] >> 16u) & 0x3fffu;
+	const uint64_t size   = stride != 0u ? uint64_t {descriptor[2]} * stride : descriptor[2];
+	EXIT_IF(base == 0u || size < table.entry_offset + 8u);
+	const auto entries = static_cast<uint32_t>(
+	    std::min<uint64_t>((size - table.entry_offset - 8u) / table.entry_stride + 1u, 4096u));
+	std::vector<uint32_t> table_words(
+	    (uint64_t {entries - 1u} * table.entry_stride + table.entry_offset + 8u) / 4u);
+
+	if (source.linked && !source.linked->observed.empty() &&
+	    source.linked->observed[0].first == base &&
+	    source.linked->observed[0].second.size() == table_words.size()) {
+		const bool same = std::ranges::all_of(source.linked->observed, [&](const auto& range) {
+			std::vector<uint32_t> words(range.second.size());
+			return read(range.first, words) && words == range.second;
+		});
+		if (same) {
+			record(*source.linked);
+			return source.linked->decoded;
+		}
+	}
+
+	if (!read(base, table_words)) {
+		EXIT("shader call at pc 0x%08x cannot read its function table at 0x%016" PRIx64 "\n",
+		     call.pc, base);
+	}
+	std::vector<uint64_t> targets;
+	for (uint32_t k = 0; k < entries; ++k) {
+		const auto index   = (k * table.entry_stride + table.entry_offset) / 4u;
+		const auto address = ((uint64_t {table_words[index + 1u]} << 32u) | table_words[index]) &
+		                     ~uint64_t {3};
+		if (address != 0u && std::ranges::find(targets, address) == targets.end()) {
+			targets.push_back(address);
+		}
+	}
+	EXIT_IF(targets.empty());
+	for (size_t i = 0; i < targets.size(); ++i) {
+		for (size_t j = i + 1u; j < targets.size(); ++j) {
+			EXIT_NOT_IMPLEMENTED(static_cast<uint32_t>(targets[i]) ==
+			                     static_cast<uint32_t>(targets[j]));
+		}
+	}
+
+	struct Function {
+		std::vector<uint32_t>             words;
+		std::vector<Decoder::Instruction> instructions;
+	};
+	std::vector<Function> functions;
+	for (const auto address: targets) {
+		auto&    function   = functions.emplace_back();
+		auto&    words      = function.words;
+		uint32_t index      = 0;
+		uint32_t max_target = 0;
+		for (;;) {
+			EXIT_IF(index >= 16384u);
+			while (words.size() < index + Decoder::MaxInstructionRawWords) {
+				// Read ahead in chunks; near the end of a mapping fall back to single words.
+				const auto old = words.size();
+				words.resize(old + 64u);
+				if (read(address + old * sizeof(uint32_t), std::span(words).subspan(old))) {
+					continue;
+				}
+				words.resize(old + 1u);
+				if (!read(address + old * sizeof(uint32_t), std::span(words).subspan(old))) {
+					words.resize(old);
+					break;
+				}
+			}
+			if (words.size() <= index) {
+				EXIT("shader call table target 0x%016" PRIx64 " cannot be read\n", address);
+			}
+			Decoder::Instruction inst;
+			Decoder::DecodeInstruction(words, index, inst);
+			inst.pc = index * sizeof(uint32_t);
+			if (inst.opcode == Opcode::UNKNOWN || inst.opcode == Opcode::S_SWAPPC_B64 ||
+			    inst.opcode == Opcode::S_GETPC_B64 ||
+			    CFG::MayWriteScalarRegister(inst, call.dst.reg, wave_size) ||
+			    CFG::MayWriteScalarRegister(inst, call.dst.reg + 1u, wave_size)) {
+				std::printf("call table target 0x%016" PRIx64 ": %s\n", address,
+				            Decoder::InstructionToString(inst).c_str());
+				EXIT("unsupported instruction in shader call table target\n");
+			}
+			const bool returns = inst.opcode == Opcode::S_SETPC_B64;
+			if (returns) {
+				EXIT_NOT_IMPLEMENTED(inst.src0.kind != Decoder::OperandKind::Sgpr ||
+				                     inst.src0.reg != call.dst.reg);
+			} else if (Decoder::IsDirectBranch(inst.opcode)) {
+				max_target = std::max(max_target, inst.branch_target);
+			}
+			index += inst.word_count;
+			function.instructions.push_back(inst);
+			if ((returns || inst.opcode == Opcode::S_ENDPGM) &&
+			    index * sizeof(uint32_t) > max_target) {
+				break;
+			}
+		}
+		words.resize(index);
+		for (const auto& inst: function.instructions) {
+			if (Decoder::IsDirectBranch(inst.opcode)) {
+				EXIT_IF(inst.branch_target >= index * sizeof(uint32_t));
+			}
+		}
+	}
+
+	ShaderSource::Linked linked {.code = source.code, .decoded = source.decoded};
+	linked.observed.emplace_back(base, std::move(table_words));
+	const auto& last = source.decoded.instructions.back();
+	EXIT_NOT_IMPLEMENTED(last.opcode != Opcode::S_ENDPGM);
+	const auto return_pc   = call.pc + call.word_count * static_cast<uint32_t>(sizeof(uint32_t));
+	const auto dispatch_pc = last.pc + last.word_count * static_cast<uint32_t>(sizeof(uint32_t));
+	std::vector<uint32_t> function_pc(functions.size());
+	function_pc[0] =
+	    dispatch_pc + static_cast<uint32_t>((functions.size() - 1u) * 3u + 1u) * sizeof(uint32_t);
+	for (size_t k = 1; k < functions.size(); ++k) {
+		function_pc[k] = function_pc[k - 1u] +
+		                 static_cast<uint32_t>(functions[k - 1u].words.size() * sizeof(uint32_t));
+	}
+	uint32_t   pc   = dispatch_pc;
+	const auto emit = [&](std::span<const uint32_t> words) -> Decoder::Instruction& {
+		auto& inst = linked.decoded.instructions.emplace_back();
+		Decoder::DecodeInstruction(words, 0u, inst);
+		inst.pc = pc;
+		pc += inst.word_count * static_cast<uint32_t>(sizeof(uint32_t));
+		linked.code.insert(linked.code.end(), words.begin(), words.end());
+		return inst;
+	};
+	for (size_t k = 0; k + 1u < functions.size(); ++k) {
+		// s_cmp_eq_u32 s[compare_reg], <literal low target>; s_cbranch_scc1 <body k>
+		const std::array<uint32_t, 2> compare {0xbf06ff00u | table.compare_reg,
+		                                       static_cast<uint32_t>(targets[k])};
+		emit(compare);
+		const std::array<uint32_t, 1> branch {0xbf850000u};
+		emit(branch).branch_target = function_pc[k];
+	}
+	const std::array<uint32_t, 1> branch {0xbf820000u};
+	emit(branch).branch_target = function_pc.back();
+	for (size_t k = 0; k < functions.size(); ++k) {
+		for (auto inst: functions[k].instructions) {
+			if (inst.opcode == Opcode::S_SETPC_B64) {
+				inst.opcode        = Opcode::S_BRANCH;
+				inst.branch_target = return_pc;
+			} else if (Decoder::IsDirectBranch(inst.opcode)) {
+				inst.branch_target += function_pc[k];
+			}
+			inst.pc += function_pc[k];
+			linked.decoded.instructions.push_back(inst);
+		}
+		linked.code.insert(linked.code.end(), functions[k].words.begin(),
+		                   functions[k].words.end());
+		linked.observed.emplace_back(targets[k], functions[k].words);
+	}
+	std::printf("Shader call table at pc 0x%08x: %u entries, %zu functions (%zu words)\n",
+	            call.pc, entries, functions.size(), linked.code.size() - source.code.size());
+	linked.decoded.instructions[source.call->instruction].branch_target = dispatch_pc;
+	linked.decoded.code = linked.code;
+	record(linked);
+	source.linked = std::move(linked);
+	++source.revision;
+	return source.linked->decoded;
 }
 
 } // namespace
@@ -604,6 +902,7 @@ ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOp
 }
 
 const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime) {
+	if (source.call->table) return LinkCallTable(source, runtime);
 	auto& reads = source.reads;
 	reads.clear();
 	IR::SrtReadCapture capture(runtime, reads);
@@ -803,12 +1102,10 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		IR::RemoveIdentities(ir.blocks);
 		IR::EliminateDeadCode(ir.blocks);
 	}
-	if (decoded.has_swap_pc) {
-		// Leaf returns are resolved CFG edges; native PC values must not escape into GPU data.
-		for (const auto* block: ir.blocks)
-			for (const auto& inst: *block)
-				EXIT_NOT_IMPLEMENTED(inst.GetOpcode() == IR::ValueOpcode::GetShaderBase);
-	}
+	// Leaf returns are resolved CFG edges. Linked callees sit at virtual PCs, but the linkers
+	// reject S_GETPC_B64/S_SWAPPC_B64 inside callees, so every GetShaderBase here comes from a
+	// caller instruction at its native PC (the call's return address or PC-relative constant
+	// data) and evaluates to the real guest address.
 	LowerTessellationMemory(ir, options);
 	std::string cfg_dump;
 	if (options.dump_ir) {
