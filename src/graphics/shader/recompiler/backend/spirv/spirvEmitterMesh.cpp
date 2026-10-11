@@ -16,12 +16,18 @@ namespace {
 // primitives that index past the vertex allocation; both are undefined on the host otherwise.
 // KYTY_PROBE_MESH_EMPTY=<hex shader hash> emits an empty allocation for that mesh program only,
 // so its draw records no primitives and runs no fragments.
-bool MeshGuardProbe() {
-	static const bool enabled = [] {
+// KYTY_PROBE_MESH_GUARD=1 clamps counts and culls out-of-range primitives; =2 additionally
+// replaces every out-of-range primitive index with 0 so the hardware never sees it.
+uint32_t MeshGuardMode() {
+	static const uint32_t mode = [] {
 		const char* value = std::getenv("KYTY_PROBE_MESH_GUARD");
-		return value != nullptr && std::strcmp(value, "1") == 0;
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
 	}();
-	return enabled;
+	return mode;
+}
+
+bool MeshGuardProbe() {
+	return MeshGuardMode() != 0;
 }
 
 bool MeshFixedOutputProbe() {
@@ -298,11 +304,20 @@ void EmitMeshEntryPoint(EmitterState& state) {
 			const auto packed = MeshLoad(state, state.mesh_primitive_data, spv::StorageClassPrivate,
 			                             TypeU32(state), ConstantU32(state, half));
 			uint32_t   vertex[3] {};
+			uint32_t   out_of_range[3] {};
 			for (uint32_t component = 0; component < 3; component++) {
 				vertex[component] = state.builder.AllocateId();
 				state.builder.AddFunction(
 				    spv::OpBitFieldUExtract, TypeU32(state), vertex[component], packed,
 				    ConstantU32(state, component * 10u), ConstantU32(state, 10));
+				if (MeshGuardProbe()) {
+					out_of_range[component] = MeshBool(state, spv::OpUGreaterThanEqual,
+					                                   vertex[component], vertices);
+					if (MeshGuardMode() >= 2) {
+						vertex[component] = MeshSelectU32(state, out_of_range[component],
+						                                  ConstantU32(state, 0), vertex[component]);
+					}
+				}
 			}
 			const auto triangle = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 3), triangle,
@@ -318,11 +333,9 @@ void EmitMeshEntryPoint(EmitterState& state) {
 			                          ConstantU32(state, 0));
 			if (MeshGuardProbe()) {
 				for (uint32_t component = 0; component < 3; component++) {
-					const auto out_of_range = MeshBool(state, spv::OpUGreaterThanEqual,
-					                                   vertex[component], vertices);
 					const auto merged = state.builder.AllocateId();
 					state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), merged, culled,
-					                          out_of_range);
+					                          out_of_range[component]);
 					culled = merged;
 				}
 			}
