@@ -3,6 +3,11 @@
 #include "common/assert.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/gpuDiagnostics.h"
+#include "graphics/host_gpu/vulkanCommon.h"
+
+#include <atomic>
+#include <cinttypes>
+#include <cstdio>
 
 namespace Libs::Graphics {
 
@@ -27,6 +32,11 @@ MasterSemaphore::~MasterSemaphore() {
 void MasterSemaphore::Refresh() {
 	uint64_t   counter = 0;
 	const auto result  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
+	if (result != vk::Result::eSuccess) {
+		std::printf("MasterSemaphore::Refresh: vkGetSemaphoreCounterValue = %s\n",
+		            vk::to_string(result).c_str());
+		ReportDeviceFault(m_graphics.device);
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	auto known = m_gpu_tick.load(std::memory_order_acquire);
@@ -62,6 +72,20 @@ void MasterSemaphore::Wait(uint64_t tick) {
 			GpuDiagnostics::DumpStall(GpuDiagnostics::HandleValue(m_semaphore), tick,
 			                          KnownGpuTick(), CurrentTick());
 			reported = true;
+		}
+		if (result == vk::Result::eTimeout && GpuDiagnostics::Enabled()) {
+			// Claude probe: is the device lost? vkGetSemaphoreCounterValue returns
+			// VK_ERROR_DEVICE_LOST without blocking; VK_EXT_device_fault names the address.
+			static std::atomic<uint32_t> timeouts = 0;
+			const auto n = timeouts.fetch_add(1, std::memory_order_relaxed) + 1;
+			uint64_t   counter = 0;
+			const auto status  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
+			std::printf("MasterSemaphore::Wait: timeout #%u waiting for %" PRIu64 ", counter=%" PRIu64
+			            " status=%s\n", n, tick, counter, vk::to_string(status).c_str());
+			if (status != vk::Result::eSuccess || n == 2) {
+				ReportDeviceFault(m_graphics.device);
+			}
+			std::fflush(stdout);
 		}
 	} while (result == vk::Result::eTimeout && GpuDiagnostics::Enabled());
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);

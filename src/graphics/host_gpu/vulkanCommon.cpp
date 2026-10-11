@@ -4,6 +4,9 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 
 #include <array>
+#include <vector>
+#include <cstdio>
+#include <cinttypes>
 
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 
@@ -132,6 +135,51 @@ vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device) {
 	RequireVulkanSuccess(device.createShaderModule(&create_info, nullptr, &module),
 	                     "create SPIR-V shader module");
 	return module;
+}
+
+bool ReportDeviceFault(vk::Device device) {
+	if (device == nullptr || VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT == nullptr) {
+		std::printf("Vulkan device fault: VK_EXT_device_fault not available\n");
+		std::fflush(stdout);
+		return false;
+	}
+	vk::DeviceFaultCountsEXT counts {};
+	const auto count_result = device.getFaultInfoEXT(&counts, nullptr);
+	if (count_result != vk::Result::eSuccess) {
+		std::printf("Vulkan device fault: vkGetDeviceFaultInfoEXT(counts) = %s\n",
+		            vk::to_string(count_result).c_str());
+		std::fflush(stdout);
+		return false;
+	}
+	std::vector<vk::DeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+	std::vector<vk::DeviceFaultVendorInfoEXT>  vendors(counts.vendorInfoCount);
+	counts.vendorBinarySize = 0;
+	vk::DeviceFaultInfoEXT info {};
+	info.pAddressInfos = addresses.data();
+	info.pVendorInfos  = vendors.data();
+	const auto result  = device.getFaultInfoEXT(&counts, &info);
+	if (result != vk::Result::eSuccess && result != vk::Result::eIncomplete) {
+		std::printf("Vulkan device fault: vkGetDeviceFaultInfoEXT = %s\n", vk::to_string(result).c_str());
+		std::fflush(stdout);
+		return false;
+	}
+	std::printf("Vulkan device fault: \"%s\" addresses=%u vendor=%u\n", info.description.data(),
+	            counts.addressInfoCount, counts.vendorInfoCount);
+	for (uint32_t i = 0; i < counts.addressInfoCount; ++i) {
+		const auto& address = addresses[i];
+		std::printf("  address fault: %s at 0x%016" PRIx64 " (precision 0x%" PRIx64 ")\n",
+		            vk::to_string(address.addressType).c_str(),
+		            static_cast<uint64_t>(address.reportedAddress),
+		            static_cast<uint64_t>(address.addressPrecision));
+	}
+	for (uint32_t i = 0; i < counts.vendorInfoCount; ++i) {
+		const auto& vendor = vendors[i];
+		std::printf("  vendor fault: %s code=0x%" PRIx64 " data=0x%" PRIx64 "\n",
+		            vendor.description.data(), static_cast<uint64_t>(vendor.vendorFaultCode),
+		            static_cast<uint64_t>(vendor.vendorFaultData));
+	}
+	std::fflush(stdout);
+	return counts.addressInfoCount + counts.vendorInfoCount > 0;
 }
 
 } // namespace Libs::Graphics
