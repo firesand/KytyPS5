@@ -139,6 +139,7 @@ void BufferCache::DeleteBuffer(BufferId id) {
 
 template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	DrainPendingGpuModified();
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -614,11 +615,91 @@ bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
+	PrepareHostRead(vaddr, size);
 	return m_memory_tracker.IsRegionGpuModified(vaddr, size);
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
+	PrepareHostRead(vaddr, size);
 	return m_gpu_modified_ranges.Intersects(vaddr, size);
+}
+
+void BufferCache::QueueGpuModified(uint64_t vaddr, uint64_t size) {
+	std::lock_guard lock(m_pending_gpu_modified_mutex);
+	m_pending_gpu_modified.emplace_back(vaddr, size);
+	m_has_pending_gpu_modified.store(true, std::memory_order_release);
+}
+
+void BufferCache::DrainPendingGpuModified() {
+	if (!m_has_pending_gpu_modified.load(std::memory_order_acquire)) {
+		return;
+	}
+	std::vector<std::pair<uint64_t, uint64_t>> pending;
+	{
+		std::lock_guard lock(m_pending_gpu_modified_mutex);
+		pending.swap(m_pending_gpu_modified);
+		m_has_pending_gpu_modified.store(false, std::memory_order_release);
+	}
+	for (const auto [vaddr, size]: pending) {
+		m_gpu_modified_ranges.Add(vaddr, size);
+		m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
+	}
+}
+
+void BufferCache::MarkPageWritten(uint64_t vaddr) {
+	if (m_memory_tracker.TryMarkRegionAsGpuModified(vaddr, CACHING_PAGESIZE)) {
+		QueueGpuModified(vaddr, CACHING_PAGESIZE);
+		return;
+	}
+	// The CPU wrote the page after the GPU did; the CPU data wins for that page.
+	static std::atomic<uint32_t> reported {0};
+	if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+		LOGF("BufferCache: unbounded GPU write to CPU-dirty page 0x%016" PRIx64 " kept CPU data\n",
+		     vaddr);
+	}
+}
+
+void BufferCache::MarkWriteFaultOverflow() {
+	// More pages than the compress pass can list: fall back to marking every unbounded written
+	// range, region by region (4 MiB), skipping regions with CPU-dirty pages.
+	static std::atomic<uint32_t> reported {0};
+	if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+		LOGF("BufferCache: write-fault list overflow, marking whole unbounded ranges\n");
+	}
+	m_write_fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
+		for (auto address = start; address < end;) {
+			const auto region_end = std::min(end, Common::AlignDown(address, TRACKER_REGION_SIZE) +
+			                                          TRACKER_REGION_SIZE);
+			if (m_memory_tracker.TryMarkRegionAsGpuModified(address, region_end - address)) {
+				QueueGpuModified(address, region_end - address);
+			}
+			address = region_end;
+		}
+	});
+}
+
+void BufferCache::FlushWriteFaults(bool wait) {
+	if (m_write_faults_dirty) {
+		m_write_faults_dirty = false;
+		m_write_fault_tick   = m_scheduler.CurrentTick();
+		m_fault_manager.ProcessWriteFaultBuffer();
+	}
+	if (!wait || m_write_fault_tick == 0) {
+		return;
+	}
+	const auto tick    = m_write_fault_tick;
+	m_write_fault_tick = 0;
+	m_scheduler.Wait(tick);
+	m_scheduler.WaitPriorityOperations(tick);
+	DrainPendingGpuModified();
+}
+
+void BufferCache::PrepareHostRead(uint64_t vaddr, uint64_t size) {
+	if ((m_write_faults_dirty || m_write_fault_tick != 0) &&
+	    m_write_fault_ranges.Intersects(vaddr, size)) {
+		FlushWriteFaults(true);
+	}
+	DrainPendingGpuModified();
 }
 
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
@@ -626,6 +707,8 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::RunGarbageCollector() {
+	FlushWriteFaults(false);
+	DrainPendingGpuModified();
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();

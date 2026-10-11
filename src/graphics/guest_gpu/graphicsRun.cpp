@@ -367,6 +367,10 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 	}
 }
 
+void CommandProcessor::PrepareHostRead(uint64_t vaddr, uint64_t size) {
+	m_renderer.GetBufferCache().PrepareHostRead(vaddr, size);
+}
+
 void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cache_policy,
                                uint64_t dst_address_or_offset, uint8_t src_sel,
                                uint8_t  src_cache_policy,
@@ -617,6 +621,7 @@ bool GuestGpu::Process(Submission& submission) {
 			break;
 		case SubmissionType::SuspendPoint:
 			cp.EmitGlobalBarrier();
+			m_renderer.GetBufferCache().FlushWriteFaults(false);
 			m_renderer.GetCommandScheduler().DeferPriorityOperation(
 			    [ready = m_suspend_point_ready] { ready->release(); });
 			cp.BufferFlush();
@@ -1421,6 +1426,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	ProcessorScope processor_scope(*this);
 
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
+	m_renderer.GetBufferCache().FlushWriteFaults(false);
 	GetScheduler().DeferPriorityOperation(
 	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
 	GetScheduler().Flush();

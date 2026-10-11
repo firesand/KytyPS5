@@ -116,6 +116,11 @@ struct BufferResource {
 	bool                   atomic             = false;
 	bool                   formatted          = false;
 	bool                   scalar             = false;
+	// Descriptor spans the whole GPU heap (NUM_RECORDS = 0xffffffff or >= 256 MiB). Stores to an
+	// unbounded written buffer report their guest page through the fault buffer's write half so
+	// the host marks only touched pages GPU-modified (BufferCache::FlushWriteFaults).
+	bool                   unbounded          = false;
+	uint32_t               unbounded_slot     = UINT32_MAX;
 	uint32_t               indirect_root              = NoIndirectBuffer;
 	uint32_t               indirect_mapping_offset    = 0;
 	uint32_t               indirect_search_iterations = 0;
@@ -433,10 +438,15 @@ struct Bindings {
 	uint32_t push_data_start_dword = PushData::NoStart;
 	uint32_t dispatch_thread_dword = PushData::NoStart;
 	uint32_t memory_offset_dword = 0;
+	// Two dwords (packed guest base address) per unbounded written buffer follow the offsets.
+	uint32_t unbounded_write_count = 0;
 
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	[[nodiscard]] uint32_t UnboundedBaseDword() const {
 		return memory_offset_dword +
 		       (descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)] + 3u) / 4u;
+	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const {
+		return UnboundedBaseDword() + unbounded_write_count * 2u;
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;
@@ -469,6 +479,7 @@ struct ShaderInfo {
 	int32_t                          instance_offset_sgpr = -1;
 	bool                            has_bitwise_xor               = false;
 	bool                            uses_dma                      = false;
+	bool                            uses_write_faults             = false;
 	bool                            uses_swizzle                  = false;
 	bool                            uses_lds                      = false;
 	bool                            uses_gds                      = false;

@@ -1441,6 +1441,7 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 	EXIT_NOT_IMPLEMENTED(addr == 0);
 	EXIT_NOT_IMPLEMENTED(payload_dw + exec_count >= dw);
 
+	cp.PrepareHostRead(addr, sizeof(uint32_t));
 	if (*reinterpret_cast<const volatile uint32_t*>(addr) == 0) {
 		return payload_dw + exec_count;
 	}
@@ -1475,6 +1476,7 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	EXIT_NOT_IMPLEMENTED(function > 6);
 	EXIT_NOT_IMPLEMENTED(then_buffer == nullptr || then_num_dw == 0);
 
+	cp.PrepareHostRead(reinterpret_cast<uint64_t>(compare_addr), sizeof(uint64_t));
 	const bool take_then = TestWaitRegMemValue(*compare_addr, reference, mask, function);
 	LOGF("\t branch: take=%u then=0x%016" PRIx64 "/%" PRIu32 " else=0x%016" PRIx64 "/%" PRIu32 "\n",
 	     take_then ? 1u : 0u, reinterpret_cast<uint64_t>(then_buffer), then_num_dw,
@@ -2568,6 +2570,7 @@ static uint32_t CpOpWaitRegMemSized(CommandProcessor& cp, uint32_t cmd_id, const
 
 	EXIT_NOT_IMPLEMENTED((ctrl & 0x10u) == 0);
 
+	cp.PrepareHostRead(reinterpret_cast<uint64_t>(addr), sizeof(T));
 	cp.WaitRegMem(ctrl & 0x7u, addr, ref, mask, poll, CpOpWaitRegMemWaitOp<T>(ctrl));
 
 	return payload_dw;

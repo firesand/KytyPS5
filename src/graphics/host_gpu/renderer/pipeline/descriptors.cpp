@@ -884,8 +884,18 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 				const char* value = std::getenv("KYTY_PROBE_UNBOUNDED_UNTRACKED");
 				return value != nullptr && value[0] == '1';
 			}();
-			const bool untracked_write = untracked_probe && unbounded &&
-			                             program.info.buffers[resource].written;
+			// KYTY_UNBOUNDED_WRITE_FAULTS=0 restores whole-range GPU-modified marking.
+			static const bool write_faults = [] {
+				const char* value = std::getenv("KYTY_UNBOUNDED_WRITE_FAULTS");
+				return value == nullptr || !(value[0] == '0' && value[1] == '\0');
+			}();
+			const auto& info          = program.info.buffers[resource];
+			const bool  fault_tracked = write_faults && info.written && info.unbounded &&
+			                           info.unbounded_slot != UINT32_MAX;
+			if (fault_tracked) {
+				cache.NoteUnboundedWrite(address, size);
+			}
+			const bool untracked_write = fault_tracked || (untracked_probe && unbounded && info.written);
 			source = {address, size, cache.FindBuffer(address, size), untracked_write};
 		}
 	}
@@ -915,6 +925,17 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		prepared.buffers[index] = NativeStorageBuffer(m_context, prepared.buffer_sources[index],
 		                                              resource, buffer_offset);
 		pack_memory_offset(index, buffer_offset);
+		if (resource.unbounded_slot != UINT32_MAX) {
+			// Packed guest base of the bound range for the shader's written-page records.
+			const auto  base   = prepared.buffer_sources[index].address;
+			const auto  packed = base < LOWER_ADDRESS_SIZE
+			                         ? base
+			                         : base - (LibKernel::Memory::kExtendedMemoryBase - LOWER_ADDRESS_SIZE);
+			const auto  dword  = layout.UnboundedBaseDword() + resource.unbounded_slot * 2u;
+			EXIT_IF(dword + 1u >= prepared.shader_data.size());
+			prepared.shader_data[dword]      = static_cast<uint32_t>(packed);
+			prepared.shader_data[dword + 1u] = static_cast<uint32_t>(packed >> 32u);
+		}
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);

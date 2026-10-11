@@ -1988,7 +1988,9 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 		return;
 	}
 	std::scoped_lock lock {m_lock};
-	for (const auto id: FindImagesInRegion(address, size, true)) {
+	// Only images whose data starts exactly at `address` qualify, and they own that address's
+	// page; walking every page of a 528 MiB whole-heap binding (34k lookups) is unnecessary.
+	for (const auto id: FindImagesInRegion(address, 1, true)) {
 		auto& image = m_slot_images[id];
 		if (image.info.data.address != address) {
 			continue;

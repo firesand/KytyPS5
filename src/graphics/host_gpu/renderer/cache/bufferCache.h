@@ -12,6 +12,8 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <map>
+#include <mutex>
+#include <atomic>
 #include <span>
 #include <utility>
 #include <vector>
@@ -30,6 +32,9 @@ public:
 	static constexpr uint32_t CACHING_PAGEBITS  = 14;
 	static constexpr uint64_t CACHING_PAGESIZE  = uint64_t {1} << CACHING_PAGEBITS;
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
+	// The fault buffer holds two page bitmaps: BDA accesses to uncached pages, then pages written
+	// through unbounded (whole-heap) buffer descriptors.
+	static constexpr uint32_t WRITE_FAULT_WORD_OFFSET = static_cast<uint32_t>(CACHING_NUMPAGES / 32);
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
 	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
 
@@ -80,7 +85,18 @@ public:
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
-	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	// Unbounded-descriptor write tracking. Shaders set a bit per written guest page in the fault
+	// buffer's write half; FlushWriteFaults records the compress pass and a priority operation
+	// marks those pages GPU-modified once the GPU is done (instead of protecting the whole
+	// 528 MiB clamped range at bind time, which made every CPU access to the heap fault).
+	void NoteUnboundedWrite(uint64_t vaddr, uint64_t size) { m_write_fault_ranges.Add(vaddr, size); }
+	void MarkWriteFaultsDirty() { m_write_faults_dirty = true; }
+	void FlushWriteFaults(bool wait);
+	// Before the host reads guest memory that unbounded writes may have touched.
+	void PrepareHostRead(uint64_t vaddr, uint64_t size);
+	void MarkPageWritten(uint64_t vaddr);      // any thread (fault-processing operation)
+	void MarkWriteFaultOverflow();             // any thread
+	void SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
 
 private:
@@ -116,6 +132,8 @@ private:
 	                                     bool is_written, bool is_texel_buffer);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
+	void QueueGpuModified(uint64_t vaddr, uint64_t size); // any thread
+	void DrainPendingGpuModified();                       // GPU thread
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
@@ -137,6 +155,12 @@ private:
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;
+	RangeSet                                          m_write_fault_ranges;
+	bool                                              m_write_faults_dirty = false;
+	uint64_t                                          m_write_fault_tick   = 0;
+	std::mutex                                        m_pending_gpu_modified_mutex;
+	std::vector<std::pair<uint64_t, uint64_t>>        m_pending_gpu_modified;
+	std::atomic<bool>                                 m_has_pending_gpu_modified {false};
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;

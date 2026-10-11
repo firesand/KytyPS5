@@ -241,7 +241,16 @@ void DefineDescriptors(EmitterState& state) {
 	counts[static_cast<size_t>(Kind::SharedMemory)] =
 	    info.uses_lds && state.lds_storage_class == spv::StorageClassStorageBuffer;
 	counts[static_cast<size_t>(Kind::BdaPagetable)] = info.uses_dma;
-	counts[static_cast<size_t>(Kind::FaultBuffer)] = info.uses_dma;
+	uint32_t unbounded_slots = 0;
+	for (auto& buffer: info.buffers) {
+		buffer.unbounded_slot = UINT32_MAX;
+		if (buffer.unbounded && buffer.written && buffer.descriptor_index != UINT32_MAX) {
+			buffer.unbounded_slot = unbounded_slots++;
+		}
+	}
+	info.uses_write_faults         = unbounded_slots != 0;
+	bindings.unbounded_write_count = unbounded_slots;
+	counts[static_cast<size_t>(Kind::FaultBuffer)] = info.uses_dma || info.uses_write_faults;
 	counts[static_cast<size_t>(Kind::FlattenedSrt)] = info.uses_flattened_srt;
 	bindings.memory_offset_dword = static_cast<uint32_t>(info.user_data_registers.size());
 	if (info.uses_dispatch_threads) {

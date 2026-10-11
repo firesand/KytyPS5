@@ -1,4 +1,5 @@
 #include "kernel/memory.h"
+#include <utility>
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -899,9 +900,15 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	if (clamped_size != size) {
-		LOGF("Memory: clamped buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64
-		     " to 0x%016" PRIx64 "\n",
-		     vaddr, size, clamped_size);
+		// Whole-heap descriptors clamp on every binding (~100 per frame); report each range once.
+		static std::vector<std::pair<uint64_t, uint64_t>> reported; // GPU thread only
+		const std::pair<uint64_t, uint64_t> key {vaddr, size};
+		if (reported.size() < 256 && std::find(reported.begin(), reported.end(), key) == reported.end()) {
+			reported.push_back(key);
+			LOGF("Memory: clamped buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64
+			     " to 0x%016" PRIx64 " (reported once per range)\n",
+			     vaddr, size, clamped_size);
+		}
 	}
 	return clamped_size;
 }

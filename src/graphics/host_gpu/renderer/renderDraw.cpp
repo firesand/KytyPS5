@@ -1248,6 +1248,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
+	{
+		bool write_faults = state.ps_active && state.ps_input_info.stage.program->info.uses_write_faults;
+		for (const auto& stage: vertex_stages) {
+			write_faults |= stage.stage.program->info.uses_write_faults;
+		}
+		if (write_faults) {
+			m_context.GetBufferCache().MarkWriteFaultsDirty();
+		}
+	}
 	GpuDiagnosticEvent diagnostic;
 	if (GpuDiagnostics::Enabled()) {
 		diagnostic.kind = mesh_active ? "draw-mesh" : (draw.IsIndexed() ? "draw-indexed" : "draw");

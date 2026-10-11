@@ -10,6 +10,8 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
+void RecordUnboundedWrite(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem);
+
 uint32_t AndCondition(EmitterState& state, uint32_t lhs, uint32_t rhs) {
 	return Binary(state, spv::OpLogicalAnd, TypeBool(state), lhs, rhs);
 }
@@ -178,6 +180,42 @@ void RecordBdaFault(EmitterState& state, uint32_t page) {
 	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
 	state.builder.AddFunction(spv::OpStore, pointer,
 	                          Binary(state, spv::OpBitwiseOr, TypeU32(state), value, bit));
+}
+
+// Stores and atomics through an unbounded (whole-heap) descriptor set the touched guest page's
+// bit in the write half of the fault buffer. The host turns those bits into GPU-modified pages
+// (BufferCache::FlushWriteFaults) instead of marking the whole clamped range at bind time.
+void RecordUnboundedWrite(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
+	auto& state = ctx.state;
+	if (mem.kind != IR::ResourceKind::Buffer || mem.resource >= state.program.info.buffers.size()) {
+		return;
+	}
+	const auto& buffer = state.program.info.buffers[mem.resource];
+	if (!buffer.unbounded || !buffer.written || buffer.unbounded_slot == UINT32_MAX ||
+	    state.fault_buffer_variable == 0) {
+		return;
+	}
+	const auto dword = state.program.bindings.UnboundedBaseDword() + buffer.unbounded_slot * 2u;
+	const auto base  = PackU64(state, EmitShaderDataDwordLoad(state, dword),
+	                           EmitShaderDataDwordLoad(state, dword + 1u));
+	const auto offset =
+	    Unary(state, spv::OpUConvert, TypeU64(state), BufferByteAddress(ctx, inst, mem));
+	const auto page64 = Binary(state, spv::OpShiftRightLogical, TypeU64(state),
+	                           Binary(state, spv::OpIAdd, TypeU64(state), base, offset),
+	                           ConstantU32(state, BufferCache::CACHING_PAGEBITS));
+	const auto page   = Unary(state, spv::OpUConvert, TypeU32(state), page64);
+	const auto word   = Binary(state, spv::OpIAdd, TypeU32(state),
+	                           Binary(state, spv::OpShiftRightLogical, TypeU32(state), page,
+	                                  ConstantU32(state, 5)),
+	                           ConstantU32(state, BufferCache::WRITE_FAULT_WORD_OFFSET));
+	const auto bit = Binary(state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
+	                        Binary(state, spv::OpBitwiseAnd, TypeU32(state), page,
+	                               ConstantU32(state, 31)));
+	const auto pointer = FaultElementPointer(state, word);
+	const auto old     = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state), old, pointer,
+	                          ConstantU32(state, spv::ScopeDevice),
+	                          ConstantU32(state, spv::MemorySemanticsMaskNone), bit);
 }
 
 uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = false) {
@@ -482,6 +520,7 @@ void StoreSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR:
 
 void StoreSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem, uint32_t bits) {
 	EmitIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		RecordUnboundedWrite(ctx, inst, mem);
 		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
 		StoreSubwordPrepared(ctx, inst, mem, resource, bits, ctx.Arg(inst, inst.NumArgs() - 2));
 	});
@@ -558,6 +597,7 @@ void StoreWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) 
 				    state.program.descriptor_sources[buffer.source].indirect_descriptor) return;
 			}
 			mem.resource = resource;
+			RecordUnboundedWrite(ctx, inst, mem);
 			const auto access = PrepareMemoryResourceAccess(state, mem);
 			StoreWordPrepared(ctx, inst, mem, access, data);
 		};
@@ -599,6 +639,7 @@ template <typename Fn>
 uint32_t EmitAtomicAccess(ValueEmitContext& ctx, const IR::Inst& inst,
                           const IR::MemoryInfo& mem, Fn&& operation) {
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		RecordUnboundedWrite(ctx, inst, mem);
 		const auto index = DwordIndex(ctx, inst, mem);
 		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
 		return EmitValueOrZeroIfCondition(
@@ -825,9 +866,15 @@ void StoreFormattedPrepared(ValueEmitContext& ctx, const IR::Inst& inst,
 
 void FormattedStore(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
 	EmitIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		RecordUnboundedWrite(ctx, inst, mem);
 		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
 		const auto data     = ctx.Arg(inst, inst.NumArgs() - 2);
 		const auto info     = Format::GetFormatInfo(BufferFormat(ctx, mem));
+		if (info.type != Format::ComponentType::Unknown && info.byte_size > 4u) {
+			auto last = mem;
+			last.offset += info.byte_size - 1u;
+			RecordUnboundedWrite(ctx, inst, last);
+		}
 		if (info.type == Format::ComponentType::Unknown) {
 			StoreWordPrepared(ctx, inst, RebaseRawComponent(mem, 0u), resource, data);
 			return;
@@ -1059,10 +1106,17 @@ void StoreWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 	auto& state = ctx.state;
 	EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		const auto mem       = ctx.Memory(inst);
+		RecordUnboundedWrite(ctx, inst, mem);
 		const auto resource  = PrepareMemoryResourceAccess(state, mem);
 		const auto composite = ctx.Arg(inst, inst.NumArgs() - 2);
 		const auto info = Format::GetFormatInfo(
 		    mem.formatted ? BufferFormat(ctx, mem) : Prospero::BufferFormat::kInvalid);
+		{
+			// A multi-dword store can straddle a tracked page; record the last byte's page too.
+			auto last = mem;
+			last.offset += (info.type != Format::ComponentType::Unknown ? info.byte_size : components * 4u) - 1u;
+			RecordUnboundedWrite(ctx, inst, last);
+		}
 		if (info.type != Format::ComponentType::Unknown) {
 			StoreFormattedPrepared(ctx, inst, mem, resource, info, composite, components);
 			return;
@@ -1201,6 +1255,7 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&       state = ctx.state;
 	return EmitValueOrDefaultIfCondition(
 	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU64(state), ConstantU64(state, 0), [&]() {
+		    RecordUnboundedWrite(ctx, inst, mem);
 		    const auto resource =
 		        PrepareStorageBufferResourceAccess(state, mem, state.storage_buffers[3]);
 		    const auto byte_address = ByteAddress(ctx, inst, mem);

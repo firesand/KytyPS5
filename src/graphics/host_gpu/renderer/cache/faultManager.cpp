@@ -17,7 +17,7 @@ namespace Libs::Graphics {
 
 namespace {
 
-constexpr size_t MaxPageFaults    = 1024;
+constexpr size_t MaxPageFaults    = 65536; // matches -DMAX_PAGE_FAULTS for fault_buffer_process.comp
 constexpr size_t PageFaultAreaSize = MaxPageFaults * sizeof(uint64_t);
 
 } // namespace
@@ -26,9 +26,9 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
                            BufferCache& buffer_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_buffer_cache(buffer_cache),
       m_fault_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-                     BufferCache::CACHING_NUMPAGES / 8),
+                     BufferCache::CACHING_NUMPAGES / 4), // BDA half + unbounded-write half
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
-                        MaxPendingFaults * PageFaultAreaSize) {
+                        2 * MaxPendingFaults * PageFaultAreaSize) {
 	SetVulkanObjectNameF(m_graphics.device, m_fault_buffer.Handle(), "Fault Buffer");
 
 	const vk::DescriptorSetLayoutBinding bindings[] {
@@ -75,15 +75,31 @@ FaultManager::~FaultManager() {
 }
 
 void FaultManager::ProcessFaultBuffer() {
-	if (const auto wait_tick = m_fault_areas[m_current_area]; wait_tick != 0) {
+	Process(false);
+}
+
+void FaultManager::ProcessWriteFaultBuffer() {
+	Process(true);
+}
+
+void FaultManager::Process(bool write_faults) {
+	auto&      areas        = write_faults ? m_write_areas : m_fault_areas;
+	auto&      current_area = write_faults ? m_current_write_area : m_current_area;
+	if (const auto wait_tick = areas[current_area].load(std::memory_order_acquire); wait_tick != 0) {
 		m_scheduler.Wait(wait_tick);
-		m_scheduler.PopPendingOperations();
+		if (write_faults) {
+			m_scheduler.WaitPriorityOperations(wait_tick);
+		} else {
+			m_scheduler.PopPendingOperations();
+		}
 	}
 
-	const auto offset = m_current_area * PageFaultAreaSize;
+	const auto offset = (current_area + (write_faults ? MaxPendingFaults : 0u)) * PageFaultAreaSize;
 	auto*      mapped = m_download_buffer.Mapped().data() + offset;
-	std::memset(mapped, 0, PageFaultAreaSize);
-	m_download_buffer.Flush(offset, PageFaultAreaSize);
+	// The compress pass only reads the entry counter; entries are written before being read back.
+	std::memset(mapped, 0, 64);
+	m_download_buffer.Flush(offset, 64);
+	constexpr vk::DeviceSize half_bytes = BufferCache::CACHING_NUMPAGES / 8;
 
 	vk::BufferMemoryBarrier2 pre_barrier {};
 	pre_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
@@ -100,7 +116,7 @@ void FaultManager::ProcessFaultBuffer() {
 	post_barrier.dstAccessMask = vk::AccessFlagBits2::eShaderWrite;
 
 	const vk::DescriptorBufferInfo infos[] {
-	    {m_fault_buffer.Handle(), 0, m_fault_buffer.Size()},
+	    {m_fault_buffer.Handle(), write_faults ? half_bytes : 0, half_bytes},
 	    {m_download_buffer.Handle(), offset, PageFaultAreaSize},
 	};
 	std::array<vk::WriteDescriptorSet, 2> writes {};
@@ -136,26 +152,44 @@ void FaultManager::ProcessFaultBuffer() {
 	dependency.pBufferMemoryBarriers = &post_barrier;
 	command.pipelineBarrier2(dependency);
 
-	const auto area = m_current_area;
-	m_scheduler.DeferOperation([this, mapped, offset, area] {
-		m_download_buffer.Invalidate(offset, PageFaultAreaSize);
-		RangeSet    fault_ranges;
-		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
-		const auto  count  = static_cast<uint32_t>(faults[0]);
-		for (uint32_t index = 1; index <= count; ++index) {
-			const auto address = BufferCache::GuestAddress(faults[index]);
-			fault_ranges.Add(address, BufferCache::CACHING_PAGESIZE);
-			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
-		}
-		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
-			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
-			(void)m_buffer_cache.FindBuffer(start, end - start);
+	const auto area = current_area;
+	if (write_faults) {
+		// Priority operation: it must run before the end-of-pipe signals queued after it, so the
+		// game's fence wait already finds the written pages marked and protected.
+		m_scheduler.DeferPriorityOperation([this, mapped, offset, area] {
+			m_download_buffer.Invalidate(offset, PageFaultAreaSize);
+			const auto* faults = std::bit_cast<const uint64_t*>(mapped);
+			const auto  count  = std::min<uint32_t>(static_cast<uint32_t>(faults[0]),
+			                                        static_cast<uint32_t>(MaxPageFaults - 1));
+			for (uint32_t index = 1; index <= count; ++index) {
+				m_buffer_cache.MarkPageWritten(BufferCache::GuestAddress(faults[index]));
+			}
+			if (static_cast<uint32_t>(faults[0]) >= MaxPageFaults - 1) {
+				m_buffer_cache.MarkWriteFaultOverflow();
+			}
+			m_write_areas[area].store(0, std::memory_order_release);
 		});
-		m_fault_areas[area] = 0;
-	});
+	} else {
+		m_scheduler.DeferOperation([this, mapped, offset, area] {
+			m_download_buffer.Invalidate(offset, PageFaultAreaSize);
+			RangeSet    fault_ranges;
+			const auto* faults = std::bit_cast<const uint64_t*>(mapped);
+			const auto  count  = static_cast<uint32_t>(faults[0]);
+			for (uint32_t index = 1; index <= count; ++index) {
+				const auto address = BufferCache::GuestAddress(faults[index]);
+				fault_ranges.Add(address, BufferCache::CACHING_PAGESIZE);
+				LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
+			}
+			fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
+				EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
+				(void)m_buffer_cache.FindBuffer(start, end - start);
+			});
+			m_fault_areas[area].store(0, std::memory_order_release);
+		});
+	}
 
-	m_fault_areas[m_current_area++] = m_scheduler.CurrentTick();
-	m_current_area %= MaxPendingFaults;
+	areas[current_area++].store(m_scheduler.CurrentTick(), std::memory_order_release);
+	current_area %= MaxPendingFaults;
 }
 
 } // namespace Libs::Graphics
