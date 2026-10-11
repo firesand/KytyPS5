@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
+#include "graphics/host_gpu/renderer/gpuDiagnostics.h"
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <condition_variable>
@@ -35,6 +36,13 @@ public:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
 	void                      Wait(uint64_t tick);
+	void RecordGpuOperation(const GpuDiagnosticEvent& event) {
+		GpuDiagnostics::Record(this, GpuDiagnostics::HandleValue(m_master.Handle()),
+		                       CurrentTick(), event);
+	}
+	void DiagnosticOperationComplete() {
+		if (GpuDiagnostics::Serialize()) FlushAndWait();
+	}
 	void                      PopPendingOperations();
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);

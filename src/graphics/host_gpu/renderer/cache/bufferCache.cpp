@@ -187,6 +187,16 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                       nullptr);
 	native.copyBuffer(buffer.Handle(), download.Handle(),
 	                  static_cast<uint32_t>(copies.size()), copies.data());
+	if (GpuDiagnostics::Enabled()) {
+		for (const auto& copy : copies) {
+			GpuDiagnosticEvent event;
+			event.kind = "readback-copy";
+			event.args = {GpuDiagnostics::HandleValue(buffer.Handle()),
+			              GpuDiagnostics::HandleValue(download.Handle()), copy.srcOffset,
+			              copy.dstOffset, copy.size, buffer_address + copy.srcOffset};
+			m_scheduler.RecordGpuOperation(event);
+		}
+	}
 
 	auto after          = before;
 	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;

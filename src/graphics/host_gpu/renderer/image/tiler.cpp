@@ -331,6 +331,15 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 		command.bindPipeline(vk::PipelineBindPoint::eCompute, GetPipeline(dispatch.pipeline_slot));
 		command.dispatch((dispatch.push.width + 7u) / 8u, (dispatch.push.height + 7u) / 8u,
 		                 dispatch.push.depth);
+		if (GpuDiagnostics::Enabled()) {
+			GpuDiagnosticEvent event;
+			event.kind = "utility-tiler";
+			event.pipeline = GpuDiagnostics::HandleValue(GetPipeline(dispatch.pipeline_slot));
+			event.args = {(dispatch.push.width + 7u) / 8u, (dispatch.push.height + 7u) / 8u,
+			              dispatch.push.depth, static_cast<uint64_t>(dispatch.pipeline_slot),
+			              GpuDiagnostics::HandleValue(source), GpuDiagnostics::HandleValue(target)};
+			m_scheduler.RecordGpuOperation(event);
+		}
 	}
 
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eShaderWrite;
@@ -573,6 +582,13 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 			command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
 			                      sizeof(push), &push);
 			command.dispatch(static_cast<uint32_t>(groups_x), rows, 1);
+			if (GpuDiagnostics::Enabled()) {
+				GpuDiagnosticEvent event;
+				event.kind = "utility-depth-conversion";
+				event.pipeline = GpuDiagnostics::HandleValue(pipeline);
+				event.args = {groups_x, rows, 1, layer, row, layout.width};
+				m_scheduler.RecordGpuOperation(event);
+			}
 			row += rows;
 		}
 	}
@@ -653,6 +669,14 @@ void TileManager::TransformColor(Result input, Result output, ColorTransform tra
 	command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
 	                      &push);
 	command.dispatch((pixels + 63u) / 64u, 1, 1);
+	if (GpuDiagnostics::Enabled()) {
+		GpuDiagnosticEvent event;
+		event.kind = "utility-color-transform";
+		event.pipeline = GpuDiagnostics::HandleValue(m_color_transform);
+		event.args = {(pixels + 63u) / 64u, 1, 1, pixels,
+		              static_cast<uint64_t>(transform), to_host ? 1u : 0u};
+		m_scheduler.RecordGpuOperation(event);
+	}
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eTransferRead;
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,

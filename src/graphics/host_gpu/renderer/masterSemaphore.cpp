@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/gpuDiagnostics.h"
 
 namespace Libs::Graphics {
 
@@ -49,7 +50,20 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pSemaphores    = &m_semaphore;
 	wait_info.pValues        = &tick;
 
-	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	// Diagnostic slices never turn an incomplete submission into a successful wait.
+	// Default behavior and the eventual Vulkan error handling remain unchanged.
+	vk::Result result;
+	bool reported = false;
+	do {
+		result = m_graphics.device.waitSemaphores(
+		    &wait_info, GpuDiagnostics::Enabled() ? 5'000'000'000ull : UINT64_MAX);
+		if (result == vk::Result::eTimeout && GpuDiagnostics::Enabled() && !reported) {
+			Refresh();
+			GpuDiagnostics::DumpStall(GpuDiagnostics::HandleValue(m_semaphore), tick,
+			                          KnownGpuTick(), CurrentTick());
+			reported = true;
+		}
+	} while (result == vk::Result::eTimeout && GpuDiagnostics::Enabled());
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	Refresh();
 }

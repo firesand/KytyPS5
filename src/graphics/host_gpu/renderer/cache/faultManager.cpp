@@ -124,6 +124,15 @@ void FaultManager::ProcessFaultBuffer() {
 	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 32;
 	const auto num_workgroups = (num_threads + 63) / 64;
 	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
+	if (GpuDiagnostics::Enabled()) {
+		GpuDiagnosticEvent event;
+		event.kind = "utility-fault-process";
+		event.pipeline = GpuDiagnostics::HandleValue(m_fault_process_pipeline);
+		event.args = {num_workgroups, 1, 1, offset,
+		              GpuDiagnostics::HandleValue(m_fault_buffer.Handle()),
+		              GpuDiagnostics::HandleValue(m_download_buffer.Handle())};
+		m_scheduler.RecordGpuOperation(event);
+	}
 	dependency.pBufferMemoryBarriers = &post_barrier;
 	command.pipelineBarrier2(dependency);
 

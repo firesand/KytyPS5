@@ -431,10 +431,23 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	if (GpuDiagnostics::Enabled()) {
+		GpuDiagnosticEvent event;
+		event.kind = "dispatch";
+		event.guest_submit = submit_id;
+		event.pipeline = GpuDiagnostics::HandleValue(pipeline.pipeline);
+		event.args = {thread_group_x, thread_group_y, thread_group_z, mode,
+		              input_info.threads_num[0], input_info.threads_num[1] |
+		                  (uint64_t {input_info.threads_num[2]} << 32u)};
+		event.shaders[0] = {program.shader_hash, compute_program.id,
+		                    static_cast<uint32_t>(program.stage)};
+		m_context.GetCommandScheduler().RecordGpuOperation(event);
+	}
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
+	m_context.GetCommandScheduler().DiagnosticOperationComplete();
 }
 
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
@@ -493,8 +506,21 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                          1, &barrier, 0, nullptr, 0, nullptr);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	if (GpuDiagnostics::Enabled()) {
+		GpuDiagnosticEvent event;
+		event.kind = "dispatch-indirect";
+		event.guest_submit = submit_id;
+		event.pipeline = GpuDiagnostics::HandleValue(pipeline.pipeline);
+		event.args = {args_addr, GpuDiagnostics::HandleValue(args_buffer->Handle()),
+		              args_offset, mode, input_info.threads_num[0], input_info.threads_num[1] |
+		                  (uint64_t {input_info.threads_num[2]} << 32u)};
+		event.shaders[0] = {program.shader_hash, compute_program.id,
+		                    static_cast<uint32_t>(program.stage)};
+		m_context.GetCommandScheduler().RecordGpuOperation(event);
+	}
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
+	m_context.GetCommandScheduler().DiagnosticOperationComplete();
 }
 
 } // namespace Libs::Graphics

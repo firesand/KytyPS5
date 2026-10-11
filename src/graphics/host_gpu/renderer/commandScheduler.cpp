@@ -371,6 +371,29 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
 		result = graphics.queue.submit(1, &submit_info, nullptr);
+		if (GpuDiagnostics::Enabled()) {
+			const auto semaphore = GpuDiagnostics::HandleValue(m_master.Handle());
+			GpuDiagnosticEvent event;
+			event.kind = "submit";
+			event.args = {GpuDiagnostics::HandleValue(buffer),
+			              submit.num_wait_semaphores, submit.num_signal_semaphores,
+			              static_cast<uint64_t>(static_cast<int64_t>(result)),
+			              GpuDiagnostics::HandleValue(graphics.queue), 0};
+			GpuDiagnostics::Record(this, semaphore, tick, event);
+			for (uint32_t i = 0; i < submit.num_wait_semaphores; ++i) {
+				event.kind = "submit-wait";
+				event.args = {GpuDiagnostics::HandleValue(submit.wait_semaphores[i]),
+				              submit.wait_ticks[i], static_cast<uint32_t>(submit.wait_stages[i]),
+				              i, 0, 0};
+				GpuDiagnostics::Record(this, semaphore, tick, event);
+			}
+			for (uint32_t i = 0; i < submit.num_signal_semaphores; ++i) {
+				event.kind = "submit-signal";
+				event.args = {GpuDiagnostics::HandleValue(submit.signal_semaphores[i]),
+				              submit.signal_ticks[i], i, 0, 0, 0};
+				GpuDiagnostics::Record(this, semaphore, tick, event);
+			}
+		}
 	}
 
 	if (result != vk::Result::eSuccess) {
