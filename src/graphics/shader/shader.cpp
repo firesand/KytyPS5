@@ -511,6 +511,7 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 static void ShaderGetStaticInputInfoPS(
     const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+    std::span<const ShaderPixelOutputType> target_output_type,
 	const ShaderMappedData& data, ShaderPixelInputInfo& ps_info) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -568,6 +569,10 @@ static void ShaderGetStaticInputInfoPS(
 		ps_info.target_export_mapping[i] = sh.target_output_mode[i] != 0 && slot < 8
 		                                       ? target_export_mapping[slot]
 		                                       : Prospero::ColorComponentMapping {};
+		ps_info.target_output_type[i] =
+		    sh.target_output_mode[i] != 0 && slot < 8 && slot < target_output_type.size()
+		        ? target_output_type[slot]
+		        : ShaderPixelOutputType::Float;
 	}
 }
 
@@ -683,6 +688,11 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 		}
 		key.push_back(packed);
 	}
+	uint32_t output_types = 0;
+	for (uint32_t i = 0; i < info.target_output_type.size(); i++) {
+		output_types |= static_cast<uint32_t>(info.OutputType(i)) << (i * 2u);
+	}
+	key.push_back(output_types);
 	key.insert(key.end(), std::begin(info.interpolator_settings),
 	           std::begin(info.interpolator_settings) + info.input_num);
 }
@@ -850,9 +860,10 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 ShaderParams PrepareProgram(
     const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
-    ShaderPixelInputInfo&                               ps_info) {
+    ShaderPixelInputInfo&                               ps_info,
+    std::span<const ShaderPixelOutputType> target_output_type) {
 	const auto [data, hash] = ShaderGetMappedData(regs.ps_regs.data_addr, "ShaderGetInputInfoPS():");
-	ShaderGetStaticInputInfoPS(regs, sh, target_export_mapping, data, ps_info);
+	ShaderGetStaticInputInfoPS(regs, sh, target_export_mapping, target_output_type, data, ps_info);
 	return GetShaderParams(
 	    regs.ps_regs.data_addr, hash,
 	    std::span<const uint32_t>(regs.ps_user_sgpr.value, regs.ps_regs.rsrc2.user_sgpr), data);

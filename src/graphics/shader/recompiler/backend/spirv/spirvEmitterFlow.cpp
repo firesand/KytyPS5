@@ -270,9 +270,11 @@ uint32_t ExportRawComponent(ValueEmitContext& ctx, uint32_t vector, uint32_t com
 }
 
 uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo& exp,
-                      bool uint_output) {
+                      ShaderPixelOutputType output_type) {
 	auto& state = ctx.state;
-	if (exp.compr && !uint_output) {
+	const auto output_mode = MrtOutputMode(state, exp);
+	const bool integer_output = output_type != ShaderPixelOutputType::Float;
+	if (exp.compr && output_mode != 7u && output_mode != 8u) {
 		auto unpack = GLSLstd450UnpackHalf2x16;
 		switch (MrtOutputMode(state, exp)) {
 			case 5: unpack = GLSLstd450UnpackUnorm2x16; break;
@@ -302,6 +304,12 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
 		const auto vector = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 4), vector,
 		                          f32[0], f32[1], f32[2], f32[3]);
+		if (integer_output) {
+			const auto bits = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpBitcast, TypePixelOutputVector(state, output_type),
+			                          bits, vector);
+			return bits;
+		}
 		return vector;
 	}
 	if (exp.compr || exp.en != 0xfu) {
@@ -309,7 +317,7 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
 		    ConstantU32(state, 0),
 		    ConstantU32(state, 0),
 		    ConstantU32(state, 0),
-		    ConstantU32(state, uint_output ? 1u : 0x3f800000u),
+		    ConstantU32(state, integer_output ? 1u : 0x3f800000u),
 		};
 		if (exp.compr) {
 			for (uint32_t pair = 0; pair < 2u; pair++) {
@@ -323,7 +331,9 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
 						continue;
 					}
 					raw[component] = state.builder.AllocateId();
-					state.builder.AddFunction(spv::OpBitFieldUExtract, TypeU32(state), raw[component],
+					state.builder.AddFunction(output_mode == 8u ? spv::OpBitFieldSExtract
+					                                           : spv::OpBitFieldUExtract,
+					                          TypeU32(state), raw[component],
 					                          packed, ConstantU32(state, lane * 16u),
 					                          ConstantU32(state, 16));
 				}
@@ -339,11 +349,11 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
 		state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), data,
 		                          raw[0], raw[1], raw[2], raw[3]);
 	}
-	if (uint_output) {
+	if (output_type == ShaderPixelOutputType::Uint) {
 		return data;
 	}
 	const auto vector = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpBitcast, TypeF32Vector(state, 4), vector, data);
+	state.builder.AddFunction(spv::OpBitcast, TypePixelOutputVector(state, output_type), vector, data);
 	return vector;
 }
 
@@ -520,11 +530,15 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		if (state.program.stage != ShaderType::Mesh && variable == 0) {
 			return;
 		}
-		const bool uint_output = MrtOutputMode(state, exp) == 7u;
-		const auto vector_type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
-		auto       value       = ExportVector(ctx, data, exp, uint_output);
+		const auto output_type =
+		    state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
+		            exp.index < state.input_info.pixel->target_output_type.size()
+		        ? state.input_info.pixel->OutputType(exp.index)
+		        : ShaderPixelOutputType::Float;
+		const auto vector_type = TypePixelOutputVector(state, output_type);
+		auto       value       = ExportVector(ctx, data, exp, output_type);
 		if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
-		    exp.index == 0 && !uint_output &&
+		    exp.index == 0 && output_type == ShaderPixelOutputType::Float &&
 		    state.input_info.pixel->alpha_blend_source != ShaderAlphaBlendSource::None) {
 			// Broadcast logical alpha before swizzling the primary output.
 			const auto blend_output =

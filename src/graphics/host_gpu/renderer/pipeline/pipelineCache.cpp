@@ -644,7 +644,8 @@ void PipelineCache::Save() {
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
-    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
+    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+    std::span<const ShaderPixelOutputType, 8> target_output_type, bool pixel_active,
     std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
@@ -674,7 +675,8 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	ShaderParams pixel_params;
 	if (pixel_active) {
-		pixel_params      = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info,
+		                              target_output_type);
 		if (!mesh_active && !tess_active && Prospero::IsRectList(user_config.GetPrimType())) {
 			pixel_info.parameter_mode = ShaderPixelParameterMode::Rectangle;
 		} else if (context.GetModeControl().provoking_vtx_last) {
@@ -693,8 +695,10 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			// MRT1 supplies the second blend source for target 0.
 			pixel_info.target_output_mode[1]    = pixel_info.target_output_mode[0];
 			pixel_info.target_export_mapping[1] = pixel_info.target_export_mapping[0];
+			pixel_info.target_output_type[1]    = pixel_info.target_output_type[0];
 		} else if (blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
-		           pixel_info.target_output_mode[0] != 0 && pixel_info.target_output_mode[0] != 7 &&
+		           pixel_info.target_output_mode[0] != 0 &&
+		           pixel_info.OutputType(0) == ShaderPixelOutputType::Float &&
 		           std::all_of(std::begin(pixel_info.target_output_mode) + 1,
 		                       std::end(pixel_info.target_output_mode),
 		                       [](uint8_t mode) { return mode == 0; })) {
@@ -714,6 +718,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 				pixel_info.dual_source_blending     = true;
 				pixel_info.target_output_mode[1]    = pixel_info.target_output_mode[0];
 				pixel_info.target_export_mapping[1] = {};
+				pixel_info.target_output_type[1]    = pixel_info.target_output_type[0];
 			}
 		}
 	}

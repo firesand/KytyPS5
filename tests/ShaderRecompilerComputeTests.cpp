@@ -1367,6 +1367,10 @@ struct GraphicsCase {
   u32 pixel_perspective_sample_vgpr = UINT32_MAX;
   u32 pixel_perspective_centroid_vgpr = UINT32_MAX;
   u32 pixel_custom_interpolation_mask = 0;
+  ShaderPixelOutputType pixel_output_type = ShaderPixelOutputType::Float;
+  u32 pixel_output_mode = 0;
+  vk::Format color_format = vk::Format::eR32G32B32A32Sfloat;
+  u32 color_dwords_per_pixel = 4;
 };
 
 struct CompiledShader {
@@ -1794,6 +1798,8 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   pixel_info.ps_perspective_sample_vgpr = test.pixel_perspective_sample_vgpr;
   pixel_info.ps_perspective_centroid_vgpr = test.pixel_perspective_centroid_vgpr;
   pixel_info.custom_interpolation_mask = test.pixel_custom_interpolation_mask;
+  pixel_info.target_output_type[0] = test.pixel_output_type;
+  pixel_info.target_output_mode[0] = test.pixel_output_mode;
   for (u32 i = 0; i < std::size(pixel_info.interpolator_settings); i++) {
     pixel_info.interpolator_settings[i] = i;
   }
@@ -16362,6 +16368,7 @@ public:
       registers.SetViewportTransformControl(0x300);
       user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
       std::array<Prospero::ColorComponentMapping, 8> export_mapping{};
+      std::array<ShaderPixelOutputType, 8> output_types{};
       std::array<ShaderVertexInputInfo, 3> native_vertex_info{};
       std::array<uint64_t, 2> wave_ids{};
       std::array<std::vector<u32>, 2> wave_keys;
@@ -16372,7 +16379,7 @@ public:
         registers.SetPsInControl(wave.control);
         const auto programs = context.GetPipelineCache().GetGraphicsPrograms(
             native_vertex_regs, native_pixel_regs, registers.GetShaderRegisters(),
-            registers, user_config, export_mapping, true, native_vertex_info, pixel);
+            registers, user_config, export_mapping, output_types, true, native_vertex_info, pixel);
         Require(name, "pixel wave metadata propagation",
                 pixel.input_num == 8 && pixel.stage.program->wave_size == wave.width,
                 "SPI_PS_IN_CONTROL width did not reach the compiled pixel program");
@@ -16450,7 +16457,7 @@ public:
         registers.SetBlendControl(0, alpha_blend);
         const auto programs = context.GetPipelineCache().GetGraphicsPrograms(
             native_vertex_regs, native_pixel_regs, registers.GetShaderRegisters(),
-            registers, user_config, export_mapping, true, native_vertex_info, pixel);
+            registers, user_config, export_mapping, output_types, true, native_vertex_info, pixel);
         Require(name, "logical alpha blend program", pixel.alpha_blend_source == test.mode &&
                     pixel.dual_source_blending,
                 "the separate alpha equation did not reach the compiled pixel program");
@@ -16525,7 +16532,7 @@ public:
              .code_size_bytes = static_cast<uint32_t>(code.size() * sizeof(u32))});
         const auto programs = context.GetPipelineCache().GetGraphicsPrograms(
             native_vertex_regs, native_pixel_regs, registers.GetShaderRegisters(),
-            registers, user_config, export_mapping, true, native_vertex_info, pixel);
+            registers, user_config, export_mapping, output_types, true, native_vertex_info, pixel);
         vertex_shader = programs.vertex[0];
         pixel_shader = programs.pixel;
         vertex = native_vertex_info[0];
@@ -16877,8 +16884,8 @@ public:
     ValidateSpirv(test.name, vertex_spirv);
 
     Image target =
-        CreateImageMips(test.name, 1, 1, vk::Format::eR32G32B32A32Sfloat,
-                      vk::ImageUsageFlagBits::eColorAttachment, {}, 4,
+        CreateImageMips(test.name, 1, 1, test.color_format,
+                      vk::ImageUsageFlagBits::eColorAttachment, {}, test.color_dwords_per_pixel,
                       vk::ImageLayout::eGeneral, vk::ImageType::e2D,
                       test.layers > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D,
                       test.layers, 0, 0, test.samples);
@@ -16886,7 +16893,7 @@ public:
     if (test.samples != vk::SampleCountFlagBits::e1) {
       resolved = CreateImageMips(
           test.name, 1, 1, target.format, vk::ImageUsageFlagBits::eColorAttachment,
-          {}, 4, vk::ImageLayout::eGeneral, vk::ImageType::e2D,
+          {}, test.color_dwords_per_pixel, vk::ImageLayout::eGeneral, vk::ImageType::e2D,
           test.layers > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D,
           test.layers);
     }
@@ -17010,7 +17017,7 @@ public:
     color_blend.pAttachments = &color_attachment;
 
     vk::GraphicsPipelineCreateInfo pipeline_info{};
-    const vk::Format color_format = vk::Format::eR32G32B32A32Sfloat;
+    const vk::Format color_format = test.color_format;
     vk::PipelineRenderingCreateInfo rendering_pipeline{};
     rendering_pipeline.sType = vk::StructureType::ePipelineRenderingCreateInfo;
     rendering_pipeline.colorAttachmentCount = 1;
@@ -17067,7 +17074,7 @@ public:
     target.layout = vk::ImageLayout::eGeneral;
 
     auto pixel = ReadImage(test.name, resolved.image != nullptr ? &resolved : &target);
-    pixel.resize(4 * test.layers);
+    pixel.resize(test.color_dwords_per_pixel * test.layers);
 
     m_device.destroyPipeline(pipeline, nullptr);
     m_device.destroyPipelineLayout(pipeline_layout, nullptr);
@@ -36318,6 +36325,61 @@ GraphicsCase GraphicsInterpolationExport() {
            O::V_MOV_B32, O::EXP, O::S_ENDPGM}};
 }
 
+std::vector<GraphicsCase> GraphicsTypedColorExports() {
+  std::vector<GraphicsCase> tests;
+  const auto append = [&](const char *name, ShaderPixelOutputType type,
+                          u32 mode, vk::Format format,
+                          std::initializer_list<u32> values,
+                          std::initializer_list<u32> expected,
+                          bool compressed = false, u32 mask = 0xf) {
+    GraphicsCase test;
+    test.name = name;
+    test.pixel_output_type = type;
+    test.pixel_output_mode = mode;
+    test.color_format = format;
+    test.color_dwords_per_pixel = static_cast<u32>(expected.size());
+    test.expected_pixel = expected;
+    u32 reg = 0;
+    for (const auto value : values) {
+      AppendVMovLiteral(&test.fragment_code, reg++, value);
+    }
+    test.fragment_code.push_back(EncodeExp0(0, mask, true, compressed));
+    test.fragment_code.push_back(EncodeExp1(0, 1, 2, 3));
+    AppendEnd(&test.fragment_code);
+    test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::EXP,
+                    ShaderOpcode::S_ENDPGM};
+    tests.push_back(std::move(test));
+  };
+  // These bit patterns expose accidental float conversions and NaN canonicalization.
+  append("GraphicsUint32Export", ShaderPixelOutputType::Uint, 9,
+         vk::Format::eR32G32B32A32Uint,
+         {0, 0xffffffffu, 0x80000001u, 0x7fc00001u},
+         {0, 0xffffffffu, 0x80000001u, 0x7fc00001u});
+  append("GraphicsSint32Export", ShaderPixelOutputType::Sint, 9,
+         vk::Format::eR32G32B32A32Sint,
+         {0xffffffffu, 0x80000000u, 0x7fffffffu, 0xffffcfc7u},
+         {0xffffffffu, 0x80000000u, 0x7fffffffu, 0xffffcfc7u});
+  append("GraphicsR32UintExport", ShaderPixelOutputType::Uint, 1,
+         vk::Format::eR32Uint, {0x7fc00001u}, {0x7fc00001u}, false, 1);
+  append("GraphicsUintDefaultAlpha", ShaderPixelOutputType::Uint, 1,
+         vk::Format::eR32G32B32A32Uint, {0xffffffffu},
+         {0xffffffffu, 0, 0, 1}, false, 1);
+  append("GraphicsSintDefaultAlpha", ShaderPixelOutputType::Sint, 1,
+         vk::Format::eR32G32B32A32Sint, {0x80000000u},
+         {0x80000000u, 0, 0, 1}, false, 1);
+  // Packed modes must still infer the integer type when no attachment hint is supplied.
+  append("GraphicsPackedUint16Export", ShaderPixelOutputType::Float, 7,
+         vk::Format::eR32G32B32A32Uint, {0xffff8000u, 0x7fff0001u},
+         {32768, 65535, 1, 32767}, true);
+  append("GraphicsPackedSint16Export", ShaderPixelOutputType::Float, 8,
+         vk::Format::eR32G32B32A32Sint, {0xffff8000u, 0x7fff0001u},
+         {0xffff8000u, 0xffffffffu, 1, 32767}, true);
+  append("GraphicsFloatDefaultAlpha", ShaderPixelOutputType::Float, 1,
+         vk::Format::eR32G32B32A32Sfloat, {0x3f000000u},
+         {0x3f000000u, 0, 0, 0x3f800000u}, false, 1);
+  return tests;
+}
+
 GraphicsCase GraphicsPositionWExport() {
   GraphicsCase test;
   test.name = "GraphicsPositionWExport";
@@ -42549,6 +42611,14 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc == 2 && std::strcmp(argv[1], "--fragment-output-only") == 0) {
+    VulkanHarness vulkan;
+    for (const auto &test : GraphicsTypedColorExports()) {
+      RunGraphicsCase(&vulkan, test);
+    }
+    RunGraphicsCase(&vulkan, GraphicsInterpolationExport());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--thread-dimensions-only") == 0) {
     VulkanHarness vulkan;
     CheckComputeThreadDimensions(vulkan);

@@ -109,6 +109,14 @@ uint32_t TypeF32Vector(EmitterState& state, uint32_t components) {
 	return type;
 }
 
+uint32_t TypePixelOutputVector(EmitterState& state, ShaderPixelOutputType output_type) {
+	switch (output_type) {
+		case ShaderPixelOutputType::Uint: return TypeU32Vector(state, 4);
+		case ShaderPixelOutputType::Sint: return TypeI32Vector(state, 4);
+		default: return TypeF32Vector(state, 4);
+	}
+}
+
 uint32_t TypePointer(EmitterState& state, spv::StorageClass storage_class, uint32_t pointee) {
 	return state.builder.Type(spv::OpTypePointer, storage_class, pointee);
 }
@@ -660,12 +668,13 @@ void DefineOutputs(EmitterState& state) {
 				break;
 			case IR::StageOutputKind::Parameter:
 			case IR::StageOutputKind::Mrt: {
-				const bool uint_output =
+				const auto output_type =
 				    binding.kind == IR::StageOutputKind::Mrt &&
 				    state.program.stage == ShaderType::Pixel &&
-				    binding.index < std::size(state.input_info.pixel->target_output_mode) &&
-				    state.input_info.pixel->target_output_mode[binding.index] == 7u;
-				const auto type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
+				    binding.index < std::size(state.input_info.pixel->target_output_mode)
+				        ? state.input_info.pixel->OutputType(binding.index)
+				        : ShaderPixelOutputType::Float;
+				const auto type = TypePixelOutputVector(state, output_type);
 				binding.variable_id = DefineInterfaceVariable(state, type, spv::StorageClassOutput,
 				                                              binding.debug_name.c_str());
 				const bool dual_source = binding.kind == IR::StageOutputKind::Mrt &&

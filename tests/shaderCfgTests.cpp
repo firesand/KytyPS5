@@ -13097,6 +13097,150 @@ void TestNewShaderRecompilerExpPixelOutputs() {
   CheckSpirvBinaryValidates(unorm16_ba_result.spirv);
 }
 
+void TestPixel32BitRenderTargetOutputTypes() {
+  // A synthetic flat-input/R-only export exercises the same interface as an
+  // integer visibility-buffer clear, without using a captured game binary.
+  const uint32_t flat_shader[] = {
+      EncodeVintrp(2, 0, 0, 0, 2),
+      EncodeExp0(0x00, 0x1, true, false, true),
+      EncodeExp1(0, 0, 0, 0), EncodeSopp(0x01),
+  };
+  const uint32_t literal_shader[] = {
+      EncodeVop1(0x01, 0, 255u), 0x80000001u,
+      EncodeExp0(0x00, 0x1), EncodeExp1(0, 0, 0, 0), EncodeSopp(0x01),
+  };
+  ShaderPixelInputInfo pixel{};
+  pixel.input_num = 1;
+  pixel.interpolator_settings[0] = 0x400u;
+  pixel.ps_system_input_base = 2;
+  pixel.target_output_mode[0] = 1; // 32_R does not encode integer signedness.
+  pixel.target_shader_mask = 1;
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &pixel;
+  struct Case {
+    ShaderPixelOutputType type;
+    const char *variable;
+    const char *alpha;
+  };
+  const Case cases[] = {
+      {ShaderPixelOutputType::Float, "OpVariable %_ptr_Output_v4float Output",
+       "%uint_1065353216"},
+      {ShaderPixelOutputType::Uint, "OpVariable %_ptr_Output_v4uint Output",
+       "%uint_1"},
+      {ShaderPixelOutputType::Sint, "OpVariable %_ptr_Output_v4int Output",
+       "%uint_1"},
+  };
+  for (const auto &test : cases) {
+    pixel.target_output_type[0] = test.type;
+    for (const auto shader : {std::span<const uint32_t>(flat_shader),
+                              std::span<const uint32_t>(literal_shader)}) {
+      const auto result = RecompileForTest(shader, options);
+      CheckSpirvBinaryValidates(result.spirv);
+      const auto source = DisassembleSpirvBinary(result.spirv);
+      Check(source.find(test.variable) != std::string::npos,
+            "32-bit MRT export ignored the render-target numeric type");
+      Check(SpirvSourceHasInstructionOperand(source, "OpCompositeConstruct",
+                                             test.alpha),
+            "disabled alpha used the wrong integer/float representation");
+      for (const auto opcode : {109u, 110u, 111u, 112u}) {
+        Check(!SpirvContainsOpcode(result.spirv, opcode),
+              "raw 32-bit MRT export performed a numeric float conversion");
+      }
+      if (test.type == ShaderPixelOutputType::Sint) {
+        Check(source.find("OpBitcast %v4int") != std::string::npos,
+              "signed MRT export did not preserve the unsigned register bits");
+      }
+      if (shader.data() == literal_shader) {
+        Check(source.find("OpConstant %uint 2147483649") != std::string::npos,
+              "32-bit MRT export lost the high-bit payload");
+      }
+    }
+  }
+
+  pixel.target_output_type[0] = ShaderPixelOutputType::Float;
+  const auto float_key = MakeStageStaticKey(pixel);
+  pixel.target_output_type[0] = ShaderPixelOutputType::Uint;
+  const auto uint_key = MakeStageStaticKey(pixel);
+  pixel.target_output_type[0] = ShaderPixelOutputType::Sint;
+  const auto sint_key = MakeStageStaticKey(pixel);
+  Check(float_key != uint_key && uint_key != sint_key && float_key != sint_key,
+        "shader cache aliases float, uint and sint 32-bit MRT outputs");
+}
+
+void TestPackedIntegerRenderTargetOutputTypes() {
+  const uint32_t shader[] = {
+      EncodeVop1(0x01, 0, 255u), 0x8001ffffu,
+      EncodeVop1(0x01, 1, 255u), 0x7fff8000u,
+      EncodeExp0(0x00, 0xf, true, true), EncodeExp1(0, 1, 0, 0),
+      EncodeSopp(0x01),
+  };
+  ShaderPixelInputInfo pixel{};
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &pixel;
+  for (const auto mode : {7u, 8u}) {
+    pixel.target_output_mode[0] = mode;
+    pixel.target_output_type[0] = ShaderPixelOutputType::Float;
+    const auto result = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    const auto output = mode == 7u ? "OpVariable %_ptr_Output_v4uint Output"
+                                  : "OpVariable %_ptr_Output_v4int Output";
+    const auto extract = mode == 7u ? "OpBitFieldUExtract" : "OpBitFieldSExtract";
+    Check(source.find(output) != std::string::npos,
+          "packed integer mode lost its output signedness");
+    Check(CountSourceOccurrences(source, extract) == 4u,
+          "packed integer export did not extend each of its four 16-bit lanes");
+    Check(!SpirvContainsExtInst(result.spirv, 62),
+          "packed integer export was decoded as half-float data");
+    const auto key = MakeStageStaticKey(pixel);
+    pixel.target_output_type[0] = mode == 7u ? ShaderPixelOutputType::Sint
+                                            : ShaderPixelOutputType::Uint;
+    Check(MakeStageStaticKey(pixel) == key,
+          "packed integer type override produced a duplicate shader cache key");
+  }
+}
+
+void TestCompactRenderTargetOutputTypes() {
+  const uint32_t shader[] = {
+      EncodeExp0(0x00, 0xf), EncodeExp1(0, 1, 2, 3), EncodeSopp(0x01),
+  };
+  HW::PixelShaderInfo regs{};
+  regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(shader);
+  ShaderMappedData mapped{};
+  mapped.code_size_bytes = sizeof(shader);
+  ShaderMapUserData(regs.ps_regs.data_addr, mapped);
+  HW::ShaderRegisters sh{};
+  sh.target_output_mode[0] = 1;
+  sh.m_cbShaderMask = 0xf000; // MRT0 is the compact ordinal for physical target 3.
+  std::array<Prospero::ColorComponentMapping, 8> mappings{};
+  std::array<ShaderPixelOutputType, 8> types{};
+  types[3] = ShaderPixelOutputType::Uint;
+  ShaderPixelInputInfo pixel{};
+  PrepareProgram(regs, sh, mappings, pixel, types);
+  Check(pixel.OutputType(0) == ShaderPixelOutputType::Uint &&
+            pixel.OutputType(3) == ShaderPixelOutputType::Float,
+        "compact MRT ordinal selected the wrong physical target numeric type");
+  const auto uint_key = MakeStageStaticKey(pixel);
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &pixel;
+  const auto result = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(result.spirv);
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check(source.find("OpVariable %_ptr_Output_v4uint Output") != std::string::npos &&
+            source.find("OpDecorate %out_mrt_0 Location 3") != std::string::npos,
+        "compact integer MRT output lost its physical attachment location");
+  types[3] = ShaderPixelOutputType::Sint;
+  PrepareProgram(regs, sh, mappings, pixel, types);
+  Check(pixel.OutputType(0) == ShaderPixelOutputType::Sint &&
+            MakeStageStaticKey(pixel) != uint_key,
+        "physical render-target signedness was omitted from shader specialization");
+  types[0] = ShaderPixelOutputType::Uint;
+  const auto active_key = MakeStageStaticKey(pixel);
+  PrepareProgram(regs, sh, mappings, pixel, types);
+  Check(MakeStageStaticKey(pixel) == active_key,
+        "unbound physical target type introduced a duplicate shader variant");
+}
+
 void TestRenderTargetReverseExportMapping() {
   const auto format = TextureGetRenderTargetFormat(
       Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat,
@@ -15700,6 +15844,9 @@ int main() {
   TestNewShaderRecompilerPerInvocationMasksWithoutMirrors();
   TestNewShaderRecompilerPerInvocationU64Complement();
   TestNewShaderRecompilerExpPixelOutputs();
+  TestPixel32BitRenderTargetOutputTypes();
+  TestPackedIntegerRenderTargetOutputTypes();
+  TestCompactRenderTargetOutputTypes();
   TestRenderTargetReverseExportMapping();
   TestBlendMappingClassification();
   TestLogicalAlphaBlendExport();

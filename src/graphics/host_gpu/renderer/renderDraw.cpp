@@ -9,6 +9,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
@@ -875,13 +876,23 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	state.ps_input_info = {};
 	std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX>
 	    target_export_mapping {};
+	std::array<ShaderPixelOutputType, RENDER_COLOR_ATTACHMENTS_MAX> target_output_type {};
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		const auto& rt = ctx.GetRenderTarget(slot);
 		if ((color_output_mask & (1u << slot)) != 0 && rt.base.addr != 0) {
-			target_export_mapping[slot] =
+			const auto format =
 			    TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type,
-			                                 rt.info.channel_order)
-			        .export_mapping;
+			                                 rt.info.channel_order);
+			target_export_mapping[slot] = format.export_mapping;
+			switch (Prospero::SampledTextureNumericClass(format.guest_format)) {
+				case Prospero::TextureNumericClass::Uint:
+					target_output_type[slot] = ShaderPixelOutputType::Uint;
+					break;
+				case Prospero::TextureNumericClass::Sint:
+					target_output_type[slot] = ShaderPixelOutputType::Sint;
+					break;
+				default: break;
+			}
 		}
 	}
 	auto& pipeline_cache = buffer.GetContext().GetPipelineCache();
@@ -890,7 +901,8 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	}
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
-	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info);
+	    target_export_mapping, target_output_type, state.ps_active, state.vertex_info,
+	    state.ps_input_info);
 }
 
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,

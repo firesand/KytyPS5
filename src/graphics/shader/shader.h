@@ -161,6 +161,7 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 
 enum class ShaderAlphaBlendSource : uint8_t { None, SourceAlpha, SourceAlphaOne, SourceAlphaZero };
 enum class ShaderPixelParameterMode : uint8_t { FirstVertex, LastVertex, Rectangle };
+enum class ShaderPixelOutputType : uint8_t { Float, Uint, Sint };
 
 struct ShaderPixelInputInfo {
 	uint32_t                                       interpolator_settings[32]    = {0};
@@ -174,6 +175,7 @@ struct ShaderPixelInputInfo {
 	uint8_t                                        target_output_mode[8]        = {};
 	uint32_t                                       target_shader_mask           = UINT32_MAX;
 	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
+	std::array<ShaderPixelOutputType, 8>             target_output_type           = {};
 	uint32_t                                       scratch_size_dwords          = 0;
 	bool                                           ps_pos_x                     = false;
 	bool                                           ps_pos_y                     = false;
@@ -195,6 +197,13 @@ struct ShaderPixelInputInfo {
 	ShaderStageRuntime                             stage;
 
 	bool HasPositionInput() const { return ps_pos_x || ps_pos_y || ps_pos_z || ps_pos_w; }
+	ShaderPixelOutputType OutputType(uint32_t index) const {
+		// Packed integer exports carry their numeric type in SPI_SHADER_COL_FORMAT.
+		// Uncompressed 32-bit exports instead need the bound render-target type.
+		if (target_output_mode[index] == 7u) return ShaderPixelOutputType::Uint;
+		if (target_output_mode[index] == 8u) return ShaderPixelOutputType::Sint;
+		return target_output_type[index];
+	}
 };
 
 union ShaderStageInputInfo {

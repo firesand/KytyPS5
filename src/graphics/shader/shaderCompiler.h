@@ -38,7 +38,8 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 ShaderParams PrepareProgram(
     const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
-    ShaderPixelInputInfo&                               input_info);
+    ShaderPixelInputInfo&                               input_info,
+    std::span<const ShaderPixelOutputType> target_output_type = {});
 ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
                             ShaderComputeInputInfo& input_info);
 
