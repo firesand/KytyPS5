@@ -31,6 +31,8 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <cinttypes>
+#include <cstdlib>
 #include <atomic>
 #include <bit>
 #include <fmt/format.h>
@@ -113,7 +115,8 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
                     const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset) {
 	buffer_offset = 0;
 
-	const auto& [address, size, id] = source;
+	const auto& [address, size, id, untracked_write] = source;
+	const bool written = resource.written && !untracked_write;
 	if (address == 0 || size == 0) {
 		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
 	}
@@ -123,7 +126,7 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 		EXIT("storage buffer range is unsupported\n");
 	}
 	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(
-	    address, size, resource.written,
+	    address, size, written,
 	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id);
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
@@ -133,7 +136,7 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
-	if (resource.written) {
+	if (written) {
 		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
 	}
 	return result;
@@ -803,6 +806,28 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	}
 }
 
+// Zero Company binds whole-heap descriptors (NUM_RECORDS = 0xffffffff) from several shaders;
+// each (shader, resource) pair is reported once so the access pattern can be audited.
+template <typename Program>
+static void LogUnboundedBuffer(const Program& program, uint32_t resource,
+                               const ShaderBufferResource& descriptor, uint64_t address,
+                               uint64_t size) {
+	static std::vector<uint64_t> seen; // GPU thread only
+	const auto key = program.shader_hash ^ (uint64_t {resource} << 56u);
+	if (seen.size() >= 512 || std::find(seen.begin(), seen.end(), key) != seen.end()) {
+		return;
+	}
+	seen.push_back(key);
+	const auto& info = program.info.buffers[resource];
+	LOGF("UnboundedBuffer: stage=%d shader=0x%016" PRIx64 " res=%u written=%d read=%d atomic=%d"
+	     " formatted=%d scalar=%d stride=%u records=0x%08x extent=%u base=0x%016" PRIx64
+	     " size=0x%" PRIx64 " dma=%d\n",
+	     static_cast<int>(program.stage), program.shader_hash, resource, info.written ? 1 : 0,
+	     info.read ? 1 : 0, info.atomic ? 1 : 0, info.formatted ? 1 : 0, info.scalar ? 1 : 0,
+	     static_cast<uint32_t>(descriptor.Stride()), descriptor.NumRecords(), info.max_byte_extent,
+	     address, size, program.info.uses_dma ? 1 : 0);
+}
+
 void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	KYTY_PROFILER_FUNCTION();
 	auto& cache = m_context.GetBufferCache();
@@ -827,6 +852,13 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 				source = {};
 				continue;
 			}
+			// Zero Company's whole-heap descriptors carry NUM_RECORDS*stride = 0xfff00000 rather
+			// than the 0xffffffff sentinel; treat any request of 256 MiB or more as unbounded.
+			const bool unbounded = descriptor.NumRecords() == UINT32_MAX ||
+			                       size >= (uint64_t {256} << 20u);
+			if (unbounded) {
+				LogUnboundedBuffer(program, resource, descriptor, address, size);
+			}
 			if (descriptor.NumRecords() == UINT32_MAX) {
 				if (program.info.buffers[resource].written) {
 					// Sentinel write ranges end before tables captured by any bound stage.
@@ -848,7 +880,13 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 				}
 			}
 			size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
-			source = {address, size, cache.FindBuffer(address, size)};
+			static const bool untracked_probe = [] {
+				const char* value = std::getenv("KYTY_PROBE_UNBOUNDED_UNTRACKED");
+				return value != nullptr && value[0] == '1';
+			}();
+			const bool untracked_write = untracked_probe && unbounded &&
+			                             program.info.buffers[resource].written;
+			source = {address, size, cache.FindBuffer(address, size), untracked_write};
 		}
 	}
 }

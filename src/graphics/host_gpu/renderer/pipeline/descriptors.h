@@ -31,6 +31,9 @@ struct PreparedBindings {
 		uint64_t address = 0;
 		uint64_t size    = 0;
 		BufferId id;
+		// KYTY_PROBE_UNBOUNDED_UNTRACKED experiment: bind an unbounded (NUM_RECORDS=0xffffffff)
+		// written descriptor without marking its whole clamped range as GPU-modified.
+		bool untracked_write = false;
 	};
 
 	// The draw owns the immutable compiled-program/runtime-snapshot association through commit.
