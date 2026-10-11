@@ -13,6 +13,7 @@
 
 #include <map>
 #include <mutex>
+#include <unordered_map>
 #include <string>
 #include <atomic>
 #include <span>
@@ -111,6 +112,7 @@ public:
 		uint64_t obtain_calls = 0, obtain_bytes = 0, obtain_pages = 0;
 		uint64_t range_calls = 0, range_bytes = 0, range_pages = 0;
 		uint64_t download_calls = 0, download_wait_ns = 0, read_memory_calls = 0;
+		uint64_t bar_readbacks = 0;
 	};
 	[[nodiscard]] SyncStats TakeSyncStats() { return std::exchange(m_sync_stats, {}); }
 	void SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
@@ -156,6 +158,10 @@ private:
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	void QueueGpuModified(uint64_t vaddr, uint64_t size); // any thread
+	// Last GPU-write tick per 16 KiB page (0 = known complete), for TryBarReadback.
+	void NoteGpuWrite(uint64_t vaddr, uint64_t size, uint64_t tick);
+	// Copies completed GPU data straight from host-visible device memory (no queue drain).
+	[[nodiscard]] bool TryBarReadback(const Buffer& buffer, std::span<const vk::BufferCopy> copies);
 	// GPU thread. Only touches m_gpu_modified_ranges: it can run under the texture cache lock
 	// (TextureCache::FindImage asks HasGpuDirtyBytes), so texture invalidations are deferred.
 	void DrainPendingGpuModified();
@@ -188,6 +194,10 @@ private:
 	std::vector<std::pair<uint64_t, uint64_t>>        m_pending_gpu_modified;
 	std::vector<std::pair<uint64_t, uint64_t>>        m_pending_texture_invalidations;
 	SyncStats                                         m_sync_stats;
+	std::unordered_map<uint64_t, uint64_t>            m_gpu_write_ticks;
+	uint64_t                                          m_bar_block_tick = 0;
+	bool                                              m_last_download_bar = false;
+	int                                               m_last_bar_reason   = 0; // 1 unmapped, 2 no tick, 3 in flight
 	uint64_t                                          m_last_upload_bytes = 0;
 	uint64_t                                          m_last_upload_pages = 0;
 	std::atomic<bool>                                 m_has_pending_gpu_modified {false};

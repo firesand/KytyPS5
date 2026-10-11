@@ -1,4 +1,6 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include <cstdlib>
+#include <atomic>
 
 #include "common/logging/log.h"
 
@@ -81,6 +83,39 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal
 	                                     ? VkMemoryPropertyFlags {}
 	                                     : VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	// Cached guest buffers go to host-visible device-local memory when the device exposes it
+	// (resizable BAR): completed GPU data can then be read back without a queue drain
+	// (BufferCache::TryBarReadback). KYTY_BAR_READBACK=0 disables.
+	static const bool bar_readback = [] {
+		const char* value = std::getenv("KYTY_BAR_READBACK");
+		return value == nullptr || !(value[0] == '0' && value[1] == '\0');
+	}();
+	static const bool bar_memory = [&] {
+		if (!bar_readback) return false;
+		vk::PhysicalDeviceMemoryProperties properties {};
+		graphics.physical_device.getMemoryProperties(&properties);
+		constexpr auto wanted = vk::MemoryPropertyFlagBits::eDeviceLocal |
+		                        vk::MemoryPropertyFlagBits::eHostVisible |
+		                        vk::MemoryPropertyFlagBits::eHostCoherent;
+		for (uint32_t i = 0; i < properties.memoryTypeCount; ++i) {
+			const auto& type = properties.memoryTypes[i];
+			if ((type.propertyFlags & wanted) == wanted &&
+			    properties.memoryHeaps[type.heapIndex].size >= (uint64_t {4} << 30)) {
+				LOGF("Buffer: host-visible device-local memory type %u (%" PRIu64 " MiB heap) for "
+				     "cached guest buffers\n",
+				     i, properties.memoryHeaps[type.heapIndex].size >> 20);
+				return true;
+			}
+		}
+		LOGF("Buffer: no host-visible device-local memory type; readbacks copy through staging\n");
+		return false;
+	}();
+	if (bar_memory && usage == MemoryUsage::DeviceLocal && cpu_address != 0) {
+		allocation_info.flags |= VMA_ALLOCATION_CREATE_MAPPED_BIT |
+		                         VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+		allocation_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+		                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+	}
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
@@ -93,6 +128,19 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	m_buffer = native_buffer;
+	if (usage == MemoryUsage::DeviceLocal && cpu_address != 0) {
+		static std::atomic<uint64_t> by_type[8] {};
+		static std::atomic<uint64_t> created {0};
+		if (allocation_result.memoryType < 8) by_type[allocation_result.memoryType]++;
+		if (const auto n = ++created; n <= 8 || n % 2000 == 0) {
+			LOGF("Buffer: game buffers created=%llu by memory type: %llu %llu %llu %llu %llu "
+			     "(this one type %u mapped=%d)\n",
+			     static_cast<unsigned long long>(n), static_cast<unsigned long long>(by_type[0].load()),
+			     static_cast<unsigned long long>(by_type[1].load()), static_cast<unsigned long long>(by_type[2].load()),
+			     static_cast<unsigned long long>(by_type[3].load()), static_cast<unsigned long long>(by_type[4].load()),
+			     allocation_result.memoryType, allocation_result.pMappedData != nullptr ? 1 : 0);
+		}
+	}
 	if (size >= (64ull << 20)) {
 		// Claude probe: large host allocations, to correlate with GPU memory growth around stalls.
 		static const auto start = std::chrono::steady_clock::now();

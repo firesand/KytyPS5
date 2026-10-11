@@ -162,6 +162,12 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	if (copies.empty()) {
 		return false;
 	}
+	m_last_download_bar = false;
+	if constexpr (!async) {
+		if (TryBarReadback(buffer, copies)) {
+			return true;
+		}
+	}
 
 	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
 	std::unique_ptr<Buffer> temporary;
@@ -306,17 +312,20 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	const auto readback_start = std::chrono::steady_clock::now();
 	struct ReadbackReport {
 		bool enabled; uint64_t index; uint64_t vaddr, size; bool is_write; bool gpu_thread;
-		std::chrono::steady_clock::time_point start;
+		std::chrono::steady_clock::time_point start; const bool* bar; const int* reason;
 		~ReadbackReport() {
 			if (!enabled || (index >= 4000 && index % 100 != 0)) return;
 			const auto ms = std::chrono::duration_cast<std::chrono::microseconds>(
 			                    std::chrono::steady_clock::now() - start).count() / 1000.0;
-			LOGF("Readback: #%llu %s 0x%016" PRIx64 "+0x%" PRIx64 " from %s %.2f ms\n",
+			LOGF("Readback: #%llu %s 0x%016" PRIx64 "+0x%" PRIx64 " from %s %.2f ms %s\n",
 			     static_cast<unsigned long long>(index), is_write ? "write-fault" : "read",
-			     vaddr, size, gpu_thread ? "gpu-thread" : "game-thread", ms);
+			     vaddr, size, gpu_thread ? "gpu-thread" : "game-thread", ms,
+			     *bar ? "bar" : (*reason == 1 ? "unmapped" : *reason == 2 ? "notick" :
+			                     *reason == 3 ? "inflight" : "copy"));
 		}
 	} readback_report {readback_log, readback_index, vaddr, size, is_write,
-	                   GuestGpu::IsGpuThread(), readback_start};
+	                   GuestGpu::IsGpuThread(), readback_start, &m_last_download_bar,
+	                   &m_last_bar_reason};
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
@@ -548,6 +557,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	m_sync_stats.obtain_pages += m_last_upload_pages;
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
+		NoteGpuWrite(vaddr, size, m_scheduler.CurrentTick());
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
@@ -690,8 +700,61 @@ void BufferCache::DrainPendingGpuModified() {
 	}
 	for (const auto [vaddr, size]: pending) {
 		m_gpu_modified_ranges.Add(vaddr, size);
+		NoteGpuWrite(vaddr, size, 0); // marked by a priority operation after the GPU finished
 		m_pending_texture_invalidations.emplace_back(vaddr, size);
 	}
+}
+
+void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size, uint64_t tick) {
+	const auto first = vaddr >> CACHING_PAGEBITS;
+	const auto last  = (vaddr + size - 1) >> CACHING_PAGEBITS;
+	if (last - first >= 8192) {
+		m_bar_block_tick = std::max(m_bar_block_tick, tick); // too many pages: block until done
+		return;
+	}
+	for (auto page = first; page <= last; ++page) {
+		m_gpu_write_ticks[page] = tick;
+	}
+}
+
+bool BufferCache::TryBarReadback(const Buffer& buffer, std::span<const vk::BufferCopy> copies) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BAR_READBACK");
+		return value == nullptr || !(value[0] == '0' && value[1] == '\0');
+	}();
+	m_last_bar_reason = 0;
+	if (!enabled || buffer.Mapped().empty() || copies.empty()) {
+		m_last_bar_reason = 1;
+		return false;
+	}
+	const auto address = buffer.CpuAddress();
+	auto       latest  = m_bar_block_tick;
+	for (const auto& copy: copies) {
+		const auto first = (address + copy.srcOffset) >> CACHING_PAGEBITS;
+		const auto last  = (address + copy.srcOffset + copy.size - 1) >> CACHING_PAGEBITS;
+		for (auto page = first; page <= last; ++page) {
+			const auto found = m_gpu_write_ticks.find(page);
+			if (found == m_gpu_write_ticks.end()) {
+				m_last_bar_reason = 2;
+				return false; // marked by a path without a tick: keep the copy path
+			}
+			latest = std::max(latest, found->second);
+		}
+	}
+	if (latest != 0 && !m_scheduler.IsFree(latest)) {
+		m_last_bar_reason = 3;
+		return false; // the write is still in flight (or recorded in the current tick)
+	}
+	for (const auto& copy: copies) {
+		if (!buffer.IsCoherent()) {
+			const_cast<Buffer&>(buffer).Invalidate(copy.srcOffset, copy.size);
+		}
+		Libs::LibKernel::Memory::WriteBacking(address + copy.srcOffset,
+		                                      buffer.Mapped().data() + copy.srcOffset, copy.size);
+	}
+	m_sync_stats.bar_readbacks++;
+	m_last_download_bar = true;
+	return true;
 }
 
 void BufferCache::PublishPendingTextureInvalidations() {
