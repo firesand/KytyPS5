@@ -191,6 +191,9 @@ struct ShaderPixelInputInfo {
 	// CB round mode per converted export: zero adds half an LSB, one truncates.
 	uint8_t                                        target_round_mode            = 0;
 	uint32_t                                       scratch_size_dwords          = 0;
+	// LDS the guest reserves for this pixel shader (SPI_SHADER_PGM_RSRC2_PS.EXTRA_LDS_SIZE, in
+	// 128-dword granules); 0 when none. Sizes the per-fragment function-scope LDS array.
+	uint32_t                                       lds_size_dwords              = 0;
 	bool                                           ps_pos_x                     = false;
 	bool                                           ps_pos_y                     = false;
 	bool                                           ps_pos_z                     = false;

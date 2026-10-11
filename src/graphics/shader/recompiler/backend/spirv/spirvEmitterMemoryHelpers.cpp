@@ -1,4 +1,10 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
+#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+
+#include <cstdlib>
+#include <algorithm>
+#include <cstdio>
+#include <atomic>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
@@ -159,7 +165,29 @@ void EmitMemoryOffsets(EmitterState& state) {
 
 uint32_t LdsDwordCount(const EmitterState& state) {
 	const auto* workgroup = ShaderWorkgroupInput(state.program.stage, state.input_info);
-	return workgroup != nullptr ? workgroup->lds_size_dwords : 8192u;
+	if (workgroup != nullptr) {
+		return workgroup->lds_size_dwords;
+	}
+	// A non-compute stage keeps LDS in a function-scope array per invocation, which NVIDIA places
+	// in local memory: 8192 dwords is 32 KB per fragment, gigabytes across the GPU, and binding such
+	// a pipeline leaves every later local-memory access faulting (Zero Company, 2026-10-11). Size
+	// a pixel shader's array from the LDS the guest actually reserved for it instead.
+	// KYTY_FUNCTION_LDS_FROM_RSRC2=0 restores the old fixed size.
+	static const bool from_rsrc2 = [] {
+		const char* value = std::getenv("KYTY_FUNCTION_LDS_FROM_RSRC2");
+		return value == nullptr || !(value[0] == '0' && value[1] == '\0');
+	}();
+	if (from_rsrc2 && state.program.stage == ShaderType::Pixel && state.input_info.pixel != nullptr &&
+	    state.input_info.pixel->lds_size_dwords != 0) {
+		const auto dwords = std::min(state.input_info.pixel->lds_size_dwords, 8192u);
+		static std::atomic<uint32_t> logged = 0;
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+			std::printf("Shader: pixel 0x%016llx function LDS sized from RSRC2: %u dwords\n",
+			            static_cast<unsigned long long>(state.program.shader_hash), dwords);
+		}
+		return dwords;
+	}
+	return 8192u;
 }
 
 void EnsureLdsStorage(EmitterState& state) {
