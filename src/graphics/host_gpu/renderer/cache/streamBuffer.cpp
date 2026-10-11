@@ -1,5 +1,10 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include "common/logging/log.h"
+
+#include <chrono>
+#include <cinttypes>
+
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/profiler.h"
@@ -88,6 +93,15 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	m_buffer = native_buffer;
+	if (size >= (64ull << 20)) {
+		// Claude probe: large host allocations, to correlate with GPU memory growth around stalls.
+		static const auto start = std::chrono::steady_clock::now();
+		const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+		LOGF("Buffer: large allocation %" PRIu64 " bytes usage=%u flags=0x%x cpu=0x%" PRIx64
+		     " memory_type=%u t=%.1fs\n",
+		     size, static_cast<unsigned>(usage), static_cast<unsigned>(VkBufferUsageFlags(flags)),
+		     cpu_address, allocation_result.memoryType, seconds);
+	}
 	if (with_bda) {
 		vk::BufferDeviceAddressInfo address_info {};
 		address_info.buffer = m_buffer;
