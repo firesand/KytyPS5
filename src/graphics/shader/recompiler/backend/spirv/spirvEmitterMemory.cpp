@@ -202,7 +202,7 @@ void RecordUnboundedWrite(ValueEmitContext& ctx, const IR::Inst& inst, const IR:
 	    Unary(state, spv::OpUConvert, TypeU64(state), BufferByteAddress(ctx, inst, mem));
 	const auto page64 = Binary(state, spv::OpShiftRightLogical, TypeU64(state),
 	                           Binary(state, spv::OpIAdd, TypeU64(state), base, offset),
-	                           ConstantU32(state, BufferCache::CACHING_PAGEBITS));
+	                           ConstantU32(state, BufferCache::WRITE_FAULT_PAGEBITS));
 	const auto page   = Unary(state, spv::OpUConvert, TypeU32(state), page64);
 	const auto word   = Binary(state, spv::OpIAdd, TypeU32(state),
 	                           Binary(state, spv::OpShiftRightLogical, TypeU32(state), page,

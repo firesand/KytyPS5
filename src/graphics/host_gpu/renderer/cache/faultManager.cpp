@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "gpu_tiler_shaders/fault_buffer_process_4k_spv.h"
 #include "gpu_tiler_shaders/fault_buffer_process_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -26,7 +27,7 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
                            BufferCache& buffer_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_buffer_cache(buffer_cache),
       m_fault_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-                     BufferCache::CACHING_NUMPAGES / 4), // BDA half + unbounded-write half
+                     BufferCache::FAULT_BUFFER_BYTES), // BDA bitmap + unbounded-write bitmap
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
                         2 * MaxPendingFaults * PageFaultAreaSize) {
 	SetVulkanObjectNameF(m_graphics.device, m_fault_buffer.Handle(), "Fault Buffer");
@@ -66,10 +67,20 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
 	m_graphics.device.destroyShaderModule(module, nullptr);
 	RequireVulkanSuccess(result, "create fault-buffer pipeline");
 	SetVulkanObjectNameF(m_graphics.device, m_fault_process_pipeline, "Fault Buffer Parser");
+
+	const auto module_4k = CompileSPV(FAULT_BUFFER_PROCESS_4K_SPV, m_graphics.device);
+	stage.module         = module_4k;
+	pipeline_info.stage  = stage;
+	const auto result_4k = m_graphics.device.createComputePipelines(
+	    nullptr, 1, &pipeline_info, nullptr, &m_write_process_pipeline);
+	m_graphics.device.destroyShaderModule(module_4k, nullptr);
+	RequireVulkanSuccess(result_4k, "create write-fault pipeline");
+	SetVulkanObjectNameF(m_graphics.device, m_write_process_pipeline, "Write Fault Parser");
 }
 
 FaultManager::~FaultManager() {
 	m_graphics.device.destroyPipeline(m_fault_process_pipeline, nullptr);
+	m_graphics.device.destroyPipeline(m_write_process_pipeline, nullptr);
 	m_graphics.device.destroyPipelineLayout(m_fault_process_pipeline_layout, nullptr);
 	m_graphics.device.destroyDescriptorSetLayout(m_fault_process_desc_layout, nullptr);
 }
@@ -99,7 +110,8 @@ void FaultManager::Process(bool write_faults) {
 	// The compress pass only reads the entry counter; entries are written before being read back.
 	std::memset(mapped, 0, 64);
 	m_download_buffer.Flush(offset, 64);
-	constexpr vk::DeviceSize half_bytes = BufferCache::CACHING_NUMPAGES / 8;
+	constexpr vk::DeviceSize bda_bytes   = BufferCache::CACHING_NUMPAGES / 8;
+	constexpr vk::DeviceSize write_bytes = BufferCache::WRITE_FAULT_NUMPAGES / 8;
 
 	vk::BufferMemoryBarrier2 pre_barrier {};
 	pre_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
@@ -116,7 +128,7 @@ void FaultManager::Process(bool write_faults) {
 	post_barrier.dstAccessMask = vk::AccessFlagBits2::eShaderWrite;
 
 	const vk::DescriptorBufferInfo infos[] {
-	    {m_fault_buffer.Handle(), write_faults ? half_bytes : 0, half_bytes},
+	    {m_fault_buffer.Handle(), write_faults ? bda_bytes : 0, write_faults ? write_bytes : bda_bytes},
 	    {m_download_buffer.Handle(), offset, PageFaultAreaSize},
 	};
 	std::array<vk::WriteDescriptorSet, 2> writes {};
@@ -134,10 +146,12 @@ void FaultManager::Process(bool write_faults) {
 	dependency.bufferMemoryBarrierCount = 1;
 	dependency.pBufferMemoryBarriers    = &pre_barrier;
 	command.pipelineBarrier2(dependency);
-	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_fault_process_pipeline);
+	command.bindPipeline(vk::PipelineBindPoint::eCompute,
+	                     write_faults ? m_write_process_pipeline : m_fault_process_pipeline);
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,
 	                             m_fault_process_pipeline_layout, 0, writes);
-	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 32;
+	const auto num_threads    = (write_faults ? BufferCache::WRITE_FAULT_NUMPAGES
+	                                          : BufferCache::CACHING_NUMPAGES) / 32;
 	const auto num_workgroups = (num_threads + 63) / 64;
 	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
 	if (GpuDiagnostics::Enabled()) {

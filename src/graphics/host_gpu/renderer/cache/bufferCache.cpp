@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include <fmt/format.h>
+#include <chrono>
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -224,9 +225,14 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	if constexpr (async) {
 		m_scheduler.DeferPriorityOperation(std::move(publish));
 	} else {
-		const auto tick = m_scheduler.CurrentTick();
+		const auto tick  = m_scheduler.CurrentTick();
+		const auto start = std::chrono::steady_clock::now();
 		m_scheduler.Wait(tick);
 		m_scheduler.WaitPriorityOperations(tick);
+		m_sync_stats.download_calls++;
+		m_sync_stats.download_wait_ns += static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
+		        .count());
 		publish();
 	}
 	return true;
@@ -289,6 +295,28 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
+	m_sync_stats.read_memory_calls++; // counted on the calling thread; approximate
+	// KYTY_PROBE_READBACK_LOG=1: one line per synchronous readback request (first 4000, then 1/100).
+	static const bool readback_log = [] {
+		const char* value = std::getenv("KYTY_PROBE_READBACK_LOG");
+		return value != nullptr && value[0] == '1';
+	}();
+	static std::atomic<uint64_t> readback_count {0};
+	const auto readback_index = readback_log ? readback_count.fetch_add(1) : 0;
+	const auto readback_start = std::chrono::steady_clock::now();
+	struct ReadbackReport {
+		bool enabled; uint64_t index; uint64_t vaddr, size; bool is_write; bool gpu_thread;
+		std::chrono::steady_clock::time_point start;
+		~ReadbackReport() {
+			if (!enabled || (index >= 4000 && index % 100 != 0)) return;
+			const auto ms = std::chrono::duration_cast<std::chrono::microseconds>(
+			                    std::chrono::steady_clock::now() - start).count() / 1000.0;
+			LOGF("Readback: #%llu %s 0x%016" PRIx64 "+0x%" PRIx64 " from %s %.2f ms\n",
+			     static_cast<unsigned long long>(index), is_write ? "write-fault" : "read",
+			     vaddr, size, gpu_thread ? "gpu-thread" : "game-thread", ms);
+		}
+	} readback_report {readback_log, readback_index, vaddr, size, is_write,
+	                   GuestGpu::IsGpuThread(), readback_start};
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
@@ -563,6 +591,17 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	if (vaddr == 0) {
 		EXIT("BufferCache: invalid fill memory address\n");
 	}
+	static const bool fill_log = [] {
+		const char* value = std::getenv("KYTY_PROBE_READBACK_LOG");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (fill_log) {
+		static uint64_t fills = 0;
+		if (fills++ < 6000 || fills % 100 == 0) {
+			LOGF("FillBuffer: 0x%016" PRIx64 "+0x%" PRIx64 " value=0x%08x gpu_dirty=%d\n", vaddr,
+			     size, value, IsRegionGpuModified(vaddr, size) ? 1 : 0);
+		}
+	}
 	(void)m_texture_cache.ClearMeta(vaddr);
 	if (!IsRegionGpuModified(vaddr, size)) {
 		// Access the guest mapping so write faults invalidate cached buffers and images.
@@ -673,8 +712,8 @@ void BufferCache::OnCommandBoundary() {
 }
 
 void BufferCache::MarkPageWritten(uint64_t vaddr) {
-	if (m_memory_tracker.TryMarkRegionAsGpuModified(vaddr, CACHING_PAGESIZE)) {
-		QueueGpuModified(vaddr, CACHING_PAGESIZE);
+	if (m_memory_tracker.TryMarkRegionAsGpuModified(vaddr, WRITE_FAULT_PAGESIZE)) {
+		QueueGpuModified(vaddr, WRITE_FAULT_PAGESIZE);
 		return;
 	}
 	// The CPU wrote the page after the GPU did; the CPU data wins for that page.

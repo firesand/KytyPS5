@@ -1246,10 +1246,84 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	}
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
-	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+	static const bool clear_log = [] {
+		const char* value = std::getenv("KYTY_PROBE_READBACK_LOG");
+		return value != nullptr && value[0] == '1';
+	}();
+	const auto slice_size = range.size / layers;
+	const bool gpu_dirty = m_buffer_cache.IsRegionGpuModified(range.address, range.size);
+	if (gpu_dirty && ColorClearResolver::Enabled() && (slice_size & 3u) == 0 &&
+	    slice_size <= UINT32_MAX && desc.view_info.level_count == 1 && count <= 2048) {
+		// Volume textures use a 2D-array view over their depth slices (images are created
+		// 2D-array compatible), which also clears only the detected slices.
+		// GPU path: the metadata was written by the GPU; check and clear on the GPU timeline
+		// instead of draining the pipeline for a readback (see ColorClearResolver).
+		ColorClearResolver::Request request {};
+		for (uint32_t code_slot = 0; code_slot < ColorClearResolver::CodeSlots; ++code_slot) {
+			vk::ClearColorValue color {};
+			if (DecodeColorClear(desc, static_cast<uint8_t>(code_slot << 5u), color)) {
+				request.valid_mask |= 1u << code_slot;
+				request.colors[code_slot] = color;
+			}
+		}
+		if (request.valid_mask == 0) {
+			return; // no code could decode to a clear for this view: nothing to detect
+		}
+		const auto meta_address = range.address + slice_size * first;
+		const auto meta_size    = slice_size * count;
+		auto [meta_buffer, meta_offset] =
+		    m_buffer_cache.ObtainBuffer(meta_address, meta_size, /*is_written=*/true, false);
+		if (m_color_clear_resolver == nullptr) {
+			m_color_clear_resolver = std::make_unique<ColorClearResolver>(m_graphics, m_scheduler);
+		}
+		std::scoped_lock lock {m_lock};
+		auto& image   = m_slot_images[id];
+		auto& command = m_scheduler.Current();
+		TrackImage(id);
+		if (image.IsBufferModified() || image.IsCpuDirty()) {
+			InitializeImage(id); // the resolve may clear only some slices: upload guest data first
+		}
+		command.EndRendering();
+		ImageViewInfo attachment_view {};
+		attachment_view.format      = view.format;
+		attachment_view.type        = vk::ImageViewType::e2DArray;
+		attachment_view.base_level  = view.base_level;
+		attachment_view.base_layer  = image_first;
+		attachment_view.layer_count = count;
+		attachment_view.usage       = vk::ImageUsageFlagBits::eColorAttachment;
+		image.Transit(vk::ImageLayout::eColorAttachmentOptimal,
+		              vk::AccessFlagBits2::eColorAttachmentWrite, {}, command.Handle());
+		request.meta_buffer = meta_buffer->Handle();
+		request.meta_offset = meta_offset;
+		request.slice_bytes = static_cast<uint32_t>(slice_size);
+		request.slice_count = count;
+		request.attachment  = image.FindView(attachment_view);
+		request.extent      = {std::max(image.info.extent.width >> view.base_level, 1u),
+		                       std::max(image.info.extent.height >> view.base_level, 1u)};
+		m_color_clear_resolver->Resolve(command, request);
+		CommitGpuWrite(image);
+		ZeroCompanyImageLifecycle::Record(m_scheduler, "materialize-color-clear-gpu", id, image,
+		    {.request = &desc.info, .address = meta_address, .size = meta_size});
+		if (clear_log) {
+			static uint64_t gpu_resolves = 0;
+			if (gpu_resolves++ < 200 || gpu_resolves % 1000 == 0) {
+				LOGF("ColorClearCheck: gpu-resolve image data=0x%016" PRIx64 " meta=0x%016" PRIx64
+				     "+0x%" PRIx64 " slices=%u mask=0x%02x\n",
+				     desc.info.data.address, meta_address, meta_size, count, request.valid_mask);
+			}
+		}
+		return;
+	}
+	if (gpu_dirty) {
+		if (clear_log) {
+			LOGF("ColorClearCheck: readback image data=0x%016" PRIx64 " meta=0x%016" PRIx64
+			     "+0x%" PRIx64 " kind=%d type=%d volume=%d levels=%u slice=0x%" PRIx64 " count=%u\n",
+			     desc.info.data.address, range.address, range.size,
+			     static_cast<int>(desc.info.metadata.kind), static_cast<int>(desc.type),
+			     volume_texture ? 1 : 0, desc.view_info.level_count, slice_size, count);
+		}
 		m_buffer_cache.ReadMemory(range.address, range.size, false);
 	}
-	const auto slice_size = range.size / layers;
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = range.address + slice_size * (first + slice);
 		uint8_t code = 0;
@@ -1266,6 +1340,10 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		}
 		if (!std::all_of(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte == code; })) {
 			continue;
+		}
+		if (clear_log) {
+			LOGF("ColorClearCheck: CLEAR detected image data=0x%016" PRIx64 " slice=%u code=0x%02x\n",
+			     desc.info.data.address, slice, code);
 		}
 		{
 			std::scoped_lock lock {m_lock};

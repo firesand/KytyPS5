@@ -295,6 +295,36 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${fault_buffer_shader_header}")
+
+set(fault_buffer_4k_spv "${gpu_tiler_generated_dir}/fault_buffer_process_4k.spv")
+set(fault_buffer_4k_header "${gpu_tiler_generated_dir}/fault_buffer_process_4k_spv.h")
+add_custom_command(
+	OUTPUT "${fault_buffer_4k_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -DCACHING_PAGEBITS=12 -DMAX_PAGE_FAULTS=65536
+	        -o "${fault_buffer_4k_spv}" "${fault_buffer_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${fault_buffer_4k_spv} -DOUTPUT=${fault_buffer_4k_header}
+	        -DSYMBOL=FAULT_BUFFER_PROCESS_4K_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${fault_buffer_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${fault_buffer_4k_header}")
+
+set(color_clear_check_source "${gpu_tiler_shader_dir}/color_clear_check.comp")
+set(color_clear_check_spv "${gpu_tiler_generated_dir}/color_clear_check.spv")
+set(color_clear_check_header "${gpu_tiler_generated_dir}/color_clear_check_spv.h")
+add_custom_command(
+	OUTPUT "${color_clear_check_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${color_clear_check_spv}" "${color_clear_check_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${color_clear_check_spv} -DOUTPUT=${color_clear_check_header}
+	        -DSYMBOL=COLOR_CLEAR_CHECK_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${color_clear_check_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${color_clear_check_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")

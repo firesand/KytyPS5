@@ -103,9 +103,11 @@ struct FaultSampler {
 		for (size_t i = 0; i < top.size() && i < 8; ++i) {
 			line += fmt::format(" 0x{:x}:{} {}", top[i].first, top[i].second, describe(top[i].first));
 		}
-		line += fmt::format(" | syncs: obtain {} calls {} pages {} KiB, range {} calls {} pages {} KiB",
+		line += fmt::format(" | syncs: obtain {} calls {} pages {} KiB, range {} calls {} pages {} KiB"
+		                    " | downloads {} ({} ms waited), ReadMemory {}",
 		                    sync.obtain_calls, sync.obtain_pages, sync.obtain_bytes >> 10,
-		                    sync.range_calls, sync.range_pages, sync.range_bytes >> 10);
+		                    sync.range_calls, sync.range_pages, sync.range_bytes >> 10,
+		                    sync.download_calls, sync.download_wait_ns / 1000000, sync.read_memory_calls);
 		LOGF("%s\n", line.c_str());
 		last_total = now;
 	}

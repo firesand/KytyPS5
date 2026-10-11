@@ -33,9 +33,14 @@ public:
 	static constexpr uint32_t CACHING_PAGEBITS  = 14;
 	static constexpr uint64_t CACHING_PAGESIZE  = uint64_t {1} << CACHING_PAGEBITS;
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
-	// The fault buffer holds two page bitmaps: BDA accesses to uncached pages, then pages written
-	// through unbounded (whole-heap) buffer descriptors.
+	// The fault buffer holds two page bitmaps: BDA accesses to uncached pages (16 KiB pages), then
+	// pages written through unbounded (whole-heap) buffer descriptors at tracker granularity
+	// (4 KiB) so counters do not falsely dirty neighbouring metadata and CPU data.
+	static constexpr uint32_t WRITE_FAULT_PAGEBITS   = 12;
+	static constexpr uint64_t WRITE_FAULT_PAGESIZE   = uint64_t {1} << WRITE_FAULT_PAGEBITS;
+	static constexpr uint64_t WRITE_FAULT_NUMPAGES   = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> WRITE_FAULT_PAGEBITS;
 	static constexpr uint32_t WRITE_FAULT_WORD_OFFSET = static_cast<uint32_t>(CACHING_NUMPAGES / 32);
+	static constexpr uint64_t FAULT_BUFFER_BYTES     = CACHING_NUMPAGES / 8 + WRITE_FAULT_NUMPAGES / 8;
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
 	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
 
@@ -105,6 +110,7 @@ public:
 	struct SyncStats {
 		uint64_t obtain_calls = 0, obtain_bytes = 0, obtain_pages = 0;
 		uint64_t range_calls = 0, range_bytes = 0, range_pages = 0;
+		uint64_t download_calls = 0, download_wait_ns = 0, read_memory_calls = 0;
 	};
 	[[nodiscard]] SyncStats TakeSyncStats() { return std::exchange(m_sync_stats, {}); }
 	void SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);

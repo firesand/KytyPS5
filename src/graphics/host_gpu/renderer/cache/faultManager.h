@@ -39,6 +39,7 @@ private:
 	uint32_t                                   m_current_write_area = 0;
 	vk::DescriptorSetLayout                    m_fault_process_desc_layout = nullptr;
 	vk::Pipeline                               m_fault_process_pipeline = nullptr;
+	vk::Pipeline                               m_write_process_pipeline = nullptr; // 4 KiB pages
 	vk::PipelineLayout                         m_fault_process_pipeline_layout = nullptr;
 };
 

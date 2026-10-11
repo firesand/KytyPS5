@@ -1,0 +1,57 @@
+// Checks native color metadata (DCC/CMask) slices for a uniform fast-clear code on the GPU.
+// One workgroup per slice. For slice s and code index k = code >> 5 the flag at
+// flags[s * 8 + k] becomes 1 when every byte of the slice equals the (valid) code; the slice's
+// metadata is then overwritten with 0xff ("expanded") so the clear is not applied again.
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer meta_buf {
+    uint meta[];
+};
+
+layout(std430, binding = 1) buffer flags_buf {
+    uint flags[];
+};
+
+layout(push_constant) uniform push {
+    uint slice_dwords;
+    uint slice_count;
+    uint valid_mask;   // bit k set when code (k << 5) decodes to a clear colour for this view
+    uint padding;
+} pc;
+
+shared uint mismatch;
+
+void main() {
+    const uint slice = gl_WorkGroupID.x;
+    if (slice >= pc.slice_count) {
+        return;
+    }
+    const uint base = slice * pc.slice_dwords;
+    const uint code = meta[base] & 0xffu;
+    const uint word = code * 0x01010101u;
+    if (gl_LocalInvocationID.x == 0u) {
+        mismatch = 0u;
+    }
+    barrier();
+    for (uint i = gl_LocalInvocationID.x; i < pc.slice_dwords; i += 256u) {
+        if (meta[base + i] != word) {
+            atomicOr(mismatch, 1u);
+            break;
+        }
+    }
+    barrier();
+    const uint index = code >> 5u;
+    const bool valid = index < 8u && (pc.valid_mask & (1u << index)) != 0u;
+    const bool cleared = mismatch == 0u && valid;
+    if (gl_LocalInvocationID.x < 8u) {
+        flags[slice * 8u + gl_LocalInvocationID.x] =
+            (cleared && gl_LocalInvocationID.x == index) ? 1u : 0u;
+    }
+    if (cleared) {
+        for (uint i = gl_LocalInvocationID.x; i < pc.slice_dwords; i += 256u) {
+            meta[base + i] = 0xffffffffu;
+        }
+    }
+}

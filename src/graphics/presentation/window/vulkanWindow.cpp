@@ -681,6 +681,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 			     "automatic checkpoints, shader error reporting\n");
 		}
 	}
+	// GPU-side resolution of native color fast clears predicates clears on metadata checks.
+	vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering {};
+	if (HasExtension(device_extensions, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)) {
+		conditional_rendering.conditionalRendering = VK_TRUE;
+		conditional_rendering.pNext                = const_cast<void*>(create_info.pNext);
+		create_info.pNext                          = &conditional_rendering;
+	}
 	vk::PhysicalDeviceAddressBindingReportFeaturesEXT address_binding_report {};
 	if (HasExtension(device_extensions, VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME)) {
 		address_binding_report.reportAddressBinding = VK_TRUE;
@@ -1112,7 +1119,8 @@ void WindowContext::CreateVulkan() {
 		                             VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME,
 		                             VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME,
 		                             VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME,
-		                             VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME}) {
+		                             VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME,
+		                             VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}
