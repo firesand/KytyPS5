@@ -10,8 +10,8 @@
 
 namespace Libs::Graphics {
 
-// CPU records of commands actually emitted to Vulkan. These are deliberately
-// separate from CommandBuffer::SetDebugInfo, which also describes preparation.
+// CPU records of commands actually emitted to Vulkan, with explicitly named
+// preparation/snapshot markers. Separate from CommandBuffer::SetDebugInfo.
 struct GpuDiagnosticEvent {
 	const char* kind = "unknown";
 	uint64_t guest_submit = 0;
@@ -34,6 +34,10 @@ public:
 	static bool Serialize() {
 		static const bool enabled = Flag("KYTY_GPU_DIAGNOSTICS_SYNC");
 		return Enabled() && enabled;
+	}
+	static bool SerializePreparation() {
+		static const bool enabled = Flag("KYTY_GPU_DIAGNOSTICS_SYNC_PREP");
+		return Serialize() && enabled;
 	}
 	static bool DumpShaders() {
 		static const bool enabled = Flag("KYTY_GPU_DIAGNOSTICS_DUMP_SHADERS");
@@ -110,8 +114,8 @@ private:
 				if (auto* file = std::fopen(path, "a")) output = file;
 				else std::fprintf(stderr, "GPU_DIAGNOSTICS cannot open %s; using stderr\n", path);
 			}
-			std::fprintf(output, "GPU_DIAGNOSTICS enabled capacity=%zu sync=%u\n",
-			             Capacity, Serialize() ? 1u : 0u);
+			std::fprintf(output, "GPU_DIAGNOSTICS enabled capacity=%zu sync=%u sync_prep=%u\n",
+			             Capacity, Serialize() ? 1u : 0u, SerializePreparation() ? 1u : 0u);
 			std::fputs("GPU_DIAGNOSTICS args: draw=count,instances,first,vertex_offset_u32,"
 			           "first_instance,index_guest_addr; draw-mesh=groups,instances,1,"
 			           "guest_count,first_instance,index_guest_addr; dispatch=x,y,z,mode,"
@@ -121,6 +125,15 @@ private:
 			           "submit=command_buffer,wait_count,signal_count,result,queue,0; "
 			           "submit-wait=semaphore,value,stage_mask,index,0,0; "
 			           "submit-signal=semaphore,value,index,0,0,0\n", output);
+			std::fputs("GPU_DIAGNOSTICS preparation markers (CS 2ef44268a059254f only; "
+			           "not guest dispatch completion): preparation-boundary=groups_x,y,z,mode,"
+			           "buffer_count,image_count; preparation-wait-complete=submitted_tick,"
+			           "completed_tick,next_tick,0,0,0; cs-buffer-descriptor=index,guest_addr,"
+			           "stride,records,format,source_or_read_bit32_or_write_bit33; "
+			           "cs-buffer-binding=index,descriptor_index,buffer,offset,range,guest_size; "
+			           "cs-image-descriptor=index,dword_count,raw_dwords01,23,45,67; "
+			           "cs-image-memory=index,guest_addr,size,metadata_addr,metadata_size,"
+			           "metadata_kind\n", output);
 			std::fflush(output);
 		}
 		~Storage() { if (output != stderr) std::fclose(output); }

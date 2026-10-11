@@ -351,6 +351,65 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	BindSharedMemory(m_context, input_info, bindings);
 	RebindBuffers(bindings);
 
+	if (GpuDiagnostics::Enabled() && program.shader_hash == 0x2ef44268a059254full) {
+		auto& scheduler = m_context.GetCommandScheduler();
+		GpuDiagnosticEvent event;
+		event.guest_submit = submit_id;
+		event.pipeline = GpuDiagnostics::HandleValue(pipeline.pipeline);
+		event.shaders[0] = {program.shader_hash, compute_program.id,
+		                    static_cast<uint32_t>(program.stage)};
+		// Inspect immutable descriptor snapshots and already prepared host bindings only.
+		// Do not read guest memory here: that could introduce another readback/submit.
+		for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
+			const auto& resource = program.info.buffers[i];
+			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+			event.kind = "cs-buffer-descriptor";
+			event.args = {i, descriptor.Base48(), descriptor.Stride(), descriptor.NumRecords(),
+			              descriptor.RawFormat(), uint64_t {resource.source} |
+			                  (uint64_t {resource.read} << 32u) |
+			                  (uint64_t {resource.written} << 33u)};
+			scheduler.RecordGpuOperation(event);
+			if (resource.descriptor_index != UINT32_MAX) {
+				const auto index = resource.descriptor_index;
+				const auto& view = bindings.buffers[index];
+				event.kind = "cs-buffer-binding";
+				event.args = {i, index, GpuDiagnostics::HandleValue(view.buffer), view.offset,
+				              view.range, bindings.buffer_sources[index].size};
+				scheduler.RecordGpuOperation(event);
+			}
+		}
+		for (uint32_t i = 0; i < program.info.images.size(); ++i) {
+			const auto& descriptor = resources.images[i];
+			event.kind = "cs-image-descriptor";
+			event.args = {i, descriptor.dword_count, 0, 0, 0, 0};
+			for (uint32_t pair = 0; pair < 4; ++pair) {
+				event.args[2 + pair] = uint64_t {descriptor.dwords[2 * pair]} |
+				    (uint64_t {descriptor.dwords[2 * pair + 1]} << 32u);
+			}
+			scheduler.RecordGpuOperation(event);
+			const auto& info = m_context.GetTextureCache().GetImage(bindings.images[i].image_id).info;
+			event.kind = "cs-image-memory";
+			event.args = {i, info.data.address, info.data.size, info.metadata.range.address,
+			              info.metadata.range.size, static_cast<uint64_t>(info.metadata.kind)};
+			scheduler.RecordGpuOperation(event);
+		}
+		event.kind = "preparation-boundary";
+		event.args = {thread_group_x, thread_group_y, thread_group_z, mode,
+		              program.info.buffers.size(), program.info.images.size()};
+		scheduler.RecordGpuOperation(event);
+		if (GpuDiagnostics::SerializePreparation()) {
+			const auto preparation_tick = scheduler.CurrentTick();
+			// FlushAndWait preserves the CommandBuffer wrapper and prepared bindings and
+			// does not drain deferred resource destruction. No new upload is allocated
+			// before this dispatch's existing per-operation wait retires its resources.
+			scheduler.FlushAndWait();
+			event.kind = "preparation-wait-complete";
+			event.args = {preparation_tick, scheduler.GetMasterSemaphore().KnownGpuTick(),
+			              scheduler.CurrentTick(), 0, 0, 0};
+			scheduler.RecordGpuOperation(event);
+		}
+	}
+
 	auto              vk_buffer        = buffer.Handle();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
