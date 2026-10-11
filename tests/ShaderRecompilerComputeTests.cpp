@@ -32011,6 +32011,81 @@ TestCase DsMaskedOrContention(u32 wave_size) {
   return test;
 }
 
+enum class LdsByteTablePattern { Dense, Sparse, Interleaved };
+
+TestCase DsByteCompactionTablesWave64(LdsByteTablePattern pattern) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = pattern == LdsByteTablePattern::Dense ? "DsByteTablesWave64Dense" :
+              pattern == LdsByteTablePattern::Sparse ? "DsByteTablesWave64Sparse" :
+                                                      "DsByteTablesWave64Interleaved";
+  auto &code = test.code;
+  // MS 67e610ccc37800ed stores rank at LDS[324 + local] and the inverse
+  // mapping at LDS[68 + rank] (native PCs 0x40c/0x414). Use all four guest
+  // waves, hence four physical subgroup32s with two virtual halves apiece.
+  code.push_back(EncodeVop1(0x01, 4, Vgpr(0)));
+  code.push_back(EncodeSop1(0x04, 10, 126));
+  code.push_back(EncodeVop2(0x1a, 7, InlineU32(2), 4));
+  AppendVMovLiteral(&code, 8, 0xcdcdcdcdu);
+  code.push_back(EncodeDs0(0x0d));
+  code.push_back(EncodeDs1(0, 8, 7));
+  code.push_back(EncodeSopp(0x0a, 0));
+
+  code.push_back(EncodeVop2(0x18, 1, InlineU32(6), 4)); // guest wave = local >> 6
+  code.push_back(EncodeVop2(0x1b, 3, InlineU32(63), 4));
+  if (pattern == LdsByteTablePattern::Sparse) {
+    // Drop the first lane of each guest wave: rank = local - wave - 1.
+    // 63 entries per wave makes inverse-table words straddle subgroup edges.
+    code.push_back(EncodeVop2(0x26, 2, Vgpr(4), 1));
+    code.push_back(EncodeVop2(0x27, 2, InlineU32(1), 2));
+    code.push_back(EncodeVopc(0xc5, InlineU32(0), 3));
+    code.push_back(EncodeSop1(0x04, 126, 106));
+  } else if (pattern == LdsByteTablePattern::Interleaved) {
+    // Each inverse-table DWORD receives one byte from each guest wave.
+    code.push_back(EncodeVop2(0x1a, 2, InlineU32(2), 3));
+    code.push_back(EncodeVop2(0x25, 2, Vgpr(1), 2));
+  } else {
+    code.push_back(EncodeVop1(0x01, 2, Vgpr(4)));
+  }
+  code.push_back(EncodeDs0(0x1e, 324));
+  code.push_back(EncodeDs1(0, 2, 4));
+  code.push_back(EncodeDs0(0x1e, 68));
+  code.push_back(EncodeDs1(0, 4, 2));
+  code.push_back(EncodeSop1(0x04, 126, 10));
+  code.push_back(EncodeSopp(0x0a, 0));
+
+  // Read every byte, including sparse holes and untouched inverse-table tail.
+  code.push_back(EncodeDs0(0x3a, 324));
+  code.push_back(EncodeDs1(5, 0, 4));
+  code.push_back(EncodeDs0(0x3a, 68));
+  code.push_back(EncodeDs1(6, 0, 4));
+  AppendStoreVgprAtLaneDwordOffset(&code, 5, 4, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 6, 4, 256);
+  AppendEnd(&code);
+
+  test.expected.assign(512, 0xcdu);
+  for (u32 local = 0, compact_rank = 0; local < 256; ++local) {
+    if (pattern == LdsByteTablePattern::Sparse && local % 64u == 0u) continue;
+    const u32 rank = pattern == LdsByteTablePattern::Interleaved
+                         ? (local % 64u) * 4u + local / 64u
+                         : compact_rank++;
+    test.expected[local] = rank;
+    test.expected[256u + rank] = local;
+  }
+  test.compute_info.threads_num[0] = 256;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 64;
+  test.compute_info.lds_size_dwords = 256;
+  test.has_compute_info = true;
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B64, O::S_BARRIER,
+                  O::DS_WRITE_B32, O::DS_WRITE_B8, O::DS_READ_U8,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"DS_WRITE_B8", 2}, {"DS_READ_U8", 2}};
+  test.required_spirv = {"OpAtomicLoad", "OpAtomicCompareExchange", "OpLoopMerge"};
+  return test;
+}
+
 TestCase DsAtomicReturnVariants() {
   using O = ShaderOpcode;
 
@@ -37343,6 +37418,10 @@ std::vector<TestCase> MakeCases() {
   }
   for (u32 wave_size : {32, 64}) {
     cases.push_back(DsMaskedOrContention(wave_size));
+  }
+  for (const auto pattern : {LdsByteTablePattern::Dense, LdsByteTablePattern::Sparse,
+                             LdsByteTablePattern::Interleaved}) {
+    cases.push_back(DsByteCompactionTablesWave64(pattern));
   }
   AddCase(DsAtomicReturnVariants);
   for (bool add : {false, true}) {
@@ -43034,6 +43113,37 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--ps-548a-skip-compile-only") == 0) {
     CheckPixel548aSkipProbe();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--lds-byte-tables-compile-only") == 0) {
+    for (const auto pattern : {LdsByteTablePattern::Dense, LdsByteTablePattern::Sparse,
+                               LdsByteTablePattern::Interleaved}) {
+      const auto test = DsByteCompactionTablesWave64(pattern);
+      const auto compiled = CompileCase(test, 32);
+      spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+      std::string assembly;
+      Require(test.name, "byte-table disassembly",
+              tools.Disassemble(compiled.spirv, &assembly),
+              "failed to disassemble byte-table regression");
+      Require(test.name, "four physical subgroups",
+              assembly.find("LocalSize 128 1 1") != std::string::npos,
+              "256 guest lanes did not map to 128 physical lanes");
+      Require(test.name, "two byte writes in both virtual halves",
+              CountText(assembly, "OpAtomicCompareExchange ") == 4u &&
+                  CountText(assembly, "OpLoopMerge ") == 4u,
+              "expected four emitted packed-byte CAS loops");
+      std::printf("[compute] %-32s compile checks ok\n", test.name);
+    }
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--lds-byte-tables-only") == 0) {
+    VulkanHarness vulkan;
+    Require("LDS byte tables", "host subgroup size", vulkan.SubgroupSize() == 32u,
+            "this targeted run requires wave64 emulation on subgroup32");
+    for (const auto pattern : {LdsByteTablePattern::Dense, LdsByteTablePattern::Sparse,
+                               LdsByteTablePattern::Interleaved}) {
+      RunCase(&vulkan, DsByteCompactionTablesWave64(pattern));
+    }
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--lds-wave-order-compile-only") == 0) {
