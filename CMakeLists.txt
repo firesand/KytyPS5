@@ -565,6 +565,32 @@ target_include_directories(image_page_table_tests PRIVATE ${inc_headers})
 
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
 
+# Explicit opt-in diagnostic executable; no emulator or guest package dependency.
+# GPU execution is manual, never registered with CTest or an ALL target.
+if(LINUX)
+	find_library(KYTY_REPLAY_VULKAN_LOADER NAMES vulkan)
+	if(KYTY_REPLAY_VULKAN_LOADER)
+		set(zero_replay_generated "${PROJECT_BINARY_DIR}/zero_replay_shaders")
+		add_custom_command(
+			OUTPUT "${zero_replay_generated}/zero_company_replay_frag.h"
+			COMMAND ${CMAKE_COMMAND} -E make_directory "${zero_replay_generated}"
+			COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+			        -o "${zero_replay_generated}/solid.spv" "${KYTY_TESTS_DIR}/ZeroCompanyMeshReplay.frag"
+			COMMAND ${CMAKE_COMMAND} -DINPUT=${zero_replay_generated}/solid.spv
+			        -DOUTPUT=${zero_replay_generated}/zero_company_replay_frag.h
+			        -DSYMBOL=ZERO_COMPANY_REPLAY_FRAG -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+			DEPENDS "${KYTY_TESTS_DIR}/ZeroCompanyMeshReplay.frag"
+			VERBATIM)
+		add_executable(zero_company_mesh_replay EXCLUDE_FROM_ALL
+			"${KYTY_TESTS_DIR}/ZeroCompanyMeshReplay.cpp"
+			"${zero_replay_generated}/zero_company_replay_frag.h")
+		target_include_directories(zero_company_mesh_replay PRIVATE "${zero_replay_generated}")
+		target_link_libraries(zero_company_mesh_replay PRIVATE Vulkan::Headers
+			${KYTY_REPLAY_VULKAN_LOADER} spirv-tools nlohmann_json::nlohmann_json)
+		target_compile_options(zero_company_mesh_replay PRIVATE -fexceptions)
+	endif()
+endif()
+
 set(gpu_test_generated_dir "${PROJECT_BINARY_DIR}/gpu_test_shaders")
 set(gpu_test_ms_depth_source
 	"${gpu_tiler_shader_dir}/gpu_test_ms_depth.comp")
