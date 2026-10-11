@@ -1166,7 +1166,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                            vk::ShaderStageFlagBits::eFragment,
 		                        0, sizeof(draw_data), draw_data);
 		ZeroCompanyMeshResources::Capture(buffer, submit_id,
-		    GpuDiagnostics::HandleValue(pipeline.pipeline), stages, draw_data);
+		    GpuDiagnostics::HandleValue(pipeline.pipeline),
+		    m_context.GetTextureCache().m_slot_images, stages, draw_data);
 	} else {
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}

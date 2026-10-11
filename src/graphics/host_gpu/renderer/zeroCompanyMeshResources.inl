@@ -12,6 +12,7 @@ static std::string Words(std::span<const uint32_t> words) {
 }
 
 static void Capture(CommandBuffer& buffer, uint64_t submit, uint64_t pipeline,
+                    const Common::SlotVector<Image>& images,
                     std::span<PreparedBindings* const> stages,
                     std::span<const uint32_t> draw_data) {
 	static const bool enabled = [] {
@@ -28,7 +29,6 @@ static void Capture(CommandBuffer& buffer, uint64_t submit, uint64_t pipeline,
 	const auto capture = captures.fetch_add(1, std::memory_order_relaxed);
 	if (capture >= 64u) return;
 	auto& scheduler = buffer.GetContext().GetCommandScheduler();
-	auto& cache = buffer.GetContext().GetTextureCache();
 	std::string log = fmt::format(
 	    "MeshResources: begin capture={} submit={} tick={} pipeline=0x{:x} "
 	    "draw_data={} metadata_only=true\n", capture, submit, scheduler.CurrentTick(),
@@ -81,7 +81,7 @@ static void Capture(CommandBuffer& buffer, uint64_t submit, uint64_t pipeline,
 			const auto& raw = snapshot.images.at(i);
 			const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(raw);
 			const auto& binding = prepared.images.at(i);
-			const auto* image = cache.m_slot_images.try_get(binding.image_id);
+			const auto* image = images.try_get(binding.image_id);
 			const auto kind = ShaderRecompiler::IR::DescriptorBindingForImage(resource);
 			log += fmt::format(
 			    "MeshResources: image capture={} stage_index={} resource={} source={} pc=0x{:x} "
