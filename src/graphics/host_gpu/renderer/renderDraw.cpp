@@ -1199,6 +1199,20 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 		if (GpuDiagnostics::Enabled()) {
+			const auto& mesh = state.vertex_info[0].mesh;
+			if (diagnostic.shaders[0].hash == 0x67e610ccc37800edull) {
+				auto layout = diagnostic;
+				layout.kind = "mesh-input-layout";
+				layout.args = {mesh.input_primitive, mesh.fast_launch, mesh.threads_num[0],
+				               mesh.primitives_per_group, mesh.vertices_per_group,
+				               mesh.wave_size | (uint64_t {mesh.host_subgroup_size} << 32u)};
+				m_context.GetCommandScheduler().RecordGpuOperation(layout);
+				layout.kind = "mesh-output-layout";
+				layout.args = {mesh.max_vertices, mesh.max_primitives, mesh.lds_size_dwords,
+				               draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
+				               draw.index_count, index_source.guest_element_size};
+				m_context.GetCommandScheduler().RecordGpuOperation(layout);
+			}
 			diagnostic.args = {mesh_groups, draw.instance_count, 1, draw.index_count,
 			                   emit.first_instance, index_source.address};
 			m_context.GetCommandScheduler().RecordGpuOperation(diagnostic);
