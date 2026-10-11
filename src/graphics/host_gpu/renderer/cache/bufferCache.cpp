@@ -769,11 +769,6 @@ void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
 }
 
-void BufferCache::SynchronizeBuffersForBda() {
-	m_memory_tracker.ForEachBdaSyncPendingRegion(
-	    [this](uint64_t vaddr, uint64_t size) { SynchronizeBuffersInRange(vaddr, size); });
-}
-
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 	const auto end = vaddr + size;
 	auto       it  = m_buffers.upper_bound(vaddr);

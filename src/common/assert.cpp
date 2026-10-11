@@ -6,6 +6,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <unistd.h>
 #include <fmt/format.h>
 #include <string>
 
@@ -45,6 +46,17 @@ int DbgExitHandler(const char* file, int line, fmt::text_style style, std::strin
 void DbgExit(int status) {
 	Subsystems::EmergencyShutdownActive();
 	std::fflush(nullptr);
+	// KYTY_HALT_WAIT_SECONDS=N keeps the failing thread parked here so a debugger can attach and
+	// capture every thread's backtrace before the process goes away.
+	if (const char* wait = std::getenv("KYTY_HALT_WAIT_SECONDS"); wait != nullptr) {
+		const int seconds = std::atoi(wait);
+		if (seconds > 0) {
+			std::fprintf(stderr, "halt: waiting %d s for a debugger (pid %ld)\n", seconds,
+			             static_cast<long>(getpid()));
+			std::fflush(stderr);
+			sleep(static_cast<unsigned>(seconds));
+		}
+	}
 	std::_Exit(status);
 }
 

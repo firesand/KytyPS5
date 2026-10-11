@@ -97,8 +97,12 @@ public:
 	void MarkPageWritten(uint64_t vaddr);      // any thread (fault-processing operation)
 	void MarkWriteFaultOverflow();             // any thread
 	void SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
-	// Uploads CPU-dirty pages of cached buffers in regions that changed since the last call.
-	void SynchronizeBuffersForBda();
+	// Tracker regions whose CPU-dirty state changed since the last call: func(address, size).
+	// Callers clip them to mapped guest memory before synchronizing (buffers may extend past it).
+	template <typename Func>
+	void ForEachBdaSyncPendingRegion(Func&& func) {
+		m_memory_tracker.ForEachBdaSyncPendingRegion(std::forward<Func>(func));
+	}
 	void               RunGarbageCollector();
 
 private:

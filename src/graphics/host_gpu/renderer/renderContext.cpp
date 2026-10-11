@@ -135,13 +135,19 @@ void RenderContext::PrepareBda() {
 		const char* value = std::getenv("KYTY_BDA_SYNC_ALL");
 		return value != nullptr && value[0] == '1';
 	}();
+	std::shared_lock lock(m_mapped_ranges_mutex);
 	if (sync_all) {
-		std::shared_lock lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
 		});
 	} else {
-		m_buffer_cache.SynchronizeBuffersForBda();
+		// Only regions with new CPU-dirty pages, clipped to mapped memory: cached buffers can
+		// extend past the mapping (stream leaps), and unmapped pages must never be read.
+		m_buffer_cache.ForEachBdaSyncPendingRegion([this](uint64_t vaddr, uint64_t size) {
+			m_mapped_ranges.ForEachInRange(vaddr, size, [this](uint64_t start, uint64_t end) {
+				m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+			});
+		});
 	}
 	m_fault_process_pending = true;
 }
