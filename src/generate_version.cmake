@@ -28,7 +28,7 @@ if(GIT_EXECUTABLE)
 	else()
 		string(SUBSTRING "${KYTY_GIT_REVISION}" 0 7 KYTY_GIT_HASH)
 		execute_process(
-			COMMAND "${GIT_EXECUTABLE}" diff-index --quiet HEAD --
+			COMMAND "${GIT_EXECUTABLE}" diff-index --quiet --ignore-submodules=all HEAD --
 			WORKING_DIRECTORY "${GIT_WORKING_DIRECTORY}"
 			RESULT_VARIABLE GIT_DIRTY_RESULT
 			ERROR_QUIET
