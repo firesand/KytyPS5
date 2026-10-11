@@ -35,10 +35,13 @@
 #include <limits>
 #include <mutex>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
+#include "graphics/host_gpu/renderer/zeroCompanyInputs.inl"
+
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
                                  GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
 	for (uint32_t i = 0; i < sources.size(); ++i) {
@@ -445,6 +448,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			event.args = {preparation_tick, scheduler.GetMasterSemaphore().KnownGpuTick(),
 			              scheduler.CurrentTick(), 0, 0, 0};
 			scheduler.RecordGpuOperation(event);
+			ZeroCompanyInputs::Capture(buffer, bindings, event);
 		}
 	}
 
