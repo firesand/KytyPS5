@@ -1,4 +1,7 @@
 #include "common/assert.h"
+#include <fmt/format.h>
+#include <string>
+#include <vector>
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
@@ -36,6 +39,52 @@ bool PipelineNoOptProbe() {
 		return value != nullptr && value[0] == '1' && value[1] == '\0';
 	}();
 	return enabled;
+}
+
+bool PipelineStatsProbe() {
+	static const bool enabled = [] { return std::getenv("KYTY_PROBE_PIPELINE_STATS") != nullptr; }();
+	return enabled;
+}
+
+// Logs VK_KHR_pipeline_executable_properties statistics (registers, spills, local memory...).
+void LogPipelineStatistics(GraphicContext& graphics, vk::Pipeline pipeline, uint64_t vertex_hash,
+                           uint64_t pixel_hash) {
+	if (VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPipelineExecutablePropertiesKHR == nullptr) {
+		return;
+	}
+	vk::PipelineInfoKHR pipeline_info {};
+	pipeline_info.pipeline = pipeline;
+	uint32_t count = 0;
+	if (graphics.device.getPipelineExecutablePropertiesKHR(&pipeline_info, &count, nullptr) !=
+	    vk::Result::eSuccess) {
+		return;
+	}
+	std::vector<vk::PipelineExecutablePropertiesKHR> executables(count);
+	graphics.device.getPipelineExecutablePropertiesKHR(&pipeline_info, &count, executables.data());
+	for (uint32_t index = 0; index < count; index++) {
+		vk::PipelineExecutableInfoKHR executable_info {};
+		executable_info.pipeline        = pipeline;
+		executable_info.executableIndex = index;
+		uint32_t stat_count             = 0;
+		graphics.device.getPipelineExecutableStatisticsKHR(&executable_info, &stat_count, nullptr);
+		std::vector<vk::PipelineExecutableStatisticKHR> stats(stat_count);
+		graphics.device.getPipelineExecutableStatisticsKHR(&executable_info, &stat_count, stats.data());
+		std::string line = fmt::format("PipelineStats: vs=0x{:016x} ps=0x{:016x} exec[{}] \"{}\" stages=0x{:x} subgroup={}:",
+		                               vertex_hash, pixel_hash, index, executables[index].name.data(),
+		                               static_cast<uint32_t>(executables[index].stages),
+		                               executables[index].subgroupSize);
+		for (const auto& stat: stats) {
+			std::string value;
+			switch (stat.format) {
+				case vk::PipelineExecutableStatisticFormatKHR::eBool32: value = stat.value.b32 ? "true" : "false"; break;
+				case vk::PipelineExecutableStatisticFormatKHR::eInt64: value = fmt::format("{}", stat.value.i64); break;
+				case vk::PipelineExecutableStatisticFormatKHR::eUint64: value = fmt::format("{}", stat.value.u64); break;
+				case vk::PipelineExecutableStatisticFormatKHR::eFloat64: value = fmt::format("{}", stat.value.f64); break;
+			}
+			line += fmt::format(" {}={}", stat.name.data(), value);
+		}
+		LOGF("%s\n", line.c_str());
+	}
 }
 } // namespace
 
@@ -529,6 +578,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	if (PipelineNoOptProbe()) {
 		pipeline_info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
 	}
+	if (PipelineStatsProbe()) {
+		pipeline_info.flags |= vk::PipelineCreateFlagBits::eCaptureStatisticsKHR;
+	}
 	pipeline_info.stageCount               = shader_stage_count;
 	pipeline_info.pStages                  = shader_stages;
 	pipeline_info.pVertexInputState        = mesh ? nullptr : &vertex_input_info;
@@ -559,6 +611,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	}
 	result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
 	                                                 &pipeline.pipeline);
+	if (result == vk::Result::eSuccess && pipeline.pipeline != nullptr && PipelineStatsProbe()) {
+		LogPipelineStatistics(graphics, pipeline.pipeline, vs_input_info.stage.program->shader_hash,
+		                      ps_active && ps_input_info != nullptr && ps_input_info->stage
+		                          ? ps_input_info->stage.program->shader_hash : 0ull);
+	}
 	if (result == vk::Result::eSuccess && pipeline.pipeline != nullptr) {
 		SetVulkanObjectNameF(graphics.device, pipeline.pipeline, "Kyty.Pipeline[vs 0x{:016x} ps 0x{:016x}]",
 		                     vs_input_info.stage.program->shader_hash,

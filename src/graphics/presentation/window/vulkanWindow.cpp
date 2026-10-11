@@ -687,6 +687,15 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		address_binding_report.pNext                = const_cast<void*>(create_info.pNext);
 		create_info.pNext                           = &address_binding_report;
 	}
+	// Claude probe: KYTY_PROBE_PIPELINE_STATS=1 captures driver pipeline statistics.
+	vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR executable_properties {};
+	if (HasExtension(device_extensions, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME) &&
+	    std::getenv("KYTY_PROBE_PIPELINE_STATS") != nullptr) {
+		executable_properties.pipelineExecutableInfo = VK_TRUE;
+		executable_properties.pNext                  = const_cast<void*>(create_info.pNext);
+		create_info.pNext                            = &executable_properties;
+		LOGF("Vulkan pipeline executable statistics enabled\n");
+	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
@@ -1102,7 +1111,8 @@ void WindowContext::CreateVulkan() {
 		                             VK_EXT_DEVICE_FAULT_EXTENSION_NAME,
 		                             VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME,
 		                             VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME,
-		                             VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME}) {
+		                             VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME,
+		                             VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}
