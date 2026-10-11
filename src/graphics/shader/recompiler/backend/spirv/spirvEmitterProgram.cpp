@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdlib>
 #include <functional>
 #include <optional>
 #include <type_traits>
@@ -285,6 +286,14 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 	ctx.state.current_block = block;
 	EmitLabel(ctx.state, block->Definition());
 	bool emitted_non_phi = false;
+	// Diagnostic only: the captured persistent compute shader depends on native
+	// wave-wide LDS instruction order even when EXEC changes between the writer
+	// and reader. Its wave64 is one host subgroup with two virtual halves.
+	const auto* lds_probe = std::getenv("KYTY_PROBE_LDS_WAVE_ORDER");
+	const bool probe_lds_order = ctx.state.program.stage == ShaderType::Compute &&
+	                            ctx.state.program.shader_hash == 0x2ef44268a059254full &&
+	                            lds_probe != nullptr && lds_probe[0] == '1' && lds_probe[1] == '\0';
+	std::optional<uint32_t> last_lds_probe_pc;
 	for (const auto& inst: *block) {
 		if (inst.GetOpcode() == IR::ValueOpcode::Phi) {
 			if (emitted_non_phi) {
@@ -292,6 +301,25 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 			}
 		} else {
 			emitted_non_phi = true;
+		}
+		const auto shared_access = IR::SharedAccessOf(inst.GetOpcode());
+		if (probe_lds_order &&
+		    (shared_access == IR::SharedAccess::Read || shared_access == IR::SharedAccess::Atomic) &&
+		    ctx.Memory(inst).kind == IR::ResourceKind::Lds) {
+			const auto pc = inst.Flags<IR::MemoryFlags>().pc;
+			if (last_lds_probe_pc != pc) {
+				// Emit once before both halves and outside the per-lane EXEC guard.
+				// A barrier at S_WAITCNT would be too late: the LDS read has already
+				// executed there. Do not synchronize independently progressing waves.
+				const auto memory = ctx.state.lds_storage_class == spv::StorageClassStorageBuffer
+				                        ? spv::MemorySemanticsUniformMemoryMask
+				                        : spv::MemorySemanticsWorkgroupMemoryMask;
+				ctx.state.builder.AddFunction(
+				    spv::OpControlBarrier, ConstantU32(ctx.state, spv::ScopeSubgroup),
+				    ConstantU32(ctx.state, spv::ScopeSubgroup),
+				    ConstantU32(ctx.state, spv::MemorySemanticsAcquireReleaseMask | memory));
+				last_lds_probe_pc = pc;
+			}
 		}
 		for (uint32_t half = 0; half < ctx.state.lane_count; half++) {
 			auto& lane          = half == 0 ? ctx : *ctx.other_half;

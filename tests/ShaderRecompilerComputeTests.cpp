@@ -1343,6 +1343,7 @@ struct TestCase {
   std::vector<std::pair<std::string, size_t>> ir_counts;
   u32 expected_mip_descriptors = 0;
   std::optional<std::vector<u32>> expected_buffer_resources;
+  uint64_t diagnostic_shader_hash = 0;
 };
 
 struct GraphicsCase {
@@ -1632,6 +1633,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   }
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Compute;
+  options.shader_hash = test.diagnostic_shader_hash;
   options.dump_ir = true;
   auto compute_info = test.compute_info;
   compute_info.host_subgroup_size = host_subgroup_size;
@@ -32748,6 +32750,70 @@ TestCase DsBpermuteWave64UsesIndependentHalves() {
   return test;
 }
 
+TestCase Wave64LdsInstructionOrder(bool probe_target = true) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = probe_target ? "Wave64LdsInstructionOrder" : "Wave64LdsInstructionOrderOtherHash";
+  auto &code = test.code;
+  AppendVMovU32(&code, 20, 0);
+  AppendVMovU32(&code, 4, 0);
+  code.push_back(EncodeSMovB32(8, InlineU32(1)));
+  AppendSMovLiteral(&code, 9, 257);
+  AppendSMovLiteral(&code, 10, 256);
+  const auto loop = code.size();
+  code.push_back(EncodeVop1(0x01, 3, 8));
+  // Native LDS instructions execute wave-wide in issue order. Publish first
+  // from virtual lane 63, then lane 0, and consume from all 64 lanes. There is
+  // intentionally no S_BARRIER and the wait follows the read, as in 2ef:0x188.
+  // The fixed 256 iterations always terminate, even if reads return stale data.
+  for (bool high_half : {true, false}) {
+    if (high_half) {
+      code.push_back(EncodeSop2(0x1f, 126, InlineU32(1), InlineU32(63)));
+    } else {
+      code.push_back(EncodeVop2(0x25, 3, 10, 3));
+      code.push_back(EncodeSop1(0x04, 126, InlineU32(1)));
+    }
+    const u32 offset = high_half ? 140u : 144u;
+    code.push_back(EncodeDs0(0x0d, offset));
+    code.push_back(EncodeDs1(0, 3, 20));
+    code.push_back(EncodeSop1(0x04, 126, 193u));
+    code.push_back(EncodeDs0(0x36, offset));
+    code.push_back(EncodeDs1(5, 0, 20));
+    code.push_back(EncodeSopp(0x0c, 0xc07f)); // S_WAITCNT lgkmcnt(0).
+    code.push_back(EncodeVop2(0x25, 4, Vgpr(5), 4));
+  }
+  // Each publication has its own LDS word, so this test isolates write->read
+  // visibility without adding an untested read->next-write dependency.
+  code.push_back(EncodeVop2(0x25, 20, InlineU32(8), 20));
+  code.push_back(EncodeSop2(0x00, 8, 8, InlineU32(1)));
+  code.push_back(EncodeSopc(0x0a, 8, 9));
+  code.push_back(EncodeSopp(0x05, static_cast<u32>(loop - code.size() - 1)));
+  AppendStoreVgprAtLaneDwordOffset(&code, 4, 0, 0);
+  AppendEnd(&code);
+  test.initial.assign(64, 0);
+  test.expected.assign(64, 131328); // Sum(i + i + 256), i=1..256.
+  test.opcodes = {O::S_MOV_B32, O::S_MOV_B64, O::S_LSHL_B64,
+                  O::V_MOV_B32, O::V_ADD_NC_U32, O::DS_WRITE_B32,
+                  O::DS_READ_B32, O::S_WAITCNT, O::S_ADD_U32,
+                  O::S_CMP_LT_U32, O::S_CBRANCH_SCC1,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpLoopMerge"};
+  const auto *probe = std::getenv("KYTY_PROBE_LDS_WAVE_ORDER");
+  if (probe_target && probe != nullptr && std::strcmp(probe, "1") == 0) {
+    test.required_spirv.push_back("OpControlBarrier %uint_3 %uint_3 %uint_264");
+  } else {
+    test.forbidden_spirv.push_back("OpControlBarrier");
+  }
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 64;
+  test.has_compute_info = true;
+  test.diagnostic_shader_hash = probe_target ? 0x2ef44268a059254full : 1u;
+  return test;
+}
+
 TestCase Wave64CrossHalfLaneAndLds() {
   using O = ShaderOpcode;
   std::vector<u32> code;
@@ -42904,6 +42970,32 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ImageStoreSingleMipBounds<0>());
     RunCase(&vulkan, ImageStoreSingleMipBounds<1>());
     RunCase(&vulkan, ImageStoreSingleMipBounds<2>());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--lds-wave-order-compile-only") == 0) {
+    const auto *probe = std::getenv("KYTY_PROBE_LDS_WAVE_ORDER");
+    const bool enabled = probe != nullptr && std::strcmp(probe, "1") == 0;
+    for (bool targeted : {false, true}) {
+      const auto test = Wave64LdsInstructionOrder(targeted);
+      for (u32 subgroup_size : {32u, 64u}) {
+        const auto compiled = CompileCase(test, subgroup_size);
+        spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+        std::string assembly;
+        Require(test.name, "LDS ordering disassembly",
+                tools.Disassemble(compiled.spirv, &assembly),
+                "failed to disassemble LDS ordering regression");
+        Require(test.name, "one barrier per guest LDS read",
+                CountText(assembly, "OpControlBarrier ") ==
+                    (enabled && targeted ? 2u : 0u),
+                "probe did not preserve its hash gate or emitted per-half barriers");
+      }
+    }
+    std::printf("[compute] LDS wave order compile checks ok (probe=%u)\n", enabled);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--lds-wave-order-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Wave64LdsInstructionOrder());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--wave64-only") == 0) {
