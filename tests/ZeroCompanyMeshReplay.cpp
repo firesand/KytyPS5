@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -59,10 +60,12 @@ uint64_t StreamFile(const fs::path& file, uint64_t size, void* destination = nul
     uint64_t hash = FnvBasis;
     for (uint64_t offset = 0; offset < size;) {
         auto count = static_cast<size_t>(std::min<uint64_t>(scratch.size(), size - offset));
-        auto* bytes = destination ? static_cast<char*>(destination) + offset : scratch.data();
-        in.read(bytes, static_cast<std::streamsize>(count));
+        // HOST_VISIBLE mappings may be uncached/write-combined. Hash ordinary
+        // CPU memory, then perform only sequential writes to the upload mapping.
+        in.read(scratch.data(), static_cast<std::streamsize>(count));
         Require(in.gcount() == static_cast<std::streamsize>(count), "short read: " + file.string());
-        hash = Hash(bytes, count, hash);
+        hash = Hash(scratch.data(), count, hash);
+        if (destination) std::memcpy(static_cast<char*>(destination) + offset, scratch.data(), count);
         offset += count;
     }
     Require(in.peek() == std::char_traits<char>::eof(), "file grew during read: " + file.string());
@@ -391,11 +394,16 @@ public:
 
     Json Run(const Capture& capture, const fs::path& out, uint32_t timeout_ms) {
         std::map<uint32_t, size_t> uploaded;
+        const auto upload_start = std::chrono::steady_clock::now();
+        std::cout << "upload begin: chunks=" << capture.chunks.size() << "; bytes=" << capture.bytes << std::endl;
         for (const auto& [index, c] : capture.chunks) {
             auto b = NewBuffer(c.size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
             Require(StreamFile(c.path, c.size, buffers[b].mapped) == c.hash, "input changed since validation");
             Flush(buffers[b]); uploaded[index] = b;
         }
+        std::cout << "upload complete: chunks=" << uploaded.size() << "; elapsed_ms="
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - upload_start).count()
+                  << std::endl;
         auto dummy = NewBuffer(16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         std::memset(buffers[dummy].mapped, 0, 16); Flush(buffers[dummy]);
         auto readback = NewBuffer(uint64_t(capture.width) * capture.height * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
