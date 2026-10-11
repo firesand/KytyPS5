@@ -32799,9 +32799,10 @@ TestCase Wave64LdsInstructionOrder(bool probe_target = true) {
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"OpLoopMerge"};
   const auto *probe = std::getenv("KYTY_PROBE_LDS_WAVE_ORDER");
+  const auto *probe_all = std::getenv("KYTY_PROBE_LDS_WAVE_ORDER_ALL");
   if (probe_target && probe != nullptr && std::strcmp(probe, "1") == 0) {
     test.required_spirv.push_back("OpControlBarrier %uint_3 %uint_3 %uint_264");
-  } else {
+  } else if (probe_all == nullptr || std::strcmp(probe_all, "1") != 0) {
     test.forbidden_spirv.push_back("OpControlBarrier");
   }
   test.compute_info.threads_num[0] = 64;
@@ -42974,7 +42975,9 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--lds-wave-order-compile-only") == 0) {
     const auto *probe = std::getenv("KYTY_PROBE_LDS_WAVE_ORDER");
+    const auto *probe_all = std::getenv("KYTY_PROBE_LDS_WAVE_ORDER_ALL");
     const bool enabled = probe != nullptr && std::strcmp(probe, "1") == 0;
+    const bool all_enabled = probe_all != nullptr && std::strcmp(probe_all, "1") == 0;
     for (bool targeted : {false, true}) {
       const auto test = Wave64LdsInstructionOrder(targeted);
       for (u32 subgroup_size : {32u, 64u}) {
@@ -42986,11 +42989,16 @@ int main(int argc, char **argv) {
                 "failed to disassemble LDS ordering regression");
         Require(test.name, "one barrier per guest LDS read",
                 CountText(assembly, "OpControlBarrier ") ==
-                    (enabled && targeted ? 2u : 0u),
-                "probe did not preserve its hash gate or emitted per-half barriers");
+                    ((enabled && targeted) || (all_enabled && subgroup_size == 32u) ? 2u : 0u),
+                "probe lost its hash/emulated-wave gate or emitted per-half barriers");
       }
     }
-    std::printf("[compute] LDS wave order compile checks ok (probe=%u)\n", enabled);
+    auto wave32 = Wave64LdsInstructionOrder(false);
+    wave32.compute_info.wave_size = 32;
+    wave32.forbidden_spirv.push_back("OpControlBarrier");
+    (void)CompileCase(wave32, 32);
+    std::printf("[compute] LDS wave order compile checks ok (probe=%u all=%u)\n",
+                enabled ? 1u : 0u, all_enabled ? 1u : 0u);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--lds-wave-order-only") == 0) {

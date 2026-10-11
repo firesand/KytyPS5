@@ -286,13 +286,18 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 	ctx.state.current_block = block;
 	EmitLabel(ctx.state, block->Definition());
 	bool emitted_non_phi = false;
-	// Diagnostic only: the captured persistent compute shader depends on native
-	// wave-wide LDS instruction order even when EXEC changes between the writer
-	// and reader. Its wave64 is one host subgroup with two virtual halves.
+	// Diagnostic only: test native wave-wide LDS instruction order when EXEC
+	// changes between writer and reader. The family probe is restricted to compute
+	// wave64 emulated as two virtual halves of one host subgroup32.
 	const auto* lds_probe = std::getenv("KYTY_PROBE_LDS_WAVE_ORDER");
-	const bool probe_lds_order = ctx.state.program.stage == ShaderType::Compute &&
-	                            ctx.state.program.shader_hash == 0x2ef44268a059254full &&
+	const auto* lds_probe_all = std::getenv("KYTY_PROBE_LDS_WAVE_ORDER_ALL");
+	const bool targeted_probe = ctx.state.program.shader_hash == 0x2ef44268a059254full &&
 	                            lds_probe != nullptr && lds_probe[0] == '1' && lds_probe[1] == '\0';
+	const bool family_probe = ctx.state.program.wave_size == 64u && ctx.state.lane_count == 2u &&
+	                          lds_probe_all != nullptr && lds_probe_all[0] == '1' &&
+	                          lds_probe_all[1] == '\0';
+	const bool probe_lds_order = ctx.state.program.stage == ShaderType::Compute &&
+	                            (targeted_probe || family_probe);
 	std::optional<uint32_t> last_lds_probe_pc;
 	for (const auto& inst: *block) {
 		if (inst.GetOpcode() == IR::ValueOpcode::Phi) {
