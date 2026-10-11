@@ -32086,6 +32086,202 @@ TestCase DsByteCompactionTablesWave64(LdsByteTablePattern pattern) {
   return test;
 }
 
+enum class MeshCompactionFixture { Empty, Sparse, Dense };
+
+TestCase Mesh67e6CompactionWave64(MeshCompactionFixture fixture) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = fixture == MeshCompactionFixture::Empty ? "Mesh67e6CompactionEmpty" :
+              fixture == MeshCompactionFixture::Sparse ? "Mesh67e6CompactionSparse" :
+                                                         "Mesh67e6CompactionDense";
+  constexpr u32 lanes = 256;
+  const u32 triangles = fixture == MeshCompactionFixture::Empty ? 0u :
+                        fixture == MeshCompactionFixture::Sparse ? 193u : 254u;
+  // Synthetic inputs keep the native triangle/LDS code while removing guest
+  // resources and MeshEXT allocation/rasterization from this regression.
+  // Sparse indices cross every wave/half boundary and leave one empty chunk.
+  constexpr std::array<u32, 19> sparse_vertices{
+      0, 1, 31, 32, 33, 63, 64, 65, 95, 96, 127, 128, 129,
+      192, 193, 223, 224, 254, 255};
+  test.initial.assign(10u * lanes, 0u);
+  std::array<bool, lanes> referenced{};
+  for (u32 triangle = 0; triangle < triangles; ++triangle) {
+    for (u32 component = 0; component < 3u; ++component) {
+      const u32 vertex = fixture == MeshCompactionFixture::Sparse
+                             ? sparse_vertices[(3u * triangle + component) %
+                                               sparse_vertices.size()]
+                             : (3u * triangle + component) % lanes;
+      test.initial[component * lanes + triangle] = vertex;
+      referenced[vertex] = true;
+    }
+  }
+  // Independent reference: ascending referenced vertices define the rank;
+  // neither the native prefix scan nor its packed tables are simulated here.
+  std::vector<u32> inverse;
+  std::array<u32, lanes> rank{};
+  std::array<u32, 8> masks{}, prefixes{};
+  for (u32 vertex = 0; vertex < lanes; ++vertex) {
+    if (vertex % 32u == 0u) prefixes[vertex / 32u] = inverse.size();
+    if (!referenced[vertex]) continue;
+    rank[vertex] = inverse.size();
+    inverse.push_back(vertex);
+    masks[vertex / 32u] |= 1u << (vertex % 32u);
+  }
+  test.expected = test.initial;
+  for (u32 local = 0; local < lanes; ++local) {
+    test.expected[3u * lanes + local] = inverse.size();
+    for (u32 component = 0; component < 3u; ++component) {
+      const u32 original = test.initial[component * lanes + local];
+      test.expected[(4u + component) * lanes + local] =
+          local < triangles ? rank[original] : original;
+    }
+    test.expected[7u * lanes + local] =
+        local < inverse.size() ? inverse[local] : local;
+    test.expected[8u * lanes + local] = masks[local % 8u];
+    test.expected[9u * lanes + local] = prefixes[local % 8u];
+  }
+
+  auto &code = test.code;
+  code.push_back(EncodeVop1(0x01, 4, Vgpr(0)));
+  code.push_back(EncodeVop1(0x01, 16, Vgpr(4)));
+  for (u32 component = 0; component < 3u; ++component) {
+    AppendVMovU32(&code, 31, component * lanes);
+    code.push_back(EncodeVop2(0x25, 31, Vgpr(4), 31));
+    code.push_back(EncodeVop2(0x1a, 31, InlineU32(2), 31));
+    AppendBufferLoadDword(&code, 5u + component, 31);
+  }
+  AppendSMovLiteral(&code, 8, lanes);
+  AppendSMovLiteral(&code, 33, triangles);
+  // Force the compaction branch even when empty. Native lanes 0..7 then
+  // initialize all masks/prefixes; inactive inverse entries retain local ID.
+  AppendSMovLiteral(&code, 1, triangles + 1u);
+  code.insert(code.end(), {0xbf070121u, 0x7e100208u}); // PCs 0x29c/0x2a0
+
+  // Exact 113-DWORD slice [0x2a4,0x468) from PPSA18054 MS
+  // 67e610ccc37800ed, captured in mesh-pixel-isolation-family-1, file
+  // shaders/original/0096_new_shader_ms_67e610ccc37800ed.bin.
+  // Slice SHA256: a481df78fc130dc81bce373c3fcf7ef4fe8abc836afcc0e5e4514021d5dc24d8.
+  // Relative branches, EXEC transitions, DPP controls, and all four barriers
+  // remain unchanged. Comments use original PCs, not fixture offsets.
+  static constexpr u32 native_compaction[] = {
+      0xbf840070u, // 0x2a4: S_CBRANCH_SCC0 0x00000468
+      0x7d880888u, // 0x2a8: V_CMP_GT_U32 vcc_lo, 8, v4
+      0xbefe046au, // 0x2ac: S_MOV_B64 exec_lo, vcc_lo
+      0xbf880004u, // 0x2b0: S_CBRANCH_EXECZ 0x000002c4
+      0x34000882u, // 0x2b4: V_LSHLREV_B32 v0, 2, v4
+      0x7e020280u, // 0x2b8: V_MOV_B32 v1, 0
+      0xd8340004u, 0x00000100u, // 0x2bc: DS_WRITE_B32 v0, v0, v1
+      0xbefe04c1u, // 0x2c4: S_MOV_B64 exec_lo, -1
+      0xbf8cc07fu, // 0x2c8: S_WAITCNT 0x0000c07f
+      0xbf8a0000u, // 0x2cc: s_barrier
+      0x7da80821u, // 0x2d0: V_CMPX_GT_U32 exec_lo, s33, v4
+      0xbf880012u, // 0x2d4: S_CBRANCH_EXECZ 0x00000320
+      0x2c040c85u, // 0x2d8: V_LSHRREV_B32 v2, 5, v6
+      0x2c100e85u, // 0x2dc: V_LSHRREV_B32 v8, 5, v7
+      0x2c060a85u, // 0x2e0: V_LSHRREV_B32 v3, 5, v5
+      0x340102f9u, 0x86060606u, // 0x2e4: V_LSHLREV_B32 v0, v6, 1
+      0x340302f9u, 0x86060607u, // 0x2ec: V_LSHLREV_B32 v1, v7, 1
+      0x34040482u, // 0x2f4: V_LSHLREV_B32 v2, 2, v2
+      0x34101082u, // 0x2f8: V_LSHLREV_B32 v8, 2, v8
+      0x34060682u, // 0x2fc: V_LSHLREV_B32 v3, 2, v3
+      0x341302f9u, 0x86060605u, // 0x300: V_LSHLREV_B32 v9, v5, 1
+      0xd8280004u, 0x00000903u, // 0x308: DS_OR_B32 v0, v3, v9
+      0xd8280004u, 0x00000108u, // 0x310: DS_OR_B32 v0, v8, v1
+      0xd8280004u, 0x00000002u, // 0x318: DS_OR_B32 v0, v2, v0
+      0xbf8cc07fu, // 0x320: S_WAITCNT 0x0000c07f
+      0xbf8a0000u, // 0x324: s_barrier
+      0xbefe046au, // 0x328: S_MOV_B64 exec_lo, vcc_lo
+      0xbf88001du, // 0x32c: S_CBRANCH_EXECZ 0x000003a4
+      0x34000882u, // 0x330: V_LSHLREV_B32 v0, 2, v4
+      0xd8d80004u, 0x01000000u, // 0x334: DS_READ_B32 v1, v0
+      0xbf8cc07fu, // 0x33c: S_WAITCNT 0x0000c07f
+      0xd7640003u, 0x00010101u, // 0x340: V_BCNT_U32_B32 v3, v1, 0
+      0xbeea286au, // 0x348: S_ORN2_SAVEEXEC_B64 vcc_lo, vcc_lo
+      0x02040680u, // 0x34c: V_CNDMASK_B32 v2, 0, v3
+      0x4a0404fau, 0xff011102u, // 0x350: V_ADD_NC_U32 v2, v2.dpp(ctrl=0x111,fi=0,bc=0), v2
+      0x4a0404fau, 0xff011202u, // 0x358: V_ADD_NC_U32 v2, v2.dpp(ctrl=0x112,fi=0,bc=0), v2
+      0x4a0404fau, 0xff011402u, // 0x360: V_ADD_NC_U32 v2, v2.dpp(ctrl=0x114,fi=0,bc=0), v2
+      0x4a0404fau, 0xff011802u, // 0x368: V_ADD_NC_U32 v2, v2.dpp(ctrl=0x118,fi=0,bc=0), v2
+      0xd7781001u, 0x03058302u, // 0x370: V_PERMLANEX16_B32 v1.opsel(lo=0,hi=1,neghi=0), v2, -1, -1
+      0x4a0402fau, 0xaf00e402u, // 0x378: V_ADD_NC_U32 v2, v2.dpp(ctrl=0xe4,fi=0,bc=0), v1
+      0x92fea0a0u, // 0x380: S_BFM_B64 exec_lo, 32, 32
+      0xd7600000u, 0x00013f02u, // 0x384: V_READLANE_B32 s0, v2, 31
+      0x4a040400u, // 0x38c: V_ADD_NC_U32 v2, s0, v2
+      0xbefe046au, // 0x390: S_MOV_B64 exec_lo, vcc_lo
+      0x4c020702u, // 0x394: V_SUB_NC_U32 v1, v2, v3
+      0x7e100302u, // 0x398: V_MOV_B32 v8, v2
+      0xd8340024u, 0x00000100u, // 0x39c: DS_WRITE_B32 v0, v0, v1
+      0xbefe04c1u, // 0x3a4: S_MOV_B64 exec_lo, -1
+      0xbf8cc07fu, // 0x3a8: S_WAITCNT 0x0000c07f
+      0xbf8a0000u, // 0x3ac: s_barrier
+      0x7e000280u, // 0x3b0: V_MOV_B32 v0, 0
+      0xd8dc1008u, 0x00000000u, // 0x3b4: DS_READ2_B32 v0, v0
+      0x7da80808u, // 0x3bc: V_CMPX_GT_U32 exec_lo, s8, v4
+      0xbf880016u, // 0x3c0: S_CBRANCH_EXECZ 0x0000041c
+      0x2c040885u, // 0x3c4: V_LSHRREV_B32 v2, 5, v4
+      0x341102f9u, 0x86060604u, // 0x3c8: V_LSHLREV_B32 v8, v4, 1
+      0x34060482u, // 0x3d0: V_LSHLREV_B32 v3, 2, v2
+      0xd8d80004u, 0x03000003u, // 0x3d4: DS_READ_B32 v3, v3
+      0xbf8cc07fu, // 0x3dc: S_WAITCNT 0x0000c07f
+      0x36100708u, // 0x3e0: V_AND_B32 v8, v8, v3
+      0x7daa1080u, // 0x3e4: V_CMPX_NE_U32 exec_lo, 0, v8
+      0xbf88000cu, // 0x3e8: S_CBRANCH_EXECZ 0x0000041c
+      0x34040482u, // 0x3ec: V_LSHLREV_B32 v2, 2, v2
+      0xd5480003u, 0x04110103u, // 0x3f0: V_BFE_U32 v3, v3, 0, v4
+      0xd8d80024u, 0x02000002u, // 0x3f8: DS_READ_B32 v2, v2
+      0xbf8cc07fu, // 0x400: S_WAITCNT 0x0000c07f
+      0xd7640002u, 0x00020503u, // 0x404: V_BCNT_U32_B32 v2, v3, v2
+      0xd8780144u, 0x00000204u, // 0x40c: DS_WRITE_B8 v0, v4, v2
+      0xd8780044u, 0x00000402u, // 0x414: DS_WRITE_B8 v0, v2, v4
+      0xbefe04c1u, // 0x41c: S_MOV_B64 exec_lo, -1
+      0xbf8cc07fu, // 0x420: S_WAITCNT 0x0000c07f
+      0xbf8a0000u, // 0x424: s_barrier
+      0x7da80821u, // 0x428: V_CMPX_GT_U32 exec_lo, s33, v4
+      0xbf880006u, // 0x42c: S_CBRANCH_EXECZ 0x00000448
+      0xd8e80144u, 0x05000005u, // 0x430: DS_READ_U8 v5, v5
+      0xd8e80144u, 0x07000007u, // 0x438: DS_READ_U8 v7, v7
+      0xd8e80144u, 0x06000006u, // 0x440: DS_READ_U8 v6, v6
+      0xbefe04c1u, // 0x448: S_MOV_B64 exec_lo, -1
+      0xd7640008u, 0x00020300u, // 0x44c: V_BCNT_U32_B32 v8, v0, v1
+      0x7da21104u, // 0x454: V_CMPX_LT_U32 exec_lo, v4, v8
+      0xbf880002u, // 0x458: S_CBRANCH_EXECZ 0x00000464
+      0xd8e80044u, 0x10000004u, // 0x45c: DS_READ_U8 v16, v4
+      0xbefe04c1u, // 0x464: S_MOV_B64 exec_lo, -1
+  };
+  static_assert(std::size(native_compaction) == 113u);
+  code.insert(code.end(), std::begin(native_compaction), std::end(native_compaction));
+
+  AppendStoreVgprAtLaneDwordOffset(&code, 8, 4, 3u * lanes);
+  for (u32 component = 0; component < 3u; ++component) {
+    AppendStoreVgprAtLaneDwordOffset(&code, 5u + component, 4,
+                                    (4u + component) * lanes);
+  }
+  AppendStoreVgprAtLaneDwordOffset(&code, 16, 4, 7u * lanes);
+  code.push_back(EncodeVop2(0x1b, 20, InlineU32(7), 4));
+  code.push_back(EncodeVop2(0x1a, 20, InlineU32(2), 20));
+  code.push_back(EncodeDs0(0x36, 4));
+  code.push_back(EncodeDs1(18, 0, 20));
+  code.push_back(EncodeDs0(0x36, 36));
+  code.push_back(EncodeDs1(19, 0, 20));
+  AppendStoreVgprAtLaneDwordOffset(&code, 18, 4, 8u * lanes);
+  AppendStoreVgprAtLaneDwordOffset(&code, 19, 4, 9u * lanes);
+  AppendEnd(&code);
+  test.compute_info.threads_num[0] = lanes;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 64;
+  test.compute_info.lds_size_dwords = 1024;
+  test.has_compute_info = true;
+  test.opcodes = {O::DS_OR_B32, O::DS_WRITE_B8, O::DS_READ_U8,
+                  O::V_PERMLANEX16_B32, O::V_READLANE_B32, O::S_BARRIER,
+                  O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"DS_OR_B32", 3}, {"DS_WRITE_B8", 2},
+                         {"DS_READ_U8", 4}, {"s_barrier", 4}};
+  test.required_spirv = {"OpAtomicOr", "OpAtomicCompareExchange",
+                         "OpGroupNonUniformShuffle", "OpControlBarrier"};
+  return test;
+}
+
 TestCase DsAtomicReturnVariants() {
   using O = ShaderOpcode;
 
@@ -37422,6 +37618,11 @@ std::vector<TestCase> MakeCases() {
   for (const auto pattern : {LdsByteTablePattern::Dense, LdsByteTablePattern::Sparse,
                              LdsByteTablePattern::Interleaved}) {
     cases.push_back(DsByteCompactionTablesWave64(pattern));
+  }
+  for (const auto fixture : {MeshCompactionFixture::Empty,
+                             MeshCompactionFixture::Sparse,
+                             MeshCompactionFixture::Dense}) {
+    cases.push_back(Mesh67e6CompactionWave64(fixture));
   }
   AddCase(DsAtomicReturnVariants);
   for (bool add : {false, true}) {
@@ -43113,6 +43314,43 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--ps-548a-skip-compile-only") == 0) {
     CheckPixel548aSkipProbe();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--mesh-compaction-compile-only") == 0) {
+    for (const auto fixture : {MeshCompactionFixture::Empty,
+                               MeshCompactionFixture::Sparse,
+                               MeshCompactionFixture::Dense}) {
+      const auto test = Mesh67e6CompactionWave64(fixture);
+      const auto compiled = CompileCase(test, 32);
+      spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+      std::string assembly;
+      Require(test.name, "compaction disassembly",
+              tools.Disassemble(compiled.spirv, &assembly),
+              "failed to disassemble native compaction regression");
+      Require(test.name, "four physical subgroups",
+              assembly.find("LocalSize 128 1 1") != std::string::npos,
+              "256 guest lanes did not map to 128 physical lanes");
+      Require(test.name, "native barriers only",
+              CountText(assembly, "OpControlBarrier ") == 4u,
+              "expected four unchanged native workgroup barriers; disable LDS probes");
+      Require(test.name, "packed byte writes and atomic masks",
+              CountText(assembly, "OpAtomicCompareExchange ") == 4u &&
+                  CountText(assembly, "OpLoopMerge ") == 4u &&
+                  CountText(assembly, "OpAtomicOr ") == 6u,
+              "expected both virtual halves of two byte writes and three mask atomics");
+      std::printf("[compute] %-32s compile checks ok\n", test.name);
+    }
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--mesh-compaction-only") == 0) {
+    VulkanHarness vulkan;
+    Require("mesh compaction", "host subgroup size", vulkan.SubgroupSize() == 32u,
+            "this targeted run requires wave64 emulation on subgroup32");
+    for (const auto fixture : {MeshCompactionFixture::Empty,
+                               MeshCompactionFixture::Sparse,
+                               MeshCompactionFixture::Dense}) {
+      RunCase(&vulkan, Mesh67e6CompactionWave64(fixture));
+    }
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--lds-byte-tables-compile-only") == 0) {
