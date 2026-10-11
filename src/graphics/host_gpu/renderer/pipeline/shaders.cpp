@@ -23,6 +23,8 @@
 
 #include <cstdlib>
 #include <algorithm>
+#include <cinttypes>
+#include <chrono>
 #include <bit>
 #include <limits>
 #include <span>
@@ -692,12 +694,19 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	EXIT_IF(pipeline.pipeline != nullptr);
 
-	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
-	     static_cast<void*>(pipeline.pipeline_layout));
+	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p cs=0x%016" PRIx64 "\n",
+	     static_cast<void*>(pipeline.pipeline_layout), input_info.stage.program->shader_hash);
+	Log::Flush(); // survive a kill during a long driver compile
+	const auto compile_start = std::chrono::steady_clock::now();
 	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
 	                                                &pipeline.pipeline);
-	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
-	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
+	const auto compile_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                            std::chrono::steady_clock::now() - compile_start)
+	                            .count();
+	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p cs=0x%016" PRIx64
+	     " ms=%lld\n",
+	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline),
+	     input_info.stage.program->shader_hash, static_cast<long long>(compile_ms));
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
