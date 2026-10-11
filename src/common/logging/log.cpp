@@ -1,5 +1,6 @@
 
 #include "common/logging/log.h"
+#include <cstdlib>
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -177,6 +178,14 @@ void Shutdown() {
 Direction GetDirection() {
 	EXIT_IF(!g_initialized);
 	return g_direction;
+}
+
+bool VerboseEnabled() {
+	static const bool verbose = [] {
+		const char* value = std::getenv("KYTY_LOG_VERBOSE");
+		return value != nullptr && value[0] == '1';
+	}();
+	return verbose;
 }
 
 bool IsSilent() {

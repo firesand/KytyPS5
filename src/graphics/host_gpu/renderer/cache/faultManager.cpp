@@ -192,7 +192,7 @@ void FaultManager::Process(bool write_faults) {
 			for (uint32_t index = 1; index <= count; ++index) {
 				const auto address = BufferCache::GuestAddress(faults[index]);
 				fault_ranges.Add(address, BufferCache::CACHING_PAGESIZE);
-				LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
+				if (::Log::VerboseEnabled()) LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
 			}
 			fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
 				EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());

@@ -2285,7 +2285,7 @@ static int PthreadRwlockInitNamed(PthreadRwlock* rwlock, const PthreadRwlockattr
 
 	new_rwlock->name = (name != nullptr ? name : "");
 
-	LOGF("\trwlock init: %s, 0\n", new_rwlock->name.c_str());
+	if (::Log::VerboseEnabled()) LOGF("\trwlock init: %s, 0\n", new_rwlock->name.c_str());
 
 	std::atomic_ref<PthreadRwlockPrivate*>(*rwlock).store(new_rwlock, std::memory_order_release);
 

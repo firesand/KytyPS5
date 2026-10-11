@@ -1930,7 +1930,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 
 	const uint32_t control_flags = control & 0x0fe00000u;
 	if (control_flags != 0x0f200000u) {
-		LOGF("\t temporary: accepting PS5 indirect buffer control flags = 0x%08" PRIx32 "\n",
+		if (::Log::VerboseEnabled()) LOGF("\t temporary: accepting PS5 indirect buffer control flags = 0x%08" PRIx32 "\n",
 		     control_flags);
 	}
 

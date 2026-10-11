@@ -731,7 +731,7 @@ int KYTY_SYSV_ABI AgcUnknownGetFusedShaderSize(SizeAlign* dst, const Shader* fro
                                                const Shader* back) {
 	PRINT_NAME();
 
-	LOGF("\t dst   = 0x%016" PRIx64 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t dst   = 0x%016" PRIx64 "\n"
 	     "\t front = 0x%016" PRIx64 "\n"
 	     "\t back  = 0x%016" PRIx64 "\n",
 	     reinterpret_cast<uint64_t>(dst), reinterpret_cast<uint64_t>(front),
@@ -1575,7 +1575,7 @@ int KYTY_SYSV_ABI AgcJumpPatchSetTarget(uint32_t* cmd, const volatile uint32_t* 
                                         uint32_t size_in_dwords) {
 	PRINT_NAME();
 
-	LOGF("\t cmd            = 0x%016" PRIx64 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t cmd            = 0x%016" PRIx64 "\n"
 	     "\t target         = 0x%016" PRIx64 "\n"
 	     "\t size_in_dwords = %" PRIu32 "\n",
 	     reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(target), size_in_dwords);
@@ -1874,7 +1874,7 @@ uint32_t* KYTY_SYSV_ABI AgcCbBranch(CommandBuffer* buf, uint8_t mode, uint8_t co
                                     uint32_t size_in_dwords2) {
 	PRINT_NAME();
 
-	LOGF("\t mode             = 0x%02" PRIx8 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t mode             = 0x%02" PRIx8 "\n"
 	     "\t compare_function = 0x%02" PRIx8 "\n"
 	     "\t compare_addr     = 0x%016" PRIx64 "\n"
 	     "\t mask             = 0x%016" PRIx64 "\n"
@@ -2742,7 +2742,7 @@ int KYTY_SYSV_ABI AgcUnknownIkfdtRIqCE(uint32_t* cmd, uint64_t arg1,
                                        uint64_t arg4, uint64_t arg5) {
 	PRINT_NAME();
 
-	LOGF("\t cmd            = 0x%016" PRIx64 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t cmd            = 0x%016" PRIx64 "\n"
 	     "\t arg1           = 0x%016" PRIx64 "\n"
 	     "\t target         = 0x%016" PRIx64 "\n"
 	     "\t size_in_dwords = %" PRIu32 "\n"
@@ -3217,7 +3217,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbCondExec(CommandBuffer* buf, const volatile uint32
                                        uint32_t num_dwords) {
 	PRINT_NAME();
 
-	LOGF("\t address    = 0x%016" PRIx64 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t address    = 0x%016" PRIx64 "\n"
 	     "\t num_dwords = %" PRIu32 "\n",
 	     reinterpret_cast<uint64_t>(address), num_dwords);
 
@@ -3475,7 +3475,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbCopyData(CommandBuffer* buf, uint8_t dst, uint8_t 
                                        uint8_t write_confirm) {
 	PRINT_NAME();
 
-	LOGF("\t dst                      = 0x%02" PRIx8 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t dst                      = 0x%02" PRIx8 "\n"
 	     "\t dst_cache_policy         = 0x%02" PRIx8 "\n"
 	     "\t dst_address              = 0x%016" PRIx64 "\n"
 	     "\t src                      = 0x%02" PRIx8 "\n"
@@ -3567,7 +3567,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbJump(CommandBuffer* buf, uint8_t mode, uint8_t cac
                                    const uint32_t* target, uint32_t size_in_dwords) {
 	PRINT_NAME();
 
-	LOGF("\t mode           = 0x%02" PRIx8 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t mode           = 0x%02" PRIx8 "\n"
 	     "\t cache_policy   = 0x%02" PRIx8 "\n"
 	     "\t target         = 0x%016" PRIx64 "\n"
 	     "\t size_in_dwords = %" PRIu32 "\n",
@@ -3787,7 +3787,7 @@ int KYTY_SYSV_ABI AgcRewindPatchSetRewindState(uint32_t* cmd, uint8_t state) {
 int KYTY_SYSV_ABI AgcCondExecPatchSetEnd(uint32_t* cmd, const volatile uint32_t* buffer) {
 	PRINT_NAME();
 
-	LOGF("\t cmd    = 0x%016" PRIx64 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t cmd    = 0x%016" PRIx64 "\n"
 	     "\t buffer = 0x%016" PRIx64 "\n",
 	     reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(buffer));
 
