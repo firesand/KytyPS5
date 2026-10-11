@@ -6,6 +6,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
+#include <cinttypes>
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -789,9 +790,10 @@ void CompactImages(std::vector<T>& images, Keep&& keep) {
 }
 
 struct ImageRemap {
-	explicit ImageRemap(const ResourceSpecialization& specialization)
+	ImageRemap(const ResourceSpecialization& specialization, uint64_t shader_hash)
 	    : indices(specialization.images.size()),
-	      source_count(static_cast<uint32_t>(specialization.images.size())) {
+	      source_count(static_cast<uint32_t>(specialization.images.size())),
+	      shader_hash(shader_hash) {
 		for (uint32_t index = 0; index < source_count; index++) {
 			indices[index] = specialization.images[index].fmask ? UINT32_MAX : count++;
 		}
@@ -799,6 +801,17 @@ struct ImageRemap {
 
 	uint32_t operator[](uint32_t index) const {
 		EXIT_IF(index >= source_count);
+		return indices[index];
+	}
+
+	// Reports the offending reference before the fatal exit (seen with Zero Company's pixel
+	// shader 0xa03ea43365937752 while loading a new game).
+	uint32_t Get(uint32_t index, const char* site) const {
+		if (index >= source_count) {
+			EXIT("ResourceMaterialization: shader 0x%016" PRIx64 " %s references image %u but the "
+			     "specialization has %u images\n",
+			     shader_hash, site, index, source_count);
+		}
 		return indices[index];
 	}
 
@@ -815,6 +828,7 @@ private:
 	std::vector<uint32_t> indices;
 	uint32_t                                    source_count;
 	uint32_t                                    count = 0;
+	uint64_t                                    shader_hash;
 };
 
 static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot,
@@ -1806,7 +1820,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 				inst.ReplaceUsesWith(Value(0u));
 		}
 	}
-	const ImageRemap image_remap(specialization);
+	const ImageRemap image_remap(specialization, program.shader_hash);
 	for (auto* block: program.blocks) {
 		for (auto it = block->begin(); it != block->end(); ++it) {
 			auto& inst = *it;
@@ -1909,9 +1923,23 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			        inst.GetOpcode() != ValueOpcode::ImageWrite);
 		}
 	}
-	for (auto& memory: memory_info) {
-		if (memory.kind == ResourceKind::Image && !memory.planning_only) {
-			memory.resource = image_remap[memory.resource];
+	// Remap only entries that a live instruction references. Dead-code elimination ahead of
+	// tracking removes operations whose metadata still carries the translation-time resource
+	// index: Zero Company's pixel shader 0xa03ea43365937752 keeps its whole body behind
+	// exec & ~exec, so its image entries named images 0, 2 and 4 while no image was tracked.
+	std::vector<bool> remapped(memory_info.size(), false);
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::None) {
+				continue;
+			}
+			const auto index  = inst.Flags<MemoryFlags>().index;
+			auto&      memory = memory_info[index];
+			if (remapped[index] || memory.kind != ResourceKind::Image || memory.planning_only) {
+				continue;
+			}
+			memory.resource = image_remap.Get(memory.resource, "image memory op");
+			remapped[index] = true;
 		}
 	}
 	for (auto& buffer: buffers) {
