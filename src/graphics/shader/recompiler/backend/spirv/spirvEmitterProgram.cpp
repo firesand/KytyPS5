@@ -623,6 +623,20 @@ const IR::ExportInfo& ValueEmitContext::Export(const IR::Inst& inst) const {
 
 void EmitProgram(EmitterState& state) {
 	const auto&      program = state.program;
+	const auto* skip_pixel_probe = std::getenv("KYTY_PROBE_SKIP_PS_548A");
+	if (program.stage == ShaderType::Pixel && program.shader_hash == 0x548ab529f34a1307ull &&
+	    skip_pixel_probe != nullptr && skip_pixel_probe[0] == '1' && skip_pixel_probe[1] == '\0') {
+		// Diagnostic only: retain DefineModule's original interface and descriptors,
+		// but omit this pixel shader's reads and image atomic side effects. Keep the
+		// mesh shader and rasterization enabled to isolate the stalled draw.
+		state.builder.AddName(state.main_func, "probe_skip_ps_548a");
+		state.builder.AddFunction(spv::OpFunction, TypeVoid(state), state.main_func,
+		                          spv::FunctionControlMaskNone, TypeFunction(state));
+		EmitLabel(state, state.entry_label);
+		state.builder.AddFunction(spv::OpReturn);
+		state.builder.AddFunction(spv::OpFunctionEnd);
+		return;
+	}
 	ValueEmitContext ctx(state);
 	ValueEmitContext high(state);
 	if (state.lane_count == 2) {

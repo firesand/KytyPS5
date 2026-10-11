@@ -1781,7 +1781,7 @@ std::string StorageUint2DImageBindingName(bool atomic) {
   return "image_" + std::to_string(static_cast<uint32_t>(*binding));
 }
 
-CompiledShader CompileFragmentCase(const GraphicsCase &test) {
+CompiledShader CompileFragmentCase(const GraphicsCase &test, uint64_t shader_hash = 0) {
   const auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
   ShaderPixelInputInfo pixel_info{};
@@ -1813,6 +1813,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
 
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Pixel;
+  options.shader_hash = shader_hash;
   options.dump_ir = false;
   options.input_info.pixel = &pixel_info;
   options.user_data = user_data;
@@ -36354,6 +36355,64 @@ GraphicsCase GraphicsInterpolationExport() {
            O::V_MOV_B32, O::EXP, O::S_ENDPGM}};
 }
 
+void CheckPixel548aSkipProbe() {
+  constexpr const char *name = "Pixel548aSkipProbe";
+  constexpr uint64_t target = 0x548ab529f34a1307ull;
+  const auto *probe = std::getenv("KYTY_PROBE_SKIP_PS_548A");
+  const bool enabled = probe != nullptr && std::strcmp(probe, "1") == 0;
+  GraphicsCase test;
+  test.name = name;
+  test.user_data = MakeStorageTextureData(Prospero::BufferFormat::k32_32UInt);
+  test.has_user_data = true;
+  auto &code = test.fragment_code;
+  // Preserve an interpolated input and the captured shader's R64 image atomic
+  // interface. There are no color/depth exports, just as in the target shader.
+  code.push_back(EncodeVintrp(0x02, 20, 0, 0, 2));
+  AppendVMovU32(&code, 21, 0);
+  AppendVMovU32(&code, 2, 1);
+  AppendVMovU32(&code, 3, 1);
+  code.push_back(EncodeMimg0(0x17, 3));
+  code.push_back(EncodeMimg1(2, 20));
+  AppendEnd(&code);
+  std::optional<ShaderRecompiler::IR::Bindings> original_bindings;
+  size_t original_inputs = 0;
+  for (bool targeted : {false, true}) {
+    const auto compiled = CompileFragmentCase(test, targeted ? target : 1u);
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+    std::string assembly;
+    Require(name, "pixel probe disassembly",
+            tools.Disassemble(compiled.spirv, &assembly),
+            "failed to disassemble the pixel probe");
+    Require(name, "exact hash gate",
+            CountText(assembly, "OpAtomicUMax ") == (enabled && targeted ? 0u : 1u),
+            "pixel body bypass did not preserve its exact hash gate");
+    Require(name, "retained interface",
+            assembly.find("R64ui") != std::string::npos &&
+                assembly.find(" Location 0") != std::string::npos,
+            "pixel bypass removed its storage image or interpolated input declaration");
+    if (!targeted) {
+      original_bindings = compiled.program.bindings;
+      original_inputs = compiled.program.info.inputs.size();
+    } else {
+      Require(name, "retained binding layout",
+              compiled.program.bindings.descriptor_mask == original_bindings->descriptor_mask &&
+                  compiled.program.bindings.descriptor_counts == original_bindings->descriptor_counts &&
+                  compiled.program.info.inputs.size() == original_inputs,
+              "pixel bypass changed the declared pipeline interface");
+    }
+  }
+  TestCase compute;
+  compute.name = "Pixel548aSkipProbeComputeGate";
+  compute.code = code;
+  compute.code[0] = EncodeVop1(0x01, 20, InlineU32(0));
+  compute.user_data = test.user_data;
+  compute.has_user_data = true;
+  compute.diagnostic_shader_hash = target;
+  compute.required_spirv = {"OpAtomicUMax"};
+  CompileCase(compute);
+  std::printf("[shader] pixel 548a bypass compile checks ok (probe=%u)\n", enabled);
+}
+
 std::vector<GraphicsCase> GraphicsTypedColorExports() {
   std::vector<GraphicsCase> tests;
   const auto append = [&](const char *name, ShaderPixelOutputType type,
@@ -42971,6 +43030,10 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ImageStoreSingleMipBounds<0>());
     RunCase(&vulkan, ImageStoreSingleMipBounds<1>());
     RunCase(&vulkan, ImageStoreSingleMipBounds<2>());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--ps-548a-skip-compile-only") == 0) {
+    CheckPixel548aSkipProbe();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--lds-wave-order-compile-only") == 0) {
