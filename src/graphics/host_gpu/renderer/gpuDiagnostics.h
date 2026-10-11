@@ -35,6 +35,10 @@ public:
 		static const bool enabled = Flag("KYTY_GPU_DIAGNOSTICS_SYNC");
 		return Enabled() && enabled;
 	}
+	static bool DumpShaders() {
+		static const bool enabled = Flag("KYTY_GPU_DIAGNOSTICS_DUMP_SHADERS");
+		return Enabled() && enabled;
+	}
 	template <typename Handle> static uint64_t HandleValue(Handle handle) {
 		static_assert(sizeof(handle) <= sizeof(uint64_t));
 		uint64_t value = 0;
