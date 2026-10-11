@@ -4,6 +4,8 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 
 #include <array>
+#include <chrono>
+#include <thread>
 #include <mutex>
 #include <cstring>
 #include <atomic>
@@ -197,19 +199,42 @@ void DumpAddressBindingsNear(uint64_t address) {
 	std::fflush(stdout);
 }
 
-bool ReportDeviceFault(vk::Device device) {
+bool ReportDeviceFault(vk::Device device, vk::Queue queue) {
 	if (device == nullptr || VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT == nullptr) {
 		std::printf("Vulkan device fault: VK_EXT_device_fault not available\n");
 		std::fflush(stdout);
 		return false;
 	}
 	vk::DeviceFaultCountsEXT counts {};
-	const auto count_result = device.getFaultInfoEXT(&counts, nullptr);
+	vk::Result               count_result = vk::Result::eErrorUnknown;
+	// The NVIDIA vendor binary (crash dump) can appear a little after the loss is first visible.
+	for (uint32_t attempt = 0; attempt < 6; ++attempt) {
+		count_result = device.getFaultInfoEXT(&counts, nullptr);
+		if (count_result == vk::Result::eSuccess && counts.vendorBinarySize != 0) break;
+		if (count_result != vk::Result::eSuccess) break;
+		std::printf("Vulkan device fault: attempt %u: addresses=%u vendor=%u binary=%" PRIu64 "; waiting 1 s\n",
+		            attempt, counts.addressInfoCount, counts.vendorInfoCount,
+		            static_cast<uint64_t>(counts.vendorBinarySize));
+		std::fflush(stdout);
+		std::this_thread::sleep_for(std::chrono::seconds(1));
+	}
 	if (count_result != vk::Result::eSuccess) {
 		std::printf("Vulkan device fault: vkGetDeviceFaultInfoEXT(counts) = %s\n",
 		            vk::to_string(count_result).c_str());
 		std::fflush(stdout);
 		return false;
+	}
+	if (queue != nullptr && VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueueCheckpointDataNV != nullptr) {
+		uint32_t count = 0;
+		queue.getCheckpointDataNV(&count, nullptr);
+		std::vector<vk::CheckpointDataNV> data(count);
+		queue.getCheckpointDataNV(&count, data.data());
+		std::printf("Vulkan NV checkpoints: %u\n", count);
+		for (const auto& entry: data) {
+			std::printf("  checkpoint stage=%s marker=%p\n", vk::to_string(entry.stage).c_str(),
+			            entry.pCheckpointMarker);
+		}
+		std::fflush(stdout);
 	}
 	std::vector<vk::DeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
 	std::vector<vk::DeviceFaultVendorInfoEXT>  vendors(counts.vendorInfoCount);

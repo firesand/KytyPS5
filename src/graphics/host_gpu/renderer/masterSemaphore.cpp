@@ -107,7 +107,8 @@ void MasterSemaphore::Wait(uint64_t tick) {
 						m_graphics.device.destroyFence(fence, nullptr);
 					}
 					if (submit_result != vk::Result::eSuccess) {
-						ReportDeviceFault(m_graphics.device);
+						Common::LockGuard lock(m_graphics.queue_mutex);
+						ReportDeviceFault(m_graphics.device, m_graphics.queue);
 					}
 				}
 			}

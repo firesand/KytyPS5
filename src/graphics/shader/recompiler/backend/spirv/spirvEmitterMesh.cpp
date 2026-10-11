@@ -24,6 +24,14 @@ bool MeshGuardProbe() {
 	return enabled;
 }
 
+bool MeshFixedOutputProbe() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PROBE_MESH_FIXED_OUTPUT");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
 bool MeshEmptyProbe(uint64_t hash) {
 	static const uint64_t target = [] {
 		const char* value = std::getenv("KYTY_PROBE_MESH_EMPTY");
@@ -194,6 +202,45 @@ void EmitMeshEntryPoint(EmitterState& state) {
 	                          state.mesh_guest_func);
 	// All guest waves finish before the uniform Vulkan allocation and output stores.
 	EmitBarrier(state);
+	if (MeshFixedOutputProbe()) {
+		// Diagnostic: the guest program ran (LDS, barriers, loops), but the host outputs are a
+		// fixed degenerate triangle written by invocation 0 only. Isolates the output path.
+		static std::atomic_bool logged = false;
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			Log::WriteToConsoleAndLog("Shader: KYTY_PROBE_MESH_FIXED_OUTPUT replaces mesh outputs\n");
+		}
+		state.builder.AddFunction(spv::OpSetMeshOutputsEXT, ConstantU32(state, 3), ConstantU32(state, 1));
+		const auto first = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpIEqual, TypeBool(state), first,
+		                          EmitLocalInvocationIndex(state), ConstantU32(state, 0));
+		EmitIfCondition(state, first, [&] {
+			const auto zero4 = state.builder.Constant(spv::OpConstantNull, TypeF32Vector(state, 4));
+			for (const auto& output: state.outputs) {
+				if (output.kind != IR::StageOutputKind::Position) continue;
+				for (uint32_t v = 0; v < 3; v++) {
+					state.builder.AddFunction(spv::OpStore,
+					                          MeshElement(state, output.variable_id, spv::StorageClassOutput,
+					                                      TypeF32Vector(state, 4), ConstantU32(state, v)),
+					                          zero4);
+				}
+			}
+			const auto triangle = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 3), triangle,
+			                          ConstantU32(state, 0), ConstantU32(state, 1), ConstantU32(state, 2));
+			state.builder.AddFunction(spv::OpStore,
+			                          MeshElement(state, state.mesh_primitives, spv::StorageClassOutput,
+			                                      TypeU32Vector(state, 3), ConstantU32(state, 0)),
+			                          triangle);
+			state.builder.AddFunction(spv::OpStore,
+			                          MeshElement(state, state.mesh_cull, spv::StorageClassOutput,
+			                                      TypeBool(state), ConstantU32(state, 0)),
+			                          ConstantBool(state, false));
+		});
+		state.lane_half = 0;
+		state.builder.AddFunction(spv::OpReturn);
+		state.builder.AddFunction(spv::OpFunctionEnd);
+		return;
+	}
 	auto vertices   = MeshLoad(state, state.mesh_allocation, spv::StorageClassWorkgroup,
 	                           TypeU32(state), ConstantU32(state, 0));
 	auto primitives = MeshLoad(state, state.mesh_allocation, spv::StorageClassWorkgroup,

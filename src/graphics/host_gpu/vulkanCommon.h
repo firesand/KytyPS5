@@ -29,7 +29,7 @@ void        RequireVulkanSuccess(vk::Result result, const char* operation);
 vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device);
 // Prints VK_EXT_device_fault details (faulting addresses, vendor codes) after a device loss.
 // Returns true when the driver reported any fault record. (Ported from gccody b9e15e2.)
-bool        ReportDeviceFault(vk::Device device);
+bool        ReportDeviceFault(vk::Device device, vk::Queue queue = nullptr);
 // VK_EXT_device_address_binding_report ring: every GPU address range bound/unbound by the driver.
 void        RecordAddressBinding(uint64_t base, uint64_t size, bool bind, bool internal,
                                  uint32_t object_type, uint64_t object, const char* name);
