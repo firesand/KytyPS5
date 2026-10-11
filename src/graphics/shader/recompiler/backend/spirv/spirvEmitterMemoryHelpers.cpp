@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
+#include <cstdlib>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index) {
@@ -434,6 +436,15 @@ uint32_t EmitAtomicOperation(ValueEmitContext& ctx, const IR::Inst& inst, uint32
 }
 
 void EmitAtomicMemoryBarrier(EmitterState& state, IR::ResourceKind kind) {
+	// Claude probe: KYTY_PROBE_NO_ATOMIC_MEMBAR=1 omits the per-invocation device-scope
+	// AcquireRelease barrier after image atomics (the native code has none).
+	static const bool no_image_membar = [] {
+		const char* value = std::getenv("KYTY_PROBE_NO_ATOMIC_MEMBAR");
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
+	}();
+	if (no_image_membar && kind == IR::ResourceKind::Image) {
+		return;
+	}
 	const auto scope  = kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
 	const auto memory = [&] {
 		switch (kind) {

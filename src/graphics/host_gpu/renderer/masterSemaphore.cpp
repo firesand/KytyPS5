@@ -82,10 +82,10 @@ void MasterSemaphore::Wait(uint64_t tick) {
 			const auto status  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
 			std::printf("MasterSemaphore::Wait: timeout #%u waiting for %" PRIu64 ", counter=%" PRIu64
 			            " status=%s\n", n, tick, counter, vk::to_string(status).c_str());
-			if (status != vk::Result::eSuccess || n == 2) {
+			if (status != vk::Result::eSuccess) {
 				ReportDeviceFault(m_graphics.device);
 			}
-			if (n == 3) {
+			if (n == 1) {
 				// Is the queue alive? An empty submission with a fence either completes (the hung
 				// batch was dropped by the driver), stays pending (queue blocked behind it) or
 				// fails with DEVICE_LOST (the context was reset).

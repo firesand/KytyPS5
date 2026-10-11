@@ -4,6 +4,9 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 
 #include <array>
+#include <mutex>
+#include <cstring>
+#include <atomic>
 #include <vector>
 #include <cstdio>
 #include <cinttypes>
@@ -137,6 +140,63 @@ vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device) {
 	return module;
 }
 
+namespace {
+struct AddressBindingRecord {
+	uint64_t seq         = 0;
+	uint64_t base        = 0;
+	uint64_t size        = 0;
+	uint64_t object      = 0;
+	uint32_t object_type = 0;
+	bool     bind        = false;
+	bool     internal    = false;
+	char     name[56]    = {};
+};
+constexpr size_t                           kAddressRingSize = 1u << 16u;
+std::array<AddressBindingRecord, kAddressRingSize> g_address_ring {};
+std::atomic<uint64_t>                      g_address_seq {0};
+std::mutex                                 g_address_mutex;
+} // namespace
+
+void RecordAddressBinding(uint64_t base, uint64_t size, bool bind, bool internal,
+                          uint32_t object_type, uint64_t object, const char* name) {
+	std::lock_guard lock(g_address_mutex);
+	const auto seq  = g_address_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+	auto&      slot = g_address_ring[seq % kAddressRingSize];
+	slot            = {};
+	slot.seq        = seq;
+	slot.base       = base;
+	slot.size       = size;
+	slot.object     = object;
+	slot.object_type = object_type;
+	slot.bind       = bind;
+	slot.internal   = internal;
+	if (name != nullptr) {
+		std::strncpy(slot.name, name, sizeof(slot.name) - 1);
+	}
+}
+
+void DumpAddressBindingsNear(uint64_t address) {
+	std::lock_guard lock(g_address_mutex);
+	const auto total = g_address_seq.load(std::memory_order_relaxed);
+	std::printf("  address bindings recorded: %" PRIu64 " (ring %zu); records touching 0x%016" PRIx64
+	            " and neighbours within 64 MiB, newest first:\n", total, kAddressRingSize, address);
+	uint32_t printed = 0;
+	const uint64_t window = 64ull << 20u;
+	for (uint64_t seq = total; seq > 0 && total - seq < kAddressRingSize && printed < 40; --seq) {
+		const auto& r = g_address_ring[seq % kAddressRingSize];
+		if (r.seq != seq) continue;
+		const bool contains = address >= r.base && address - r.base < r.size;
+		const bool near     = (r.base > address ? r.base - address : address - (r.base + r.size)) < window;
+		if (!contains && !near) continue;
+		std::printf("    %s seq=%" PRIu64 " %s [0x%016" PRIx64 ", +0x%" PRIx64 ") type=%s%s handle=0x%" PRIx64
+		            " %s\n", contains ? "HIT " : "near", r.seq, r.bind ? "bind  " : "unbind",
+		            r.base, r.size, vk::to_string(static_cast<vk::ObjectType>(r.object_type)).c_str(),
+		            r.internal ? "(internal)" : "", r.object, r.name);
+		printed++;
+	}
+	std::fflush(stdout);
+}
+
 bool ReportDeviceFault(vk::Device device) {
 	if (device == nullptr || VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT == nullptr) {
 		std::printf("Vulkan device fault: VK_EXT_device_fault not available\n");
@@ -153,24 +213,34 @@ bool ReportDeviceFault(vk::Device device) {
 	}
 	std::vector<vk::DeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
 	std::vector<vk::DeviceFaultVendorInfoEXT>  vendors(counts.vendorInfoCount);
-	counts.vendorBinarySize = 0;
+	std::vector<uint8_t>                       binary(static_cast<size_t>(counts.vendorBinarySize));
 	vk::DeviceFaultInfoEXT info {};
-	info.pAddressInfos = addresses.data();
-	info.pVendorInfos  = vendors.data();
+	info.pAddressInfos     = addresses.data();
+	info.pVendorInfos      = vendors.data();
+	info.pVendorBinaryData = binary.empty() ? nullptr : binary.data();
 	const auto result  = device.getFaultInfoEXT(&counts, &info);
 	if (result != vk::Result::eSuccess && result != vk::Result::eIncomplete) {
 		std::printf("Vulkan device fault: vkGetDeviceFaultInfoEXT = %s\n", vk::to_string(result).c_str());
 		std::fflush(stdout);
 		return false;
 	}
-	std::printf("Vulkan device fault: \"%s\" addresses=%u vendor=%u\n", info.description.data(),
-	            counts.addressInfoCount, counts.vendorInfoCount);
+	std::printf("Vulkan device fault: \"%s\" addresses=%u vendor=%u binary=%" PRIu64 "\n",
+	            info.description.data(), counts.addressInfoCount, counts.vendorInfoCount,
+	            static_cast<uint64_t>(counts.vendorBinarySize));
+	if (!binary.empty()) {
+		if (auto* file = std::fopen("_device_fault.nv-gpudmp", "wb"); file != nullptr) {
+			std::fwrite(binary.data(), 1, binary.size(), file);
+			std::fclose(file);
+			std::printf("  vendor binary written to _device_fault.nv-gpudmp (cwd)\n");
+		}
+	}
 	for (uint32_t i = 0; i < counts.addressInfoCount; ++i) {
 		const auto& address = addresses[i];
 		std::printf("  address fault: %s at 0x%016" PRIx64 " (precision 0x%" PRIx64 ")\n",
 		            vk::to_string(address.addressType).c_str(),
 		            static_cast<uint64_t>(address.reportedAddress),
 		            static_cast<uint64_t>(address.addressPrecision));
+		DumpAddressBindingsNear(static_cast<uint64_t>(address.reportedAddress));
 	}
 	for (uint32_t i = 0; i < counts.vendorInfoCount; ++i) {
 		const auto& vendor = vendors[i];

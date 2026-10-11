@@ -656,6 +656,25 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		device_fault.deviceFault = VK_TRUE;
 		create_info.pNext        = &device_fault;
 	}
+	// Claude probe: NVIDIA diagnostics config (shader debug info, resource tracking, shader error
+	// reporting) so a device fault report names the shader, and address binding reports.
+	vk::DeviceDiagnosticsConfigCreateInfoNV       diagnostics_config {};
+	vk::PhysicalDeviceDiagnosticsConfigFeaturesNV diagnostics_features {};
+	if (HasExtension(device_extensions, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
+		diagnostics_config.flags = vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableShaderDebugInfo |
+		                           vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableResourceTracking |
+		                           vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableShaderErrorReporting;
+		diagnostics_features.diagnosticsConfig = VK_TRUE;
+		diagnostics_features.pNext             = const_cast<void*>(create_info.pNext);
+		diagnostics_config.pNext               = &diagnostics_features;
+		create_info.pNext                      = &diagnostics_config;
+	}
+	vk::PhysicalDeviceAddressBindingReportFeaturesEXT address_binding_report {};
+	if (HasExtension(device_extensions, VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME)) {
+		address_binding_report.reportAddressBinding = VK_TRUE;
+		address_binding_report.pNext                = const_cast<void*>(create_info.pNext);
+		create_info.pNext                           = &address_binding_report;
+	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
@@ -754,6 +773,33 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
     const vk::DebugUtilsMessengerCallbackDataEXT* callback_data, void* /*user_data*/) {
 	EXIT_IF(callback_data == nullptr);
 	EXIT_IF(callback_data->pMessage == nullptr);
+
+	if (message_types & vk::DebugUtilsMessageTypeFlagBitsEXT::eDeviceAddressBinding) {
+		// Claude probe: record every GPU address binding so a device fault address can be
+		// mapped to the object (buffer, image, shader code) that owned it.
+		for (const auto* next = static_cast<const vk::BaseInStructure*>(callback_data->pNext);
+		     next != nullptr; next = next->pNext) {
+			if (next->sType != vk::StructureType::eDeviceAddressBindingCallbackDataEXT) {
+				continue;
+			}
+			const auto* binding = reinterpret_cast<const vk::DeviceAddressBindingCallbackDataEXT*>(next);
+			uint32_t    object_type = 0;
+			uint64_t    object      = 0;
+			const char* name        = nullptr;
+			if (callback_data->objectCount > 0 && callback_data->pObjects != nullptr) {
+				object_type = static_cast<uint32_t>(callback_data->pObjects[0].objectType);
+				object      = callback_data->pObjects[0].objectHandle;
+				name        = callback_data->pObjects[0].pObjectName;
+			}
+			RecordAddressBinding(static_cast<uint64_t>(binding->baseAddress),
+			                     static_cast<uint64_t>(binding->size),
+			                     binding->bindingType == vk::DeviceAddressBindingTypeEXT::eBind,
+			                     static_cast<bool>(binding->flags &
+			                                       vk::DeviceAddressBindingFlagBitsEXT::eInternalObject),
+			                     object_type, object, name);
+		}
+		return VK_FALSE;
+	}
 
 	const char*     severity_str   = nullptr;
 	fmt::text_style severity_style = Log::Color::Default;
@@ -918,7 +964,8 @@ void WindowContext::CreateVulkan() {
 	                                  vk::DebugUtilsMessageSeverityFlagBitsEXT::eError;
 	dbg_create_info.messageType     = vk::DebugUtilsMessageTypeFlagBitsEXT::eGeneral |
 	                                  vk::DebugUtilsMessageTypeFlagBitsEXT::eValidation |
-	                                  vk::DebugUtilsMessageTypeFlagBitsEXT::ePerformance;
+	                                  vk::DebugUtilsMessageTypeFlagBitsEXT::ePerformance |
+	                                  vk::DebugUtilsMessageTypeFlagBitsEXT::eDeviceAddressBinding;
 	dbg_create_info.pfnUserCallback = VulkanDebugMessengerCallback;
 
 	vk::InstanceCreateInfo inst_info {};
@@ -1040,7 +1087,9 @@ void WindowContext::CreateVulkan() {
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
 		                             VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
 		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME,
-		                             VK_EXT_DEVICE_FAULT_EXTENSION_NAME}) {
+		                             VK_EXT_DEVICE_FAULT_EXTENSION_NAME,
+		                             VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME,
+		                             VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}

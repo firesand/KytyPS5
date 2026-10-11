@@ -2,6 +2,9 @@
 
 #include "common/assert.h"
 
+#include <vector>
+#include <fmt/format.h>
+#include "common/logging/log.h"
 #include <algorithm>
 #include <bit>
 #include <cstdlib>
@@ -624,8 +627,31 @@ const IR::ExportInfo& ValueEmitContext::Export(const IR::Inst& inst) const {
 void EmitProgram(EmitterState& state) {
 	const auto&      program = state.program;
 	const auto* skip_pixel_probe = std::getenv("KYTY_PROBE_SKIP_PS_548A");
-	if (program.stage == ShaderType::Pixel && program.shader_hash == 0x548ab529f34a1307ull &&
-	    skip_pixel_probe != nullptr && skip_pixel_probe[0] == '1' && skip_pixel_probe[1] == '\0') {
+	// Claude probe: KYTY_PROBE_EMPTY_PS=<hex hash>[,<hex hash>...] empties those pixel shaders.
+	static const std::vector<uint64_t> empty_pixel_hashes = [] {
+		std::vector<uint64_t> hashes;
+		if (const char* value = std::getenv("KYTY_PROBE_EMPTY_PS"); value != nullptr) {
+			for (const char* cursor = value; *cursor != '\0';) {
+				char* end = nullptr;
+				const auto hash = std::strtoull(cursor, &end, 16);
+				if (end == cursor) break;
+				hashes.push_back(hash);
+				cursor = (*end == ',') ? end + 1 : end;
+			}
+		}
+		return hashes;
+	}();
+	const bool empty_pixel_listed =
+	    program.stage == ShaderType::Pixel &&
+	    std::find(empty_pixel_hashes.begin(), empty_pixel_hashes.end(), program.shader_hash) !=
+	        empty_pixel_hashes.end();
+	if (empty_pixel_listed) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Shader: KYTY_PROBE_EMPTY_PS empties pixel shader 0x{:016x}\n", program.shader_hash));
+	}
+	if ((program.stage == ShaderType::Pixel && program.shader_hash == 0x548ab529f34a1307ull &&
+	     skip_pixel_probe != nullptr && skip_pixel_probe[0] == '1' && skip_pixel_probe[1] == '\0') ||
+	    empty_pixel_listed) {
 		// Diagnostic only: retain DefineModule's original interface and descriptors,
 		// but omit this pixel shader's reads and image atomic side effects. Keep the
 		// mesh shader and rasterization enabled to isolate the stalled draw.
