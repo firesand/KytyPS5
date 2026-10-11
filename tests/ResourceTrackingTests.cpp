@@ -7,6 +7,7 @@
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstring>
@@ -3700,6 +3701,64 @@ void TestMalformedMemoryKindsRejected() {
 
 } // namespace
 
+void TestDeadImageMemoryIsNeutralized() {
+  // Zero Company's pixel shader 0xa03ea43365937752 guards its whole body behind
+  // exec & ~exec: dead-code elimination removes every image operation while the
+  // memory metadata keeps the translation-time resource index (s8 / 4 == 2).
+  // ApplyResourceSpecialization must not remap entries no live instruction uses.
+  Fixture fixture;
+  const auto handle = fixture.Buffer(
+      {fixture.UserData(3), fixture.UserData(4), Value(64u), Value(0u)}, 4);
+  MemoryInfo buffer;
+  buffer.kind = ResourceKind::Buffer;
+  const auto loaded = fixture.Emit(
+      ValueOpcode::LoadBufferU32,
+      {handle, Value(0u), Value(0u), Value(0u), Value(true)},
+      fixture.AddMemory(buffer, 4));
+  fixture.Emit(ValueOpcode::ReferenceU32, {loaded});
+  std::array<Value, 8> words{};
+  for (uint32_t word = 0; word < words.size(); ++word)
+    words[word] = fixture.UserData(8u + word);
+  const auto image = fixture.Image(words, 0x98);
+  const auto sampler =
+      fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Image;
+  memory.resource = 2u;
+  memory.image_dimension = Decoder::ImageDimension::Dim2D;
+  const auto flags = fixture.AddMemory(memory, 0x98);
+  fixture.Emit(ValueOpcode::ImageSampleRaw,
+               {image, sampler, fixture.ImageAddress()}, flags);
+  // The sample has no uses, so tracking's own dead-code elimination removes it.
+  TrackResources(fixture.program, {}, {});
+  const bool sample_removed = std::ranges::none_of(*fixture.block, [](const Inst &inst) {
+    return inst.GetOpcode() == ValueOpcode::ImageSampleRaw;
+  });
+  Check(sample_removed, "fixture premise: unused image sample survived dead-code elimination");
+  Check(fixture.program.resource_tracking_complete &&
+            fixture.program.info.images.empty() &&
+            fixture.program.info.buffers.size() == 1u &&
+            fixture.program.memory_info[flags.index].kind == ResourceKind::Image &&
+            fixture.program.memory_info[flags.index].resource == 2u,
+        "dead image operation was not left untracked with its translation index");
+
+  auto plan = ExtractResourcePlan(fixture.program);
+  std::array<uint32_t, 16> data{};
+  data[3] = 0x1000u;
+  TestMemory test_memory;
+  SrtRuntime runtime{.user_data = data, .userdata = &test_memory,
+                     .read_specialization_memory = ReadTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            specialization.images.empty() && specialization.buffers.size() == 1u,
+        "dead image operation changed resource materialization");
+  ApplyResourceSpecialization(fixture.program, specialization);
+  Check(fixture.program.info.images.empty() &&
+            fixture.program.info.buffers.size() == 1u,
+        "specialization remapped a dead image operation");
+}
+
 int main() {
   try {
     const auto Run = [](const char *name, auto test) {
@@ -3749,6 +3808,7 @@ int main() {
     Run("live shader data collection", TestLiveShaderDataCollection);
     Run("resource limit", TestResourceLimitIsTransactional);
     Run("malformed memory kinds", TestMalformedMemoryKindsRejected);
+    Run("dead image memory", TestDeadImageMemoryIsNeutralized);
   } catch (const std::exception &exception) {
     std::cerr << "resource tracking test failed: " << exception.what() << '\n';
     return 1;

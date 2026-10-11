@@ -465,11 +465,10 @@ struct ImageRemap {
 	// shader 0xa03ea43365937752 while loading a new game).
 	uint32_t Get(uint32_t index, const char* site) const {
 		if (index >= source_count) {
-			LOGF("ResourceMaterialization: shader 0x%016" PRIx64 " %s references image %u but the "
+			EXIT("ResourceMaterialization: shader 0x%016" PRIx64 " %s references image %u but the "
 			     "specialization has %u images\n",
 			     shader_hash, site, index, source_count);
 		}
-		EXIT_IF(index >= source_count);
 		return indices[index];
 	}
 
@@ -1422,9 +1421,23 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			        inst.GetOpcode() != ValueOpcode::ImageRead);
 		}
 	}
-	for (auto& memory: memory_info) {
-		if (memory.kind == ResourceKind::Image && !memory.planning_only) {
+	// Remap only entries that a live instruction references. Dead-code elimination ahead of
+	// tracking removes operations whose metadata still carries the translation-time resource
+	// index: Zero Company's pixel shader 0xa03ea43365937752 keeps its whole body behind
+	// exec & ~exec, so its image entries named images 0, 2 and 4 while no image was tracked.
+	std::vector<bool> remapped(memory_info.size(), false);
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::None) {
+				continue;
+			}
+			const auto index  = inst.Flags<MemoryFlags>().index;
+			auto&      memory = memory_info[index];
+			if (remapped[index] || memory.kind != ResourceKind::Image || memory.planning_only) {
+				continue;
+			}
 			memory.resource = image_remap.Get(memory.resource, "image memory op");
+			remapped[index] = true;
 		}
 	}
 	for (auto& buffer: buffers) {
