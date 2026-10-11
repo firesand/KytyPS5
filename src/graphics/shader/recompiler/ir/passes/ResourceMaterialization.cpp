@@ -1,4 +1,6 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "common/logging/log.h"
+#include <cinttypes>
 
 #include "common/assert.h"
 #include "graphics/guest_gpu/gpu_format.h"
@@ -450,15 +452,23 @@ void CompactImages(std::vector<T>& images, Keep&& keep) {
 }
 
 struct ImageRemap {
-	explicit ImageRemap(const ResourceSpecialization& specialization)
+	ImageRemap(const ResourceSpecialization& specialization, uint64_t shader_hash)
 	    : indices(specialization.images.size()),
-	      source_count(static_cast<uint32_t>(specialization.images.size())) {
+	      source_count(static_cast<uint32_t>(specialization.images.size())),
+	      shader_hash(shader_hash) {
 		for (uint32_t index = 0; index < source_count; index++) {
 			indices[index] = specialization.images[index].fmask ? UINT32_MAX : count++;
 		}
 	}
 
-	uint32_t operator[](uint32_t index) const {
+	// Reports the offending reference before the fatal exit (seen with Zero Company's pixel
+	// shader 0xa03ea43365937752 while loading a new game).
+	uint32_t Get(uint32_t index, const char* site) const {
+		if (index >= source_count) {
+			LOGF("ResourceMaterialization: shader 0x%016" PRIx64 " %s references image %u but the "
+			     "specialization has %u images\n",
+			     shader_hash, site, index, source_count);
+		}
 		EXIT_IF(index >= source_count);
 		return indices[index];
 	}
@@ -475,7 +485,8 @@ struct ImageRemap {
 private:
 	std::vector<uint32_t> indices;
 	uint32_t                                    source_count;
-	uint32_t                                    count = 0;
+	uint32_t                                    count       = 0;
+	uint64_t                                    shader_hash = 0;
 };
 
 static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot,
@@ -1323,12 +1334,12 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	}
 
 	auto& memory_info = program.memory_info;
-	const ImageRemap image_remap(specialization);
+	const ImageRemap image_remap(specialization, program.shader_hash);
 	for (auto* block: program.blocks) {
 		for (auto it = block->begin(); it != block->end(); ++it) {
 			auto& inst = *it;
 			if (inst.GetOpcode() == ValueOpcode::GetImageResource) {
-				inst.SetFlags(image_remap[inst.Flags<uint32_t>()]);
+				inst.SetFlags(image_remap.Get(inst.Flags<uint32_t>(), "GetImageResource"));
 				continue;
 			}
 			if (BufferAccessOf(inst.GetOpcode()) == BufferAccess::Read) {
@@ -1413,23 +1424,23 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	}
 	for (auto& memory: memory_info) {
 		if (memory.kind == ResourceKind::Image && !memory.planning_only) {
-			memory.resource = image_remap[memory.resource];
+			memory.resource = image_remap.Get(memory.resource, "image memory op");
 		}
 	}
 	for (auto& buffer: buffers) {
 		if (buffer.image_alias != BufferResource::NoImageAlias) {
-			buffer.image_alias = image_remap[buffer.image_alias];
+			buffer.image_alias = image_remap.Get(buffer.image_alias, "buffer image alias");
 		}
 	}
 	for (auto& pair: sampled_pairs) {
-		pair.image = image_remap[pair.image];
+		pair.image = image_remap.Get(pair.image, "sampled pair");
 	}
 	for (auto& image: images) {
 		if (image.indirect_root != ImageResource::NoIndirectImage) {
-			image.indirect_root = image_remap[image.indirect_root];
+			image.indirect_root = image_remap.Get(image.indirect_root, "indirect root");
 		}
 		for (auto& resource: image.indirect_resources) {
-			resource = image_remap[resource];
+			resource = image_remap.Get(resource, "indirect resource");
 		}
 	}
 	image_remap.Apply(images);

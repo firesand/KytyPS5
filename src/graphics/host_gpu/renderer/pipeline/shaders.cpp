@@ -611,8 +611,21 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		     (with_depth ? "true" : "false"), (static_params.blend_enable[0] ? "true" : "false"),
 		     dynamic_state.dynamicStateCount);
 	}
+	const auto gfx_vs_hash = vs_input_info.stage.program->shader_hash;
+	const auto gfx_ps_hash = ps_active && ps_input_info != nullptr && ps_input_info->stage
+	                             ? ps_input_info->stage.program->shader_hash : 0ull;
+	LOGF("PipelineTrace: vkCreateGraphicsPipelines begin vs=0x%016" PRIx64 " ps=0x%016" PRIx64 "\n",
+	     gfx_vs_hash, gfx_ps_hash);
+	Log::Flush();
+	const auto gfx_compile_start = std::chrono::steady_clock::now();
 	result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
 	                                                 &pipeline.pipeline);
+	LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s vs=0x%016" PRIx64 " ps=0x%016" PRIx64
+	     " ms=%lld\n",
+	     vk::to_string(result).c_str(), gfx_vs_hash, gfx_ps_hash,
+	     static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+	                                std::chrono::steady_clock::now() - gfx_compile_start)
+	                                .count()));
 	if (result == vk::Result::eSuccess && pipeline.pipeline != nullptr && PipelineStatsProbe()) {
 		LogPipelineStatistics(graphics, pipeline.pipeline, vs_input_info.stage.program->shader_hash,
 		                      ps_active && ps_input_info != nullptr && ps_input_info->stage
