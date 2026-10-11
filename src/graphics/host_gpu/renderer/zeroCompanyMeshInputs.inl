@@ -190,10 +190,18 @@ static void Capture(CommandBuffer& buffer, uint64_t submit, uint64_t pipeline,
 		has_mesh |= program.stage == ShaderType::Mesh && program.shader_hash == 0x67e610ccc37800edull;
 		has_pixel |= program.stage == ShaderType::Pixel && program.shader_hash == 0x548ab529f34a1307ull;
 	}
-	if (!has_mesh || !has_pixel) return;
+	// The observed blocker has two nonindexed groups starting at vertex zero.
+	// Earlier uses of the same pair with other draw shapes are not this target.
+	if (!has_mesh || !has_pixel || groups != 2 || instances != 1 ||
+	    draw_data.size() != 6 || draw_data[0] != 2 || draw_data[1] != 0) return;
 	static std::atomic<uint32_t> attempts {0};
 	const auto ordinal = attempts.fetch_add(1, std::memory_order_relaxed);
 	if (ordinal >= MaxCaptures) return;
+	const auto* skip_first = std::getenv("KYTY_PROBE_MESH_INPUTS_SKIP_FIRST");
+	if (ordinal == 0 && skip_first && std::strcmp(skip_first, "1") == 0) {
+		Log(fmt::format("MeshInputs: skipped capture=0 submit={} reason=skip_first_target_draw\n", submit));
+		return;
+	}
 	auto fail = [&](const char* reason) {
 		Log(fmt::format("MeshInputs: skipped capture={} submit={} reason={}\n", ordinal, submit, reason));
 	};
@@ -273,7 +281,7 @@ static void Capture(CommandBuffer& buffer, uint64_t submit, uint64_t pipeline,
 	}
 	metadata += "],\"probe_environment\":{";
 	bool first = true;
-	for (const char* name: {"KYTY_PROBE_MESH_INPUTS", "KYTY_PROBE_LDS_WAVE_ORDER",
+	for (const char* name: {"KYTY_PROBE_MESH_INPUTS", "KYTY_PROBE_MESH_INPUTS_SKIP_FIRST", "KYTY_PROBE_LDS_WAVE_ORDER",
 	                       "KYTY_PROBE_LDS_WAVE_ORDER_ALL", "KYTY_PROBE_SKIP_PS_548A"}) {
 		if (!first) metadata += ',';
 		first = false;
