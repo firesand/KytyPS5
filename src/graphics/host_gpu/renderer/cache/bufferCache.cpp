@@ -645,8 +645,25 @@ void BufferCache::DrainPendingGpuModified() {
 	}
 	for (const auto [vaddr, size]: pending) {
 		m_gpu_modified_ranges.Add(vaddr, size);
+		m_pending_texture_invalidations.emplace_back(vaddr, size);
+	}
+}
+
+void BufferCache::PublishPendingTextureInvalidations() {
+	if (m_pending_texture_invalidations.empty()) {
+		return;
+	}
+	std::vector<std::pair<uint64_t, uint64_t>> pending;
+	pending.swap(m_pending_texture_invalidations);
+	for (const auto [vaddr, size]: pending) {
 		m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
 	}
+}
+
+void BufferCache::OnCommandBoundary() {
+	FlushWriteFaults(false);
+	DrainPendingGpuModified();
+	PublishPendingTextureInvalidations();
 }
 
 void BufferCache::MarkPageWritten(uint64_t vaddr) {
@@ -682,7 +699,7 @@ void BufferCache::MarkWriteFaultOverflow() {
 }
 
 void BufferCache::FlushWriteFaults(bool wait) {
-	if (m_write_faults_dirty) {
+	if (m_write_faults_dirty && m_scheduler.Active()) {
 		m_write_faults_dirty = false;
 		m_write_fault_tick   = m_scheduler.CurrentTick();
 		m_fault_manager.ProcessWriteFaultBuffer();
@@ -710,8 +727,7 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::RunGarbageCollector() {
-	FlushWriteFaults(false);
-	DrainPendingGpuModified();
+	OnCommandBoundary();
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();

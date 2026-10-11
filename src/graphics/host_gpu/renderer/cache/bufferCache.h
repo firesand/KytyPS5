@@ -96,6 +96,9 @@ public:
 	void PrepareHostRead(uint64_t vaddr, uint64_t size);
 	void MarkPageWritten(uint64_t vaddr);      // any thread (fault-processing operation)
 	void MarkWriteFaultOverflow();             // any thread
+	// Safe point between PM4 packets / at garbage collection: records the pending write-fault
+	// pass, publishes marked pages and deferred texture invalidations.
+	void OnCommandBoundary();
 	void SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	// Tracker regions whose CPU-dirty state changed since the last call: func(address, size).
 	// Callers clip them to mapped guest memory before synchronizing (buffers may extend past it).
@@ -139,7 +142,10 @@ private:
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	void QueueGpuModified(uint64_t vaddr, uint64_t size); // any thread
-	void DrainPendingGpuModified();                       // GPU thread
+	// GPU thread. Only touches m_gpu_modified_ranges: it can run under the texture cache lock
+	// (TextureCache::FindImage asks HasGpuDirtyBytes), so texture invalidations are deferred.
+	void DrainPendingGpuModified();
+	void PublishPendingTextureInvalidations(); // GPU thread, never under the texture cache lock
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
@@ -166,6 +172,7 @@ private:
 	uint64_t                                          m_write_fault_tick   = 0;
 	std::mutex                                        m_pending_gpu_modified_mutex;
 	std::vector<std::pair<uint64_t, uint64_t>>        m_pending_gpu_modified;
+	std::vector<std::pair<uint64_t, uint64_t>>        m_pending_texture_invalidations;
 	std::atomic<bool>                                 m_has_pending_gpu_modified {false};
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;

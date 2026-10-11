@@ -761,6 +761,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 		cursor.offset_dw += packet_dw;
 		execution.m_made_progress = true;
+		// Safe point (no cache locks held): record pending write-fault passes, publish pages.
+		m_renderer.GetBufferCache().OnCommandBoundary();
 		if (!execution.m_next_buffer.empty()) {
 			// Chains and taken branches reuse the fetcher; only calls retain a return cursor.
 			if (execution.m_chain) {
