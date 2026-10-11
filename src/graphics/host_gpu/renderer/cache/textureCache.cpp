@@ -18,16 +18,23 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fmt/format.h>
 #include <limits>
 #include <mutex>
 #include <span>
+#include <string>
 #include <tuple>
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Libs::Graphics {
+
+#include "zeroCompanyImageLifecycle.inl"
 
 namespace {
 
@@ -230,6 +237,7 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	if (!info.data.Empty()) {
 		RegisterImage(id);
 	}
+	ZeroCompanyImageLifecycle::Record(m_scheduler, "insert", id, m_slot_images[id]);
 	return id;
 }
 
@@ -280,6 +288,7 @@ void TextureCache::DeleteImage(ImageId id) {
 	if (image == nullptr || !image->registered) {
 		return;
 	}
+	ZeroCompanyImageLifecycle::Record(m_scheduler, "delete-begin", id, *image);
 	if (!image->depth_id) {
 		std::vector<ImageId> associations;
 		m_slot_images.ForEach([&](ImageId candidate, const Image& associated) {
@@ -305,15 +314,21 @@ void TextureCache::DeleteImage(ImageId id) {
 		}
 	}
 	UnregisterImage(id);
+	ZeroCompanyImageLifecycle::Record(m_scheduler, "delete-unregistered", id, *image);
 	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, id] { m_slot_images.erase(id); });
+		m_scheduler.DeferOperation([this, id] {
+			ZeroCompanyImageLifecycle::Record(m_scheduler, "delete-deferred-erase", id, m_slot_images[id]);
+			m_slot_images.erase(id);
+		});
 	} else {
+		ZeroCompanyImageLifecycle::Record(m_scheduler, "delete-immediate-erase", id, m_slot_images[id]);
 		m_slot_images.erase(id);
 	}
 }
 
 void TextureCache::FreeImage(ImageId id) {
 	auto& image = m_slot_images[id];
+	ZeroCompanyImageLifecycle::Record(m_scheduler, "free-before-ownership-clear", id, image);
 	if (image.IsGpuModified()) {
 		image.ClearGpuModified();
 	}
@@ -620,6 +635,8 @@ bool TextureCache::CopyD16(Image& destination, Image& source) {
 }
 
 void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
+	ZeroCompanyImageLifecycle::Record(m_scheduler, "copy-begin", destination_id,
+	    m_slot_images[destination_id], {.other_id = source_id, .other = &m_slot_images[source_id]});
 	RefreshCopySource(source_id);
 	auto& destination = m_slot_images[destination_id];
 	auto& source      = m_slot_images[source_id];
@@ -632,6 +649,8 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 		if (source.info.data == destination.info.data) {
 			destination.MarkBufferModified();
 		}
+		ZeroCompanyImageLifecycle::Record(m_scheduler, "copy-skip-buffer-owned", destination_id,
+		    destination, {.other_id = source_id, .other = &source});
 		return;
 	}
 	const bool source_depth = source.info.IsDepth();
@@ -645,22 +664,32 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	     (!source_depth && !dest_depth &&
 	      vk::blockSize(source.backing.format) == vk::blockSize(destination.backing.format)));
 	if (direct_copy) {
+		ZeroCompanyImageLifecycle::Record(m_scheduler, "copy-direct-record", destination_id,
+		    destination, {.other_id = source_id, .other = &source});
 		destination.CopyImage(source);
 	} else if (!CopyD16(destination, source)) {
 		if (source.backing.samples != 1 || destination.backing.samples != 1) {
 			EXIT("TextureCache: cross-format multisample image copy is unsupported\n");
 		}
 		auto& copy_buffer = m_buffer_cache.GetUtilityBuffer(MemoryUsage::DeviceLocal);
+		ZeroCompanyImageLifecycle::Record(m_scheduler, "copy-via-buffer-record", destination_id,
+		    destination, {.other_id = source_id, .other = &source,
+		                  .value0 = GpuDiagnostics::HandleValue(copy_buffer.Handle())});
 		destination.CopyImageWithBuffer(source, copy_buffer, m_tiler);
 	}
 	if (source.IsGpuModified()) {
 		destination.MarkGpuModified();
 	}
 	destination.ClearBufferModified();
+	ZeroCompanyImageLifecycle::Record(m_scheduler, "copy-returned", destination_id,
+	    destination, {.other_id = source_id, .other = &source});
 }
 
 void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint32_t mip,
                                 uint32_t layer) {
+	ZeroCompanyImageLifecycle::Record(m_scheduler, "copy-mip-begin", destination_id,
+	    m_slot_images[destination_id], {.other_id = source_id, .other = &m_slot_images[source_id],
+	                                    .value0 = mip, .value1 = layer});
 	RefreshCopySource(source_id);
 	auto& destination = m_slot_images[destination_id];
 	auto& source      = m_slot_images[source_id];
@@ -672,6 +701,8 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	if (source.IsGpuModified()) {
 		destination.MarkGpuModified();
 	}
+	ZeroCompanyImageLifecycle::Record(m_scheduler, "copy-mip-returned", destination_id,
+	    destination, {.other_id = source_id, .other = &source, .value0 = mip, .value1 = layer});
 }
 
 ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
@@ -735,6 +766,8 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	if (!recreate) {
 		return cached_id;
 	}
+	ZeroCompanyImageLifecycle::Record(m_scheduler, "depth-overlap-recreate", cached_id, cached,
+	    {.request = &requested, .value0 = static_cast<uint32_t>(binding)});
 	RefreshImage(cached_id);
 	auto info = requested;
 	if (retain_cached_layout) {
@@ -789,6 +822,8 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	const auto current_tick = m_scheduler.CurrentTick();
 	const bool safe_to_delete =
 	    current_tick - std::min(current_tick, cached.tick_accessed_last) > NumFramesBeforeRemoval;
+	ZeroCompanyImageLifecycle::Record(m_scheduler, "overlap-examine", cached_id, cached,
+	    {.request = &requested, .value0 = safe_to_delete, .value1 = static_cast<uint32_t>(binding)});
 
 	const uint32_t requested_block = requested.bytes_per_block * requested.samples;
 	const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
@@ -802,15 +837,22 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		if (requested.tile_mode != cached.info.tile_mode ||
 		    (requested.resources == cached.info.resources &&
 		     requested.mip_layout != cached.info.mip_layout)) {
+			ZeroCompanyImageLifecycle::Record(m_scheduler,
+			    safe_to_delete ? "overlap-layout-free" : "overlap-layout-retain-young",
+			    cached_id, cached, {.request = &requested});
 			if (safe_to_delete) {
 				FreeImage(cached_id);
 			}
 			return {merged_id};
 		}
 		if (requested.GetColorTransform() != cached.info.GetColorTransform()) {
+			ZeroCompanyImageLifecycle::Record(m_scheduler, "overlap-expand-transform", cached_id,
+			    cached, {.request = &requested});
 			return {ExpandImage(requested, cached_id)};
 		}
 		if (requested.IsBlock() && !cached.info.IsBlock()) {
+			ZeroCompanyImageLifecycle::Record(m_scheduler, "overlap-expand-block", cached_id,
+			    cached, {.request = &requested});
 			return {ExpandImage(requested, cached_id)};
 		}
 		// Volume depth is not an array-layer count. A larger depth can retain the
@@ -821,6 +863,8 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		      requested.extent.width == cached.info.extent.width &&
 		      requested.extent.height == cached.info.extent.height &&
 		      requested.extent.depth > cached.info.extent.depth))) {
+			ZeroCompanyImageLifecycle::Record(m_scheduler, "overlap-expand-volume", cached_id,
+			    cached, {.request = &requested});
 			return {ExpandImage(requested, cached_id)};
 		}
 		// PPSA08394
@@ -833,6 +877,8 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		         : requested.extent.width > cached.info.extent.width &&
 		               requested.extent.height >= cached.info.extent.height &&
 		               requested.extent.depth >= cached.info.extent.depth)) {
+			ZeroCompanyImageLifecycle::Record(m_scheduler, "overlap-expand-type-extent", cached_id,
+			    cached, {.request = &requested});
 			return {ExpandImage(requested, cached_id)};
 		}
 		// PS5 mip tails can expose more levels without increasing the guest allocation.
@@ -843,15 +889,21 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		      requested.extent == cached.info.extent &&
 		      cached.info.resources.levels > 1 &&
 		      requested.resources.layers == cached.info.resources.layers))) {
+			ZeroCompanyImageLifecycle::Record(m_scheduler, "overlap-expand-mips", cached_id,
+			    cached, {.request = &requested});
 			return {ExpandImage(requested, cached_id)};
 		}
 		if (requested.type != cached.info.type) {
+			ZeroCompanyImageLifecycle::Record(m_scheduler, "overlap-reject-type", cached_id,
+			    cached, {.request = &requested});
 			return {merged_id};
 		}
 		if (requested.pixel_format != cached.info.pixel_format ||
 		    requested.data.size <= cached.info.data.size) {
 			const auto result_id = merged_id ? merged_id : cached_id;
 			const auto result    = m_slot_images.try_get(result_id);
+			ZeroCompanyImageLifecycle::Record(m_scheduler, "overlap-compatible-candidate", cached_id,
+			    cached, {.other_id = result_id, .other = result, .request = &requested});
 			return {result != nullptr && ImageViewOps::FormatsCompatible(result->info.pixel_format,
 			                                                             requested.pixel_format)
 			            ? result_id
@@ -871,6 +923,9 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	const int32_t requested_mip = requested.MipOf(cached.info);
 	if (requested_mip >= 0) {
 		const int32_t layer = requested.SliceOf(cached.info, requested_mip);
+		ZeroCompanyImageLifecycle::Record(m_scheduler, "overlap-use-mip", cached_id, cached,
+		    {.request = &requested, .value0 = static_cast<uint32_t>(requested_mip),
+		     .value1 = static_cast<uint32_t>(layer)});
 		return {cached_id, requested_mip, layer};
 	}
 
@@ -878,9 +933,14 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	if (mip >= 0) {
 		const int32_t layer = cached.info.SliceOf(requested, mip);
 		if (!merged_id) {
+			ZeroCompanyImageLifecycle::Record(m_scheduler, "overlap-expand-contained", cached_id,
+			    cached, {.request = &requested});
 			return {ExpandImage(requested, cached_id)};
 		}
 		cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
+		ZeroCompanyImageLifecycle::Record(m_scheduler, "overlap-merge-mip", cached_id, cached,
+		    {.other_id = merged_id, .other = &m_slot_images[merged_id], .request = &requested,
+		     .value0 = static_cast<uint32_t>(mip), .value1 = static_cast<uint32_t>(layer)});
 		m_slot_images[merged_id].binding.is_target |= cached.binding.is_target;
 		CopyImageMip(merged_id, cached_id, static_cast<uint32_t>(mip),
 		             static_cast<uint32_t>(layer));
@@ -888,12 +948,19 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		return {merged_id};
 	}
 	if (requested.data.address >= cached.info.data.address && safe_to_delete) {
+		ZeroCompanyImageLifecycle::Record(m_scheduler, "overlap-unmatched-aged-free", cached_id,
+		    cached, {.request = &requested});
 		FreeImage(cached_id);
+	} else {
+		ZeroCompanyImageLifecycle::Record(m_scheduler, "overlap-unmatched-retain", cached_id,
+		    cached, {.request = &requested, .value0 = safe_to_delete});
 	}
 	return {merged_id};
 }
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
+	ZeroCompanyImageLifecycle::Record(m_scheduler, "expand-begin", source_id,
+	    m_slot_images[source_id], {.request = &info});
 	RefreshCopySource(source_id);
 	const auto expanded_id = InsertImage(info);
 	auto&      source      = m_slot_images[source_id];
@@ -910,6 +977,8 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 		CopyImage(expanded_id, source_id);
 	}
 	FreeImage(source_id);
+	ZeroCompanyImageLifecycle::Record(m_scheduler, "expand-returned", expanded_id,
+	    m_slot_images[expanded_id], {.other_id = source_id});
 	return expanded_id;
 }
 
@@ -1010,6 +1079,9 @@ TextureCache::ImageDownload TextureCache::BuildDownload(const Image& image) cons
 }
 
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
+	ZeroCompanyImageLifecycle::Record(m_scheduler, "upload-begin", {}, image,
+	    {.address = source.CpuAddress(), .size = source.Size(),
+	     .value0 = GpuDiagnostics::HandleValue(source.Handle()), .value1 = source_offset});
 	auto& destination = image.depth_id ? m_slot_images[image.depth_id] : image;
 	const auto binding = image.depth_id ? BindingType::DepthTarget : UploadBinding(image);
 	const auto  upload  = [&](std::vector<vk::BufferImageCopy>& copies, TileManager::Result linear) {
@@ -1017,6 +1089,9 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 			copy.bufferOffset += linear.offset;
 		}
 		destination.Upload(copies, linear.buffer, linear.offset, linear.size);
+		ZeroCompanyImageLifecycle::Record(m_scheduler, "upload-copy-returned", {}, image,
+		    {.other = &destination, .size = linear.size,
+		     .value0 = GpuDiagnostics::HandleValue(linear.buffer), .value1 = linear.offset});
 	};
 
 	if (binding != BindingType::DepthTarget) {
@@ -1104,6 +1179,7 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 
 void TextureCache::InitializeImage(ImageId id) {
 	auto& image = m_slot_images[id];
+	ZeroCompanyImageLifecycle::Record(m_scheduler, "initialize-begin", id, image);
 	if (image.info.data.Empty()) {
 		return;
 	}
@@ -1119,6 +1195,7 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
+		ZeroCompanyImageLifecycle::Record(m_scheduler, "initialize-needs-upload", id, image);
 		const auto [source, source_offset] =
 		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
 		if (source == nullptr) {
@@ -1130,6 +1207,7 @@ void TextureCache::InitializeImage(ImageId id) {
 	if (image.IsCpuDirty()) {
 		image.RefreshComplete();
 	}
+	ZeroCompanyImageLifecycle::Record(m_scheduler, "initialize-returned", id, image);
 }
 
 void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
@@ -1142,6 +1220,8 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	{
 		std::scoped_lock lock {m_lock};
 		auto& image         = m_slot_images[id];
+		ZeroCompanyImageLifecycle::Record(m_scheduler, "materialize-color-clear-check", id,
+		    image, {.request = &desc.info, .address = range.address, .size = range.size});
 		image.info.metadata = desc.info.metadata;
 		// Native color metadata must not retain a reused HTile/CMask/FMask clear flag.
 		m_surface_metas.erase(range.address);
@@ -1212,6 +1292,7 @@ void TextureCache::RefreshImage(ImageId id) {
 	}
 	TrackImage(id);
 	if (image.IsMaybeCpuDirty()) {
+		ZeroCompanyImageLifecycle::Record(m_scheduler, "refresh-maybe-dirty", id, image);
 		const auto hash = image.HashGuestEdges();
 		if (image.NeedsMaybeCpuHash()) {
 			image.SetMaybeCpuHash(hash);
@@ -1229,6 +1310,7 @@ void TextureCache::RefreshImage(ImageId id) {
 	if (!cpu_dirty) {
 		return;
 	}
+	ZeroCompanyImageLifecycle::Record(m_scheduler, "refresh-needs-upload", id, image);
 	InitializeImage(id);
 }
 
@@ -1283,6 +1365,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		for (const auto id: candidates) {
 			const auto& image = m_slot_images[id];
 			if (SameBacking(image.info, desc.info, exact_format)) {
+				ZeroCompanyImageLifecycle::Record(m_scheduler, "find-same-backing", id, image,
+				    {.request = &desc.info, .value0 = static_cast<uint32_t>(desc.type)});
 				result = id;
 			}
 		}
@@ -1306,8 +1390,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		if (result) {
 			auto& resolved = m_slot_images[result];
 			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
+				ZeroCompanyImageLifecycle::Record(m_scheduler, "find-reject-exact-format", result,
+				    resolved, {.request = &desc.info});
 				result = {};
 			} else if (resolved.info.resources < desc.info.resources) {
+				ZeroCompanyImageLifecycle::Record(m_scheduler, "find-free-small-resources", result,
+				    resolved, {.request = &desc.info});
 				FreeImage(result);
 				result = {};
 			}
@@ -1319,6 +1407,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			                                    inserted.info.data.size)) {
 				inserted.MarkBufferModified();
 			}
+			ZeroCompanyImageLifecycle::Record(m_scheduler, "find-created", result, inserted,
+			    {.request = &desc.info, .value0 = static_cast<uint32_t>(desc.type)});
 		}
 		auto& image = m_slot_images[result];
 		if (view_mip >= 0) {
@@ -1349,8 +1439,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 void TextureCache::UpdateImage(ImageId id) {
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
+	ZeroCompanyImageLifecycle::Record(m_scheduler, "update-begin", id, image);
 	TouchImage(image);
 	RefreshImage(id);
+	ZeroCompanyImageLifecycle::Record(m_scheduler, "update-returned", id, image);
 }
 
 ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool ensure_valid) {
@@ -1515,6 +1607,7 @@ void TextureCache::CommitGpuWrite(Image& image) {
 		image.RefreshComplete();
 	}
 	image.MarkGpuModified();
+	ZeroCompanyImageLifecycle::Record(m_scheduler, "commit-gpu-write", {}, image);
 }
 
 bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
@@ -1593,6 +1686,8 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
                               const vk::ImageSubresourceRange& range, const vk::ClearValue& clear) {
 	auto& image = m_slot_images[id];
+	ZeroCompanyImageLifecycle::Record(m_scheduler, "clear-begin", id, image,
+	    {.value0 = static_cast<uint32_t>(format)});
 	const auto aspects = image.info.IsDepth() ? ImageViewOps::DepthAspectMask(image.backing.format)
 	                                          : vk::ImageAspectFlagBits::eColor;
 	EXIT_IF(range.baseMipLevel >= image.info.resources.levels);
@@ -1740,6 +1835,9 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 
 void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
                                      uint64_t destination_size, ImageDownload transfer) {
+	ZeroCompanyImageLifecycle::Record(m_scheduler, "download-begin", {}, image,
+	    {.address = destination.CpuAddress(), .size = destination_size,
+	     .value0 = GpuDiagnostics::HandleValue(destination.Handle()), .value1 = destination_offset});
 	if (!transfer.valid) {
 		EXIT("TextureCache: invalid image download transfer\n");
 	}
@@ -1839,11 +1937,14 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 
 bool TextureCache::DownloadImageMemory(ImageId id) {
 	auto& image = m_slot_images[id];
+	ZeroCompanyImageLifecycle::Record(m_scheduler, "download-memory-begin", id, image);
 	if (image.depth_id) {
 		return false;
 	}
 	auto transfer = BuildDownload(image);
 	if (!transfer.valid || !image.SafeToDownload()) {
+		ZeroCompanyImageLifecycle::Record(m_scheduler, "download-memory-rejected", id, image,
+		    {.value0 = transfer.valid});
 		return false;
 	}
 	const auto range    = image.info.data;
@@ -1877,6 +1978,8 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 		download.Invalidate(offset, range.size);
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
 	});
+	ZeroCompanyImageLifecycle::Record(m_scheduler, "download-cpu-publish-queued", id, image,
+	    {.address = range.address, .size = range.size, .value0 = offset});
 	return true;
 }
 
@@ -1890,10 +1993,14 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 		if (image.info.data.address != address) {
 			continue;
 		}
+		ZeroCompanyImageLifecycle::Record(m_scheduler, "invalidate-gpu-before", id, image,
+		    {.address = address, .size = size});
 		if (image.IsGpuModified()) {
 			image.ClearGpuModified();
 		}
 		image.MarkBufferModified();
+		ZeroCompanyImageLifecycle::Record(m_scheduler, "invalidate-gpu-after", id, image,
+		    {.address = address, .size = size});
 	}
 }
 
@@ -1906,8 +2013,13 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 			continue;
 		}
 		if (owner->Overlaps(address, size)) {
+			const auto flags_before = ZeroCompanyImageLifecycle::Flags(*owner);
 			owner->InvalidateCpuWrite(address, size);
 			UntrackImage(id);
+			if (flags_before != ZeroCompanyImageLifecycle::Flags(*owner)) {
+				ZeroCompanyImageLifecycle::Record(m_scheduler, "invalidate-cpu-changed", id, *owner,
+				    {.address = address, .size = size, .value0 = flags_before});
+			}
 			continue;
 		}
 		const auto image_begin = owner->info.data.address;
@@ -1985,6 +2097,8 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		if (owner == nullptr) {
 			continue;
 		}
+		ZeroCompanyImageLifecycle::Record(m_scheduler, "unmap-free", id, *owner,
+		    {.address = address, .size = size});
 		FreeImage(id);
 	}
 }
@@ -2032,6 +2146,8 @@ void TextureCache::RunGarbageCollector() {
 					continue;
 				}
 			}
+			ZeroCompanyImageLifecycle::Record(m_scheduler, "gc-free", id, *owner,
+			    {.value0 = tick, .value1 = age});
 			FreeImage(id);
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
