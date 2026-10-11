@@ -642,6 +642,7 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	}
 	execution.m_suspended     = false;
 	execution.m_made_progress = false;
+	m_renderer.BeginCommandStream();
 
 	struct ExecutionScope {
 		ExecutionScope(CommandProcessor& processor, Pm4Execution& execution)

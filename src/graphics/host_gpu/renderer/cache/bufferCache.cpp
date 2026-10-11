@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
 #include "common/alignment.h"
+#include <fmt/format.h>
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -423,6 +424,8 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    total_size += bytes;
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+	m_last_upload_bytes = total_size;
+	m_last_upload_pages = copies.size();
 	if (source) {
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
@@ -512,6 +515,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
+	m_sync_stats.obtain_calls++;
+	m_sync_stats.obtain_bytes += m_last_upload_bytes;
+	m_sync_stats.obtain_pages += m_last_upload_pages;
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
 	}
@@ -797,8 +803,21 @@ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 		const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
 		if (start < finish) {
 			(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
+			m_sync_stats.range_calls++;
+			m_sync_stats.range_bytes += m_last_upload_bytes;
+			m_sync_stats.range_pages += m_last_upload_pages;
 		}
 	}
+}
+
+std::string BufferCache::DescribeBufferAt(uint64_t vaddr) {
+	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (owner == nullptr || !*owner || IsBufferInvalid(*owner)) {
+		return "none";
+	}
+	const auto& buffer = m_slot_buffers[*owner];
+	return fmt::format("buf[0x{:x}+0x{:x} score={}]", buffer.CpuAddress(), buffer.Size(),
+	                   buffer.StreamScore());
 }
 
 } // namespace Libs::Graphics

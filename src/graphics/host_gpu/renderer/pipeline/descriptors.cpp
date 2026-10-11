@@ -38,6 +38,7 @@
 #include <fmt/format.h>
 #include <limits>
 #include <span>
+#include <tuple>
 #include <vector>
 
 #ifdef min
@@ -115,7 +116,7 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
                     const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset) {
 	buffer_offset = 0;
 
-	const auto& [address, size, id, untracked_write] = source;
+	const auto& [address, size, id, untracked_write, unsynced_read] = source;
 	const bool written = resource.written && !untracked_write;
 	if (address == 0 || size == 0) {
 		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
@@ -125,9 +126,16 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	if (size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
 		EXIT("storage buffer range is unsupported\n");
 	}
-	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(
-	    address, size, written,
-	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id);
+	Buffer*  buffer = nullptr;
+	uint64_t offset = 0;
+	if (unsynced_read && !written) {
+		buffer = &context.GetBufferCache().GetBuffer(id);
+		offset = buffer->Offset(address);
+	} else {
+		std::tie(buffer, offset) = context.GetBufferCache().ObtainBuffer(
+		    address, size, written,
+		    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id);
+	}
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
@@ -896,7 +904,17 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 				cache.NoteUnboundedWrite(address, size);
 			}
 			const bool untracked_write = fault_tracked || (untracked_probe && unbounded && info.written);
-			source = {address, size, cache.FindBuffer(address, size), untracked_write};
+			// Whole-heap read descriptors: a per-binding upload/re-protect of the 528 MiB range is
+			// replaced by the once-per-stream CPU-write sync (KYTY_UNBOUNDED_READ_SYNC=1 restores it).
+			static const bool read_sync = [] {
+				const char* value = std::getenv("KYTY_UNBOUNDED_READ_SYNC");
+				return value != nullptr && value[0] == '1';
+			}();
+			const bool unsynced_read = !read_sync && unbounded && !info.written;
+			if (unsynced_read) {
+				m_context.SyncCpuWrites();
+			}
+			source = {address, size, cache.FindBuffer(address, size), untracked_write, unsynced_read};
 		}
 	}
 }

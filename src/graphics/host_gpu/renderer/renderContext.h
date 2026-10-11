@@ -54,6 +54,11 @@ public:
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
+	// Uploads CPU writes (pending regions + hot pages) once per command stream; used before
+	// pointer-using draws and before whole-heap descriptor reads.
+	void               SyncCpuWrites();
+	// Called when the command processor starts (or resumes) a guest command stream.
+	void               BeginCommandStream() { ++m_bda_sync_epoch; }
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -76,6 +81,8 @@ private:
 	PageManager               m_page_manager;
 	BufferCache               m_buffer_cache;
 	TextureCache              m_texture_cache;
+	uint64_t                  m_bda_sync_epoch    = 1;
+	uint64_t                  m_bda_synced_epoch  = 0;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	std::unique_ptr<GuestGpu> m_gpu;

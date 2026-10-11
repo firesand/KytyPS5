@@ -1,6 +1,11 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <cstdlib>
+#include <fmt/format.h>
+#include <vector>
+#include <string>
+#include <atomic>
+#include <unordered_map>
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -56,7 +61,60 @@ VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 	return *m_video_out;
 }
 
+// KYTY_PROBE_FAULT_HISTOGRAM=1: lock-free sample of CPU page faults handled by the caches, dumped
+// as a per-MiB histogram from RunGarbageCollector (signal-handler safe: no allocation, no locks).
+namespace {
+struct FaultSampler {
+	static constexpr size_t   Slots = 1u << 16;
+	std::atomic<uint64_t>     entries[Slots] {};
+	std::atomic<uint32_t>     cursor {0};
+	std::atomic<uint64_t>     total {0};
+	std::atomic<uint64_t>     reads {0};
+	bool                      enabled = [] {
+        const char* value = std::getenv("KYTY_PROBE_FAULT_HISTOGRAM");
+        return value != nullptr && value[0] == '1';
+	}();
+	void Record(uint64_t vaddr, bool write) noexcept {
+		if (!enabled) return;
+		total.fetch_add(1, std::memory_order_relaxed);
+		if (!write) reads.fetch_add(1, std::memory_order_relaxed);
+		const auto slot = cursor.fetch_add(1, std::memory_order_relaxed) & (Slots - 1);
+		entries[slot].store((vaddr & ~uint64_t {0xfff}) | (write ? 1u : 0u), std::memory_order_relaxed);
+	}
+	template <typename Describe>
+	void Dump(Describe&& describe, const BufferCache::SyncStats& sync) {
+		if (!enabled) return;
+		static uint64_t last_total = 0;
+		static int      calls      = 0;
+		if (++calls % 64 != 0) return;
+		const auto now = total.load(std::memory_order_relaxed);
+		std::unordered_map<uint64_t, uint32_t> buckets;
+		uint32_t sampled = 0;
+		for (auto& entry: entries) {
+			const auto value = entry.exchange(0, std::memory_order_relaxed);
+			if (value == 0) continue;
+			++sampled;
+			++buckets[(value >> 20u) << 20u];
+		}
+		std::vector<std::pair<uint64_t, uint32_t>> top(buckets.begin(), buckets.end());
+		std::sort(top.begin(), top.end(), [](auto& a, auto& b) { return a.second > b.second; });
+		std::string line = fmt::format("FaultHistogram: total={} (+{}) reads={} sampled={} top MiB:",
+		                               now, now - last_total, reads.load(), sampled);
+		for (size_t i = 0; i < top.size() && i < 8; ++i) {
+			line += fmt::format(" 0x{:x}:{} {}", top[i].first, top[i].second, describe(top[i].first));
+		}
+		line += fmt::format(" | syncs: obtain {} calls {} pages {} KiB, range {} calls {} pages {} KiB",
+		                    sync.obtain_calls, sync.obtain_pages, sync.obtain_bytes >> 10,
+		                    sync.range_calls, sync.range_pages, sync.range_bytes >> 10);
+		LOGF("%s\n", line.c_str());
+		last_total = now;
+	}
+};
+FaultSampler g_fault_sampler;
+} // namespace
+
 bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
+	g_fault_sampler.Record(fault_vaddr, access == PageFaultAccess::Write);
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
@@ -130,7 +188,24 @@ void RenderContext::PrepareBda() {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
 	}
-	// KYTY_BDA_SYNC_ALL=1 restores the per-draw walk over every cached buffer.
+	SyncCpuWrites();
+	m_fault_process_pending = true;
+}
+
+void RenderContext::SyncCpuWrites() {
+	// Once per command stream (KYTY_BDA_SYNC_PER_DRAW=1 restores the per-draw sync): every sync
+	// re-protects the pages it uploads, so the game's next CPU write to them faults again.
+	static const bool per_draw = [] {
+		const char* value = std::getenv("KYTY_BDA_SYNC_PER_DRAW");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!per_draw) {
+		if (m_bda_synced_epoch == m_bda_sync_epoch) {
+			return;
+		}
+		m_bda_synced_epoch = m_bda_sync_epoch;
+	}
+	// KYTY_BDA_SYNC_ALL=1 restores the walk over every cached buffer.
 	static const bool sync_all = [] {
 		const char* value = std::getenv("KYTY_BDA_SYNC_ALL");
 		return value != nullptr && value[0] == '1';
@@ -141,18 +216,19 @@ void RenderContext::PrepareBda() {
 			m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
 		});
 	} else {
-		// Only regions with new CPU-dirty pages, clipped to mapped memory: cached buffers can
-		// extend past the mapping (stream leaps), and unmapped pages must never be read.
+		// Only regions with new CPU-dirty pages (and regions holding hot pages), clipped to mapped
+		// memory: cached buffers can extend past the mapping and unmapped pages must not be read.
 		m_buffer_cache.ForEachBdaSyncPendingRegion([this](uint64_t vaddr, uint64_t size) {
 			m_mapped_ranges.ForEachInRange(vaddr, size, [this](uint64_t start, uint64_t end) {
 				m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
 			});
 		});
 	}
-	m_fault_process_pending = true;
 }
 
 void RenderContext::RunGarbageCollector() {
+	g_fault_sampler.Dump([this](uint64_t vaddr) { return m_buffer_cache.DescribeBufferAt(vaddr); },
+	                     m_buffer_cache.TakeSyncStats());
 	m_buffer_cache.FlushWriteFaults(false);
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;

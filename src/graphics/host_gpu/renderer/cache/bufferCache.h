@@ -13,6 +13,7 @@
 
 #include <map>
 #include <mutex>
+#include <string>
 #include <atomic>
 #include <span>
 #include <utility>
@@ -99,6 +100,13 @@ public:
 	// Safe point between PM4 packets / at garbage collection: records the pending write-fault
 	// pass, publishes marked pages and deferred texture invalidations.
 	void OnCommandBoundary();
+	// Diagnostics (GPU thread): the cached buffer covering vaddr, and upload statistics by path.
+	[[nodiscard]] std::string DescribeBufferAt(uint64_t vaddr);
+	struct SyncStats {
+		uint64_t obtain_calls = 0, obtain_bytes = 0, obtain_pages = 0;
+		uint64_t range_calls = 0, range_bytes = 0, range_pages = 0;
+	};
+	[[nodiscard]] SyncStats TakeSyncStats() { return std::exchange(m_sync_stats, {}); }
 	void SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	// Tracker regions whose CPU-dirty state changed since the last call: func(address, size).
 	// Callers clip them to mapped guest memory before synchronizing (buffers may extend past it).
@@ -173,6 +181,9 @@ private:
 	std::mutex                                        m_pending_gpu_modified_mutex;
 	std::vector<std::pair<uint64_t, uint64_t>>        m_pending_gpu_modified;
 	std::vector<std::pair<uint64_t, uint64_t>>        m_pending_texture_invalidations;
+	SyncStats                                         m_sync_stats;
+	uint64_t                                          m_last_upload_bytes = 0;
+	uint64_t                                          m_last_upload_pages = 0;
 	std::atomic<bool>                                 m_has_pending_gpu_modified {false};
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;

@@ -60,7 +60,7 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 		return manager;
 	}
 	auto  manager = std::make_unique<RegionManager>(m_page_manager, index * TRACKER_REGION_SIZE,
-	                                               &m_bda_pending_count);
+	                                               &m_bda_pending_count, &m_hot_region_count);
 	auto* ptr     = manager.get();
 	ptr->MarkBdaSyncPending(); // constructed fully CPU-dirty
 	m_region_storage.push_back(std::move(manager));

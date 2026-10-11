@@ -34,6 +34,9 @@ struct PreparedBindings {
 		// KYTY_PROBE_UNBOUNDED_UNTRACKED experiment: bind an unbounded (NUM_RECORDS=0xffffffff)
 		// written descriptor without marking its whole clamped range as GPU-modified.
 		bool untracked_write = false;
+		// KYTY_PROBE_UNBOUNDED_READ_NOSYNC experiment: bind an unbounded read-only descriptor
+		// without uploading/re-protecting CPU-dirty pages of the whole clamped range.
+		bool unsynced_read = false;
 	};
 
 	// The draw owns the immutable compiled-program/runtime-snapshot association through commit.

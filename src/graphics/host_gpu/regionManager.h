@@ -6,6 +6,8 @@
 #include "graphics/host_gpu/regionDefinitions.h"
 
 #include <atomic>
+#include <cstdlib>
+#include <array>
 #include <mutex>
 #include <utility>
 
@@ -80,9 +82,10 @@ static_assert(std::atomic_uint32_t::is_always_lock_free);
 class RegionManager final {
 public:
 	RegionManager(PageManager& page_manager, uint64_t cpu_addr,
-	              std::atomic<uint32_t>* bda_pending_count = nullptr)
+	              std::atomic<uint32_t>* bda_pending_count = nullptr,
+	              std::atomic<uint32_t>* hot_region_count  = nullptr)
 	    : m_page_manager(page_manager), m_cpu_addr(cpu_addr),
-	      m_bda_pending_count(bda_pending_count) {
+	      m_bda_pending_count(bda_pending_count), m_hot_region_count(hot_region_count) {
 		if (m_cpu_addr % TRACKER_REGION_SIZE != 0) {
 			EXIT("invalid region tracking manager construction\n");
 		}
@@ -100,12 +103,35 @@ public:
 		return GetBits<source>().FirstRangeFrom(start).first < end;
 	}
 
+	// Hot pages: the CPU writes them again and again (one write fault per page per sync point).
+	// After KYTY_HOT_PAGE_FAULTS faults (default 8, 0 disables) a page stays CPU-dirty and
+	// writable; every synchronization re-uploads it instead of re-protecting it.
+	static uint32_t HotPageFaultThreshold() {
+		static const uint32_t threshold = [] {
+			const char* value = std::getenv("KYTY_HOT_PAGE_FAULTS");
+			return value != nullptr ? static_cast<uint32_t>(std::atoi(value)) : 8u;
+		}();
+		return threshold;
+	}
+	[[nodiscard]] bool HasHotPages() const { return m_has_hot.load(std::memory_order_relaxed); }
+
 	template <DirtySource source, bool enable>
 	void ChangeState(uint64_t vaddr, uint64_t size) {
 		const auto [start, end] = GetPageRange(vaddr, size);
 		if constexpr (source == DirtySource::Cpu && enable) {
 			if (RegionBits(m_gpu_dirty, start, end).Any()) {
 				EXIT("CPU dirty state conflicts with GPU dirty state\n");
+			}
+			if (const auto threshold = HotPageFaultThreshold(); threshold != 0 && end - start <= 16) {
+				for (auto page = start; page < end; ++page) {
+					if (m_fault_counts[page] < 255 && ++m_fault_counts[page] == threshold) {
+						m_hot.Set(page);
+						if (!m_has_hot.exchange(true, std::memory_order_acq_rel) &&
+						    m_hot_region_count != nullptr) {
+							m_hot_region_count->fetch_add(1, std::memory_order_acq_rel);
+						}
+					}
+				}
 			}
 		}
 		if constexpr (source == DirtySource::Gpu && enable) {
@@ -130,7 +156,7 @@ public:
 	}
 
 	template <DirtySource source, bool clear, typename Func>
-	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func) {
+	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func, bool keep_hot = true) {
 		const auto [start, end] = GetPageRange(vaddr, size);
 		auto&      bits         = GetBits<source>();
 		if (bits.FirstRangeFrom(start).first >= end) {
@@ -139,6 +165,20 @@ public:
 		RegionBits mask(bits, start, end);
 		if constexpr (clear) {
 			bits.UnsetRange(start, end);
+			if constexpr (source == DirtySource::Cpu) {
+				if (keep_hot && HasHotPages()) {
+					// Hot pages stay dirty (and writable) so the next sync uploads them again.
+					for (const auto [first, last]: RegionBits(m_hot, start, end)) {
+						for (auto page = first; page < last; ++page) {
+							if (mask.Get(page)) bits.Set(page);
+						}
+					}
+				} else if (!keep_hot && HasHotPages()) {
+					// The GPU takes ownership (written binding): the pages leave the hot set.
+					m_hot.UnsetRange(start, end);
+					for (auto page = start; page < end; ++page) m_fault_counts[page] = 0;
+				}
+			}
 			if constexpr (source == DirtySource::Cpu) {
 				UpdateProtection<true, false>();
 			} else {
@@ -173,6 +213,10 @@ public:
 
 private:
 	std::atomic<uint32_t>* m_bda_pending_count = nullptr;
+	std::atomic<uint32_t>* m_hot_region_count  = nullptr;
+	std::atomic<bool>      m_has_hot {false};
+	RegionBits             m_hot;
+	std::array<uint8_t, TRACKER_REGION_PAGES> m_fault_counts {};
 	template <bool track, bool is_read>
 	void UpdateProtection() {
 		const auto protection = is_read ? ~m_gpu_dirty : m_cpu_dirty;

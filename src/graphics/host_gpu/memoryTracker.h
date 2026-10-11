@@ -36,14 +36,16 @@ public:
 	// MarkBdaSyncPending): func(region_address, region_size). GPU thread.
 	template <typename Func>
 	void ForEachBdaSyncPendingRegion(Func&& func) {
-		if (m_bda_pending_count.load(std::memory_order_acquire) == 0) {
+		if (m_bda_pending_count.load(std::memory_order_acquire) == 0 &&
+		    m_hot_region_count.load(std::memory_order_acquire) == 0) {
 			return;
 		}
 		std::vector<RegionManager*> pending;
 		{
 			std::lock_guard lock(m_region_mutex);
 			for (const auto& manager: m_region_storage) {
-				if (manager->TakeBdaSyncPending()) {
+				const bool flagged = manager->TakeBdaSyncPending();
+				if (flagged || manager->HasHotPages()) {
 					pending.push_back(manager.get());
 				}
 			}
@@ -110,7 +112,8 @@ public:
 		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			manager->lock.lock();
 			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
-			                                                      bytes, range_func);
+			                                                      bytes, range_func,
+			                                                      /*keep_hot=*/!is_written);
 			if (!is_written) {
 				manager->lock.unlock();
 			}
@@ -175,6 +178,7 @@ private:
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;
 	std::atomic<uint32_t>                          m_bda_pending_count {0};
+	std::atomic<uint32_t>                          m_hot_region_count {0};
 };
 
 } // namespace Libs::Graphics
