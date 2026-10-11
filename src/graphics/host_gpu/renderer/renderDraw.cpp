@@ -38,16 +38,20 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
+
+#include "graphics/host_gpu/renderer/zeroCompanyMeshResources.inl"
 
 std::pair<int32_t, uint32_t> ResolveDrawOffsets(uint32_t index_offset,
 	                                           const ShaderVertexInputInfo& vs_input_info) {
@@ -1161,6 +1165,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                        vk::ShaderStageFlagBits::eMeshEXT |
 		                            vk::ShaderStageFlagBits::eFragment,
 		                        0, sizeof(draw_data), draw_data);
+		ZeroCompanyMeshResources::Capture(buffer, submit_id,
+		    GpuDiagnostics::HandleValue(pipeline.pipeline), stages, draw_data);
 	} else {
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
