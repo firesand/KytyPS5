@@ -6,7 +6,6 @@
 // gc-free = GC tick/age. Unavailable ImageIds are explicitly marked invalid.
 namespace ZeroCompanyImageLifecycle {
 
-constexpr uint64_t TargetAddress = 0x312bad0000ull;
 constexpr uint64_t TargetSize = 0x23f0000ull;
 constexpr uint64_t EventLimit = 4096;
 
@@ -21,7 +20,18 @@ struct Details {
 };
 
 static bool Matches(const ImageInfo& info) {
-	return info.data.address == TargetAddress && info.data.size == TargetSize;
+	// Guest allocation addresses vary between boots. Match the complete observed
+	// surface signature from creation onward, then correlate actual addresses with
+	// MeshResources. For a 2D surface, kRenderTarget selects RenderTarget64KB.
+	return info.data.address != 0 && info.data.size == TargetSize &&
+	       info.extent == vk::Extent3D {2848, 1600, 1} &&
+	       info.guest_format == Prospero::BufferFormat::k32_32UInt &&
+	       info.pixel_format == vk::Format::eR32G32Uint &&
+	       info.tile_mode == Prospero::TileMode::kRenderTarget &&
+	       info.type == Prospero::ImageType::kColor2D && info.resources.levels == 1 &&
+	       info.resources.layers == 1 && info.samples == 1 &&
+	       info.metadata.kind == ImageMetadataKind::None && info.metadata.range.Empty() &&
+	       info.metadata.compression == VideoOutCompression::Uncompressed;
 }
 
 static uint32_t Flags(const Image& image) {
@@ -44,11 +54,12 @@ static void Record(const CommandScheduler& scheduler, const char* reason, ImageI
 	const auto sequence = events.fetch_add(1, std::memory_order_relaxed);
 	if (sequence >= EventLimit) return;
 	std::string line = fmt::format(
-	    "ImageLifecycle: seq={} target=0x{:x}:0x{:x} tick={} reason={} id={}:{} id_valid={} "
+	    "ImageLifecycle: seq={} selector=2848x1600x1-RG32Uint-RenderTarget64KB-size0x23f0000-1mip-1layer-1sample-no-metadata "
+	    "tick={} reason={} id={}:{} id_valid={} "
 	    "handle=0x{:x} guest=0x{:x}:0x{:x} format={} extent={}x{}x{} levels={} layers={} "
 	    "tile={} layout={} access=0x{:x} flags=0x{:x} last_use={} "
 	    "address=0x{:x} size=0x{:x} value0=0x{:x} value1=0x{:x}",
-	    sequence, TargetAddress, TargetSize, scheduler.CurrentTick(), reason, id.index, id.generation,
+	    sequence, scheduler.CurrentTick(), reason, id.index, id.generation,
 	    static_cast<bool>(id),
 	    GpuDiagnostics::HandleValue(image.backing.image), image.info.data.address, image.info.data.size,
 	    vk::to_string(image.backing.format), image.info.extent.width, image.info.extent.height,
