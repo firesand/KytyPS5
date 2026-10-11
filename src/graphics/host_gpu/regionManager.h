@@ -79,8 +79,10 @@ static_assert(std::atomic_uint32_t::is_always_lock_free);
 
 class RegionManager final {
 public:
-	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
-	    : m_page_manager(page_manager), m_cpu_addr(cpu_addr) {
+	RegionManager(PageManager& page_manager, uint64_t cpu_addr,
+	              std::atomic<uint32_t>* bda_pending_count = nullptr)
+	    : m_page_manager(page_manager), m_cpu_addr(cpu_addr),
+	      m_bda_pending_count(bda_pending_count) {
 		if (m_cpu_addr % TRACKER_REGION_SIZE != 0) {
 			EXIT("invalid region tracking manager construction\n");
 		}
@@ -117,6 +119,9 @@ public:
 		} else {
 			bits.UnsetRange(start, end);
 		}
+		if constexpr (source == DirtySource::Cpu && enable) {
+			MarkBdaSyncPending();
+		}
 		if constexpr (source == DirtySource::Cpu) {
 			UpdateProtection<!enable, false>();
 		} else {
@@ -147,7 +152,27 @@ public:
 
 	TrackingSpinLock lock;
 
+	// BDA (pointer) shaders must see CPU writes; instead of re-walking every cached buffer per
+	// draw, PrepareBda only synchronizes regions that gained CPU-dirty pages (or new buffers).
+	void MarkBdaSyncPending() {
+		if (!bda_sync_pending.exchange(true, std::memory_order_acq_rel) &&
+		    m_bda_pending_count != nullptr) {
+			m_bda_pending_count->fetch_add(1, std::memory_order_acq_rel);
+		}
+	}
+	[[nodiscard]] bool TakeBdaSyncPending() {
+		if (!bda_sync_pending.exchange(false, std::memory_order_acq_rel)) {
+			return false;
+		}
+		if (m_bda_pending_count != nullptr) {
+			m_bda_pending_count->fetch_sub(1, std::memory_order_acq_rel);
+		}
+		return true;
+	}
+	std::atomic<bool> bda_sync_pending {false};
+
 private:
+	std::atomic<uint32_t>* m_bda_pending_count = nullptr;
 	template <bool track, bool is_read>
 	void UpdateProtection() {
 		const auto protection = is_read ? ~m_gpu_dirty : m_cpu_dirty;

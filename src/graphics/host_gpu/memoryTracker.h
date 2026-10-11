@@ -32,6 +32,27 @@ public:
 	[[nodiscard]] bool TryMarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
+	// Regions whose CPU-dirty state changed since the last call (or that were flagged through
+	// MarkBdaSyncPending): func(region_address, region_size). GPU thread.
+	template <typename Func>
+	void ForEachBdaSyncPendingRegion(Func&& func) {
+		if (m_bda_pending_count.load(std::memory_order_acquire) == 0) {
+			return;
+		}
+		std::vector<RegionManager*> pending;
+		{
+			std::lock_guard lock(m_region_mutex);
+			for (const auto& manager: m_region_storage) {
+				if (manager->TakeBdaSyncPending()) {
+					pending.push_back(manager.get());
+				}
+			}
+		}
+		for (auto* manager: pending) {
+			func(manager->GetCpuAddr(), TRACKER_REGION_SIZE);
+		}
+	}
+	void MarkBdaSyncPending(uint64_t vaddr, uint64_t size);
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
@@ -153,6 +174,7 @@ private:
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;
+	std::atomic<uint32_t>                          m_bda_pending_count {0};
 };
 
 } // namespace Libs::Graphics

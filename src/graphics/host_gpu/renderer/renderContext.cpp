@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include <cstdlib>
+
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -128,10 +130,19 @@ void RenderContext::PrepareBda() {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
 	}
-	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-	});
+	// KYTY_BDA_SYNC_ALL=1 restores the per-draw walk over every cached buffer.
+	static const bool sync_all = [] {
+		const char* value = std::getenv("KYTY_BDA_SYNC_ALL");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (sync_all) {
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
+			m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+		});
+	} else {
+		m_buffer_cache.SynchronizeBuffersForBda();
+	}
 	m_fault_process_pending = true;
 }
 

@@ -59,11 +59,19 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	if (auto* manager = m_regions[index].load(std::memory_order_acquire); manager != nullptr) {
 		return manager;
 	}
-	auto  manager = std::make_unique<RegionManager>(m_page_manager, index * TRACKER_REGION_SIZE);
+	auto  manager = std::make_unique<RegionManager>(m_page_manager, index * TRACKER_REGION_SIZE,
+	                                               &m_bda_pending_count);
 	auto* ptr     = manager.get();
+	ptr->MarkBdaSyncPending(); // constructed fully CPU-dirty
 	m_region_storage.push_back(std::move(manager));
 	m_regions[index].store(ptr, std::memory_order_release);
 	return ptr;
+}
+
+void MemoryTracker::MarkBdaSyncPending(uint64_t vaddr, uint64_t size) {
+	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t, uint64_t) {
+		manager->MarkBdaSyncPending();
+	});
 }
 
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {

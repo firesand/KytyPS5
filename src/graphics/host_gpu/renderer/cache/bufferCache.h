@@ -97,6 +97,8 @@ public:
 	void MarkPageWritten(uint64_t vaddr);      // any thread (fault-processing operation)
 	void MarkWriteFaultOverflow();             // any thread
 	void SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	// Uploads CPU-dirty pages of cached buffers in regions that changed since the last call.
+	void SynchronizeBuffersForBda();
 	void               RunGarbageCollector();
 
 private:

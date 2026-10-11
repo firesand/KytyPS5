@@ -72,6 +72,9 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* 
 
 void BufferCache::Register(BufferId id) {
 	ChangeRegister<true>(id);
+	// A new buffer may cover pages that were CPU-dirty before any buffer existed there.
+	const auto& buffer = m_slot_buffers[id];
+	m_memory_tracker.MarkBdaSyncPending(buffer.CpuAddress(), buffer.Size());
 }
 
 void BufferCache::Unregister(BufferId id) {
@@ -764,6 +767,11 @@ void BufferCache::RunGarbageCollector() {
 
 void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
+}
+
+void BufferCache::SynchronizeBuffersForBda() {
+	m_memory_tracker.ForEachBdaSyncPendingRegion(
+	    [this](uint64_t vaddr, uint64_t size) { SynchronizeBuffersInRange(vaddr, size); });
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
