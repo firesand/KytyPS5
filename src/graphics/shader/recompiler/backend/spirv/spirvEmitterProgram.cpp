@@ -1,3 +1,6 @@
+#include <unordered_map>
+#include <cstdio>
+#include <cstdlib>
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include "common/assert.h"
@@ -64,6 +67,80 @@ struct DispatcherFunctionState {
 	uint32_t                                      merge_label        = 0;
 };
 
+// Loop guard (KYTY_LOOP_GUARD=<limit>, off when unset or 0): every loop counts its iterations in a function variable
+// and leaves through its existing exit edge once the count passes the limit, so a loop over corrupt guest data (a
+// cyclic parent chain, a stale index) ends instead of hanging the GPU (NVIDIA Xid 109). No new CFG edges are added:
+// the guard is folded into the condition of the loop's exit branch (header or back edge). A loop entered again keeps
+// counting, so the limit is a total per invocation; loops whose only exits are elsewhere are left unguarded.
+uint32_t LoopGuardLimit() {
+	static const uint32_t limit = [] {
+		const char* value = std::getenv("KYTY_LOOP_GUARD");
+		const auto  parsed = value != nullptr ? std::strtoul(value, nullptr, 0) : 0ul;
+		if (parsed != 0) {
+			std::printf("Shader loop guard: loops leave after %lu iterations (KYTY_LOOP_GUARD)\n", parsed);
+		}
+		return static_cast<uint32_t>(parsed);
+	}();
+	return limit;
+}
+
+thread_local std::unordered_map<const IR::Block*, uint32_t> g_loop_guard_counters;
+thread_local uint32_t                                        g_dispatcher_guard_counter = 0;
+thread_local uint32_t                                        g_loop_guard_applied       = 0;
+
+// ++counter <= limit, as a bool id.
+uint32_t EmitLoopGuardWithin(EmitterState& state, uint32_t counter) {
+	const auto loaded = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), loaded, counter);
+	const auto next = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpIAdd, TypeU32(state), next, loaded, ConstantU32(state, 1));
+	state.builder.AddFunction(spv::OpStore, counter, next);
+	const auto within = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpULessThanEqual, TypeBool(state), within, next,
+	                          ConstantU32(state, LoopGuardLimit()));
+	return within;
+}
+
+// The condition of a conditional branch with the loop guard folded in, when the branch is a loop's exit test:
+// a loop header (or a back edge to one) with one target the loop's merge block.
+uint32_t GuardLoopExitCondition(EmitterState& state, const IR::Block* block, uint32_t condition) {
+	if (LoopGuardLimit() == 0) {
+		return condition;
+	}
+	const auto&      term   = block->terminator;
+	const IR::Block* header = nullptr;
+	if (term.loop_header) {
+		header = block;
+	} else {
+		for (const auto* target: {term.true_block, term.false_block}) {
+			if (target != nullptr && target->terminator.loop_header &&
+			    target->terminator.continue_block == block) {
+				header = target;
+			}
+		}
+	}
+	if (header == nullptr) {
+		return condition;
+	}
+	const auto* exit    = header->terminator.merge_block;
+	const auto  counter = g_loop_guard_counters.find(header);
+	if (exit == nullptr || counter == g_loop_guard_counters.end() || term.true_block == term.false_block ||
+	    (term.true_block != exit && term.false_block != exit)) {
+		return condition;
+	}
+	g_loop_guard_applied++;
+	const auto within  = EmitLoopGuardWithin(state, counter->second);
+	const auto guarded = state.builder.AllocateId();
+	if (term.true_block == exit) {
+		const auto over = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLogicalNot, TypeBool(state), over, within);
+		state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), guarded, condition, over);
+	} else {
+		state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), guarded, condition, within);
+	}
+	return guarded;
+}
+
 void StoreDispatcherPhiEdge(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
                             const IR::Block* from, const IR::Block* to) {
 	if (to == nullptr) {
@@ -123,7 +200,7 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 				EmitReturn(ctx);
 				return;
 			}
-			const auto condition = ctx.Def(block->condition);
+			const auto condition = GuardLoopExitCondition(ctx.state, block, ctx.Def(block->condition));
 			emit_merge();
 			ctx.state.builder.AddFunction(spv::OpBranchConditional, condition,
 			                              true_block->Definition(), false_block->Definition());
@@ -352,9 +429,23 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	const auto next_pc = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpPhi, TypeU32(state), pc, initial_pc, initial_parent, next_pc,
 	                          dispatcher.continue_label);
-	const auto done = state.builder.AllocateId();
+	auto done = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), done, pc,
 	                          ConstantU32(ctx.state, UINT32_MAX));
+	if (g_dispatcher_guard_counter != 0) {
+		// Each dispatcher iteration runs one guest block: allow 64 blocks per guarded loop iteration.
+		const auto loaded = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), loaded, g_dispatcher_guard_counter);
+		const auto next = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpIAdd, TypeU32(state), next, loaded, ConstantU32(state, 1));
+		state.builder.AddFunction(spv::OpStore, g_dispatcher_guard_counter, next);
+		const auto over = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpUGreaterThan, TypeBool(state), over, next,
+		                          ConstantU32(state, LoopGuardLimit() * 64u));
+		const auto guarded = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), guarded, done, over);
+		done = guarded;
+	}
 	state.builder.AddFunction(spv::OpLoopMerge, dispatcher.merge_label, dispatcher.continue_label,
 	                          spv::LoopControlMaskNone);
 	state.builder.AddFunction(spv::OpBranchConditional, done, dispatcher.merge_label,
@@ -715,6 +806,24 @@ void EmitProgram(EmitterState& state) {
 			                          lane.scratch_u32_variable, spv::StorageClassFunction);
 		}
 	}
+	g_loop_guard_counters.clear();
+	g_dispatcher_guard_counter = 0;
+	if (LoopGuardLimit() != 0 && !program.blocks.empty()) {
+		const auto pointer = TypePointer(state, spv::StorageClassFunction, TypeU32(state));
+		if (state.program.dispatcher_fallback) {
+			g_dispatcher_guard_counter = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpVariable, pointer, g_dispatcher_guard_counter,
+			                          spv::StorageClassFunction);
+		} else {
+			for (const auto* block: program.blocks) {
+				if (block->terminator.loop_header) {
+					const auto counter = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpVariable, pointer, counter, spv::StorageClassFunction);
+					g_loop_guard_counters.emplace(block, counter);
+				}
+			}
+		}
+	}
 	if (state.gds_variable != 0) {
 		state.gds_length = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), state.gds_length,
@@ -723,6 +832,12 @@ void EmitProgram(EmitterState& state) {
 	if (state.pixel_valid_mask_variable != 0) {
 		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable,
 		                          ConstantU32(state, 1));
+	}
+	for (const auto& [block, counter]: g_loop_guard_counters) {
+		state.builder.AddFunction(spv::OpStore, counter, ConstantU32(state, 0));
+	}
+	if (g_dispatcher_guard_counter != 0) {
+		state.builder.AddFunction(spv::OpStore, g_dispatcher_guard_counter, ConstantU32(state, 0));
 	}
 	if (state.lds_storage_class == spv::StorageClassStorageBuffer && state.lds_variable != 0) {
 		const auto group_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);
@@ -741,7 +856,15 @@ void EmitProgram(EmitterState& state) {
 	} else if (state.program.dispatcher_fallback) {
 		EmitDispatcherFunction(ctx, *dispatcher);
 	} else {
+		g_loop_guard_applied = 0;
 		EmitStructuredFunction(ctx);
+		if (!g_loop_guard_counters.empty() && std::getenv("KYTY_LOOP_GUARD_LOG") != nullptr) {
+			std::printf("Shader loop guard: %zu loops, %u exits guarded (%zu blocks)\n", g_loop_guard_counters.size(),
+			            g_loop_guard_applied, program.blocks.size());
+		}
+	}
+	if (g_dispatcher_guard_counter != 0 && std::getenv("KYTY_LOOP_GUARD_LOG") != nullptr) {
+		std::printf("Shader loop guard: dispatcher fallback guarded (%zu blocks)\n", program.blocks.size());
 	}
 	state.builder.AddFunction(spv::OpFunctionEnd);
 	if (state.program.stage == ShaderType::Mesh) {

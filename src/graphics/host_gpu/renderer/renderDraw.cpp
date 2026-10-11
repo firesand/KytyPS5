@@ -1,3 +1,4 @@
+#include <cinttypes>
 #include "graphics/host_gpu/renderer/renderDraw.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
 
@@ -1180,6 +1181,22 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	LogDrawPhase(draw.Name(), "DrawComplete");
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x700u);
+	}
+	static const bool sync_draws = [] {
+		const char* value = std::getenv("KYTY_SYNC_DISPATCH");
+		return value != nullptr && value[0] == '2';
+	}();
+	if (sync_draws) {
+		// Debug aid (KYTY_SYNC_DISPATCH=2): run each draw to completion too, so a graphics shader that never
+		// finishes on the GPU is the last draw logged without " done" (guest shader code addresses).
+		const auto& vs = buffer.GetShaders().GetVs();
+		std::printf("Draw %s es=0x%016" PRIx64 " gs=0x%016" PRIx64 " hs=0x%016" PRIx64 " ps=0x%016" PRIx64 " ...",
+		            draw.Name(), vs.es_regs.data_addr, vs.gs_regs.data_addr, vs.hs_regs.data_addr,
+		            state.ps_active ? buffer.GetShaders().GetPs().ps_regs.data_addr : 0);
+		std::fflush(stdout);
+		m_context.GetCommandScheduler().FlushAndWait();
+		std::printf(" done\n");
+		std::fflush(stdout);
 	}
 }
 

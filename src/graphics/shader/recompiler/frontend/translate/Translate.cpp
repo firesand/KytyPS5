@@ -3,6 +3,7 @@
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <bit>
 #include <unordered_map>
@@ -1026,7 +1027,15 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			break;
 		default: break; // ValidateTranslateOptions rejects unsupported stages.
 	}
-	result.dispatcher_fallback = cfg.irreducible || cfg.unsupported;
+	// With the loop guard on (KYTY_LOOP_GUARD), compute shaders with loops take the dispatcher form, whose single
+	// loop exit the guard can bound whatever shape the guest loops have (the structured form often leaves loops
+	// through breaks the guard cannot fold into). Graphics stages keep the structured form (derivatives).
+	static const bool loop_guard = [] {
+		const char* value = std::getenv("KYTY_LOOP_GUARD");
+		return value != nullptr && std::strtoul(value, nullptr, 0) != 0;
+	}();
+	result.dispatcher_fallback = cfg.irreducible || cfg.unsupported ||
+	                             (loop_guard && options.stage == ShaderType::Compute && !cfg.back_edges.empty());
 	result.cfg_failure_kind    = cfg.failure_kind;
 	result.fallback_reason     = cfg.unsupported_reason;
 	if (options.embedded_fetch != nullptr) {

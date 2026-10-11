@@ -231,7 +231,7 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 static bool SyncDispatchDebugEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_SYNC_DISPATCH");
-		return value != nullptr && value[0] == '1';
+		return value != nullptr && (value[0] == '1' || value[0] == '2');
 	}();
 	return enabled;
 }
@@ -526,6 +526,17 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
+	if (SyncDispatchDebugEnabled()) {
+		// Debug aid (KYTY_SYNC_DISPATCH=1), as in DispatchDirect: an indirect dispatch whose GPU work never
+		// finishes is the last one logged without " done". The arguments are read only after the wait.
+		std::printf("CS indirect dispatch shader=0x%016" PRIx64 " id=%" PRIu64 " args=0x%016" PRIx64 " mode=0x%x ...",
+		            cs_regs.cs_regs.data_addr, compute_program.id, args_addr, mode);
+		std::fflush(stdout);
+		m_context.GetCommandScheduler().FlushAndWait();
+		const auto* groups = reinterpret_cast<const uint32_t*>(args_addr);
+		std::printf(" done (groups %ux%ux%u)\n", groups[0], groups[1], groups[2]);
+		std::fflush(stdout);
+	}
 }
 
 } // namespace Libs::Graphics
