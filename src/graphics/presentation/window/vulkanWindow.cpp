@@ -602,6 +602,17 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		robustness2.robustImageAccess2  = supported_robustness2.robustImageAccess2;
 		robustness2.nullDescriptor      = supported_robustness2.nullDescriptor;
 	}
+	// Claude probe: KYTY_PROBE_NO_ROBUSTNESS2=1 leaves robustBufferAccess2/robustImageAccess2 and
+	// robustImageAccess off (nullDescriptor stays), an A/B for codegen/driver differences.
+	const bool no_robustness2 = [] {
+		const char* value = std::getenv("KYTY_PROBE_NO_ROBUSTNESS2");
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
+	}();
+	if (no_robustness2) {
+		robustness2.robustBufferAccess2 = VK_FALSE;
+		robustness2.robustImageAccess2  = VK_FALSE;
+		Log::WriteToConsoleAndLog("Vulkan: KYTY_PROBE_NO_ROBUSTNESS2 disables robustness2 buffer/image access\n");
+	}
 
 	auto features13 = WindowContext::RequiredVulkan13Features();
 #if defined(__APPLE__)
@@ -611,7 +622,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	features13.pNext = robustness2_ext_enabled ? static_cast<void*>(&robustness2)
 	                                           : static_cast<void*>(&fragment_barycentric);
 #endif
-	features13.robustImageAccess   = supported_features13.robustImageAccess;
+	features13.robustImageAccess   = no_robustness2 ? VK_FALSE : supported_features13.robustImageAccess;
 	features13.subgroupSizeControl =
 	    graphics.compute_subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
 

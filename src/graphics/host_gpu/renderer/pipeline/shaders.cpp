@@ -18,6 +18,7 @@
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 
+#include <cstdlib>
 #include <algorithm>
 #include <bit>
 #include <limits>
@@ -25,6 +26,18 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+namespace {
+// Claude probe: KYTY_PROBE_PIPELINE_NO_OPT=1 creates every pipeline with
+// VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT (A/B for driver codegen differences).
+bool PipelineNoOptProbe() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PROBE_PIPELINE_NO_OPT");
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
+	}();
+	return enabled;
+}
+} // namespace
 
 // IDK: maybe we can remove it?
 constexpr uint8_t kTemporaryVertexAttribFormat113 =
@@ -513,6 +526,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	rendering_info.depthAttachmentFormat   = rendering.depth_format;
 	rendering_info.stencilAttachmentFormat = rendering.stencil_format;
 	pipeline_info.pNext                    = &rendering_info;
+	if (PipelineNoOptProbe()) {
+		pipeline_info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+	}
 	pipeline_info.stageCount               = shader_stage_count;
 	pipeline_info.pStages                  = shader_stages;
 	pipeline_info.pVertexInputState        = mesh ? nullptr : &vertex_input_info;
@@ -607,6 +623,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	info.stage             = comp_shader_stage_info;
 	info.layout            = pipeline.pipeline_layout;
 	info.basePipelineIndex = -1;
+	if (PipelineNoOptProbe()) {
+		info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+	}
 
 	EXIT_IF(pipeline.pipeline != nullptr);
 

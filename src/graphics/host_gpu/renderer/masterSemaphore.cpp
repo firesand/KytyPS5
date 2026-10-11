@@ -85,6 +85,32 @@ void MasterSemaphore::Wait(uint64_t tick) {
 			if (status != vk::Result::eSuccess || n == 2) {
 				ReportDeviceFault(m_graphics.device);
 			}
+			if (n == 3) {
+				// Is the queue alive? An empty submission with a fence either completes (the hung
+				// batch was dropped by the driver), stays pending (queue blocked behind it) or
+				// fails with DEVICE_LOST (the context was reset).
+				vk::FenceCreateInfo fence_info {};
+				vk::Fence           fence {};
+				if (m_graphics.device.createFence(&fence_info, nullptr, &fence) == vk::Result::eSuccess) {
+					vk::Result submit_result;
+					{
+						Common::LockGuard lock(m_graphics.queue_mutex);
+						submit_result = m_graphics.queue.submit(0, nullptr, fence);
+					}
+					vk::Result fence_result  = vk::Result::eNotReady;
+					if (submit_result == vk::Result::eSuccess) {
+						fence_result = m_graphics.device.waitForFences(1, &fence, VK_TRUE, 3'000'000'000ull);
+					}
+					std::printf("MasterSemaphore::Wait: liveness probe: empty submit=%s fence wait(3s)=%s\n",
+					            vk::to_string(submit_result).c_str(), vk::to_string(fence_result).c_str());
+					if (fence_result == vk::Result::eSuccess || submit_result != vk::Result::eSuccess) {
+						m_graphics.device.destroyFence(fence, nullptr);
+					}
+					if (submit_result != vk::Result::eSuccess) {
+						ReportDeviceFault(m_graphics.device);
+					}
+				}
+			}
 			std::fflush(stdout);
 		}
 	} while (result == vk::Result::eTimeout && GpuDiagnostics::Enabled());
