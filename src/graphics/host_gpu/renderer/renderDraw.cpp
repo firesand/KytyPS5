@@ -1187,6 +1187,58 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		vk_buffer.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
 	}
 
+	if (mesh_active && GpuDiagnostics::Enabled() &&
+	    vertex_stages[0].stage.program->shader_hash == 0x67e610ccc37800edull) {
+		// Claude probe: record the attachment and raster state recorded for this exact mesh draw.
+		const auto& regs = buffer.GetRegisters();
+		const auto& vp   = regs.GetScreenViewport();
+		const auto& mode = regs.GetModeControl();
+		const auto& clip = regs.GetClipControl();
+		const auto& scan = regs.GetScanModeControl();
+		std::string line = fmt::format(
+		    "MeshDrawTargets: submit={} pipeline=0x{:x} colors={} render={}x{} layers={} "
+		    "attachments={} depth_image={}:{} ",
+		    submit_id, GpuDiagnostics::HandleValue(pipeline.pipeline), state.color_count,
+		    rendering.width, rendering.height, rendering.num_layers,
+		    rendering.num_color_attachments, state.depth_info.image_id.index,
+		    state.depth_info.image_id.generation);
+		for (uint32_t i = 0; i < state.color_count; i++) {
+			const auto& c = state.color_info[i];
+			line += fmt::format(
+			    "color[{}]=slot{} id={}:{} {} {}x{} view=0x{:x} layout={} clear={} ", i,
+			    c.target_slot, c.image_id.index, c.image_id.generation,
+			    vk::to_string(c.desc.view_info.format), c.Extent().width, c.Extent().height,
+			    GpuDiagnostics::HandleValue(rendering.color_attachments[c.target_slot].image_view),
+			    vk::to_string(rendering.color_attachments[c.target_slot].image_layout),
+			    rendering.color_attachments[c.target_slot].is_clear);
+		}
+		const auto& d  = state.depth_info;
+		const auto& ds = rendering.depth_stencil_attachment;
+		line += fmt::format(
+		    "depth: test={} write={} cmp={} bounds={} stencil={} clear={}/{} fmt={} {}x{} "
+		    "view=0x{:x} layout={} has_depth={} has_stencil={} feedback=0x{:x} | ",
+		    d.depth_test_enable, d.depth_write_enable, vk::to_string(d.depth_compare_op),
+		    d.depth_bounds_test_enable, d.stencil_test_enable, d.depth_clear_enable,
+		    d.depth_load_clear_enable, vk::to_string(d.desc.view_info.format),
+		    d.desc.info.extent.width, d.desc.info.extent.height,
+		    GpuDiagnostics::HandleValue(ds.image_view), vk::to_string(ds.image_layout),
+		    ds.has_depth, ds.has_stencil, static_cast<uint32_t>(feedback_aspects));
+		const auto& v = vp.viewports[0];
+		line += fmt::format(
+		    "viewport0: xscale={} xoffset={} yscale={} yoffset={} zscale={} zoffset={} zmin={} "
+		    "zmax={} scissor screen=({},{},{},{}) window=({},{},{},{}) generic=({},{},{},{}) "
+		    "vport_scissor={} clip_disable={} dx_clip={} cull_front={} cull_back={} face={} "
+		    "poly_mode={}\n",
+		    v.xscale, v.xoffset, v.yscale, v.yoffset, v.zscale, v.zoffset, v.zmin, v.zmax,
+		    vp.screen_scissor_left, vp.screen_scissor_top, vp.screen_scissor_right,
+		    vp.screen_scissor_bottom, vp.window_scissor_left, vp.window_scissor_top,
+		    vp.window_scissor_right, vp.window_scissor_bottom, vp.generic_scissor_left,
+		    vp.generic_scissor_top, vp.generic_scissor_right, vp.generic_scissor_bottom,
+		    scan.vport_scissor_enable, clip.clip_disable, clip.dx_clip_space, mode.cull_front,
+		    mode.cull_back, mode.face, mode.poly_mode);
+		std::fputs(line.c_str(), stdout);
+		std::fflush(stdout);
+	}
 	LogDrawPhase(draw.Name(), "BeginRendering");
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);

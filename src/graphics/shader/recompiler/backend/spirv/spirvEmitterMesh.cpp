@@ -1,7 +1,48 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
+#include "common/logging/log.h"
+
+#include <fmt/format.h>
+
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
+
+// Opt-in diagnostics (default off) for A/B runs of GPU stalls on mesh draws.
+// KYTY_PROBE_MESH_GUARD=1 clamps the guest allocation to the declared output limits and culls
+// primitives that index past the vertex allocation; both are undefined on the host otherwise.
+// KYTY_PROBE_MESH_EMPTY=<hex shader hash> emits an empty allocation for that mesh program only,
+// so its draw records no primitives and runs no fragments.
+bool MeshGuardProbe() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PROBE_MESH_GUARD");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+bool MeshEmptyProbe(uint64_t hash) {
+	static const uint64_t target = [] {
+		const char* value = std::getenv("KYTY_PROBE_MESH_EMPTY");
+		return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+	}();
+	return target != 0 && target == hash;
+}
+
+uint32_t MeshBool(EmitterState& state, spv::Op op, uint32_t lhs, uint32_t rhs) {
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(op, TypeBool(state), result, lhs, rhs);
+	return result;
+}
+
+uint32_t MeshSelectU32(EmitterState& state, uint32_t condition, uint32_t yes, uint32_t no) {
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), result, condition, yes, no);
+	return result;
+}
 
 uint32_t MeshArray(EmitterState& state, spv::StorageClass storage, uint32_t type, uint32_t count) {
 	const auto array = state.builder.Type(spv::OpTypeArray, type, ConstantU32(state, count));
@@ -139,14 +180,41 @@ void EmitMeshEntryPoint(EmitterState& state) {
 	state.builder.AddFunction(spv::OpFunction, TypeVoid(state), state.main_func,
 	                          spv::FunctionControlMaskNone, TypeFunction(state));
 	EmitLabel(state, state.builder.AllocateId());
+	if (MeshEmptyProbe(state.program.shader_hash)) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Shader: KYTY_PROBE_MESH_EMPTY emits an empty allocation for mesh 0x{:016x}\n",
+		    state.program.shader_hash));
+		state.builder.AddFunction(spv::OpSetMeshOutputsEXT, ConstantU32(state, 0),
+		                          ConstantU32(state, 0));
+		state.builder.AddFunction(spv::OpReturn);
+		state.builder.AddFunction(spv::OpFunctionEnd);
+		return;
+	}
 	state.builder.AddFunction(spv::OpFunctionCall, TypeVoid(state), state.builder.AllocateId(),
 	                          state.mesh_guest_func);
 	// All guest waves finish before the uniform Vulkan allocation and output stores.
 	EmitBarrier(state);
-	const auto vertices   = MeshLoad(state, state.mesh_allocation, spv::StorageClassWorkgroup,
-	                                 TypeU32(state), ConstantU32(state, 0));
-	const auto primitives = MeshLoad(state, state.mesh_allocation, spv::StorageClassWorkgroup,
-	                                 TypeU32(state), ConstantU32(state, 1));
+	auto vertices   = MeshLoad(state, state.mesh_allocation, spv::StorageClassWorkgroup,
+	                           TypeU32(state), ConstantU32(state, 0));
+	auto primitives = MeshLoad(state, state.mesh_allocation, spv::StorageClassWorkgroup,
+	                           TypeU32(state), ConstantU32(state, 1));
+	if (MeshGuardProbe()) {
+		static std::atomic_bool logged = false;
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			Log::WriteToConsoleAndLog("Shader: KYTY_PROBE_MESH_GUARD clamps mesh allocations and "
+			                          "culls out-of-range primitive indices\n");
+		}
+		const auto& mesh           = state.input_info.vertex->mesh;
+		const auto  max_vertices   = ConstantU32(state, mesh.max_vertices);
+		const auto  max_primitives = ConstantU32(state, mesh.max_primitives);
+		vertices   = MeshSelectU32(state, MeshBool(state, spv::OpULessThanEqual, vertices, max_vertices),
+		                           vertices, max_vertices);
+		primitives = MeshSelectU32(
+		    state, MeshBool(state, spv::OpULessThanEqual, primitives, max_primitives), primitives,
+		    max_primitives);
+		primitives = MeshSelectU32(state, MeshBool(state, spv::OpIEqual, vertices, ConstantU32(state, 0)),
+		                           ConstantU32(state, 0), primitives);
+	}
 	state.builder.AddFunction(spv::OpSetMeshOutputsEXT, vertices,
 	                          primitives); // OpSetMeshOutputsEXT
 	for (uint32_t half = 0; half < state.lane_count; half++) {
@@ -198,9 +266,19 @@ void EmitMeshEntryPoint(EmitterState& state) {
 			state.builder.AddFunction(spv::OpStore, triangle_pointer, triangle);
 			const auto null_bit =
 			    EmitBinaryU32(state, spv::OpBitwiseAnd, packed, ConstantU32(state, 0x80000000u));
-			const auto culled = state.builder.AllocateId();
+			uint32_t culled = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), culled, null_bit,
 			                          ConstantU32(state, 0));
+			if (MeshGuardProbe()) {
+				for (uint32_t component = 0; component < 3; component++) {
+					const auto out_of_range = MeshBool(state, spv::OpUGreaterThanEqual,
+					                                   vertex[component], vertices);
+					const auto merged = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), merged, culled,
+					                          out_of_range);
+					culled = merged;
+				}
+			}
 			state.builder.AddFunction(spv::OpStore,
 			                          MeshElement(state, state.mesh_cull, spv::StorageClassOutput,
 			                                      TypeBool(state), index),
