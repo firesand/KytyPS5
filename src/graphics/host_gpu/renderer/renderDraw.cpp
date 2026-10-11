@@ -1152,7 +1152,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
 	if (mesh_active) {
 		ZeroCompanyMeshInputs::Capture(buffer, submit_id,
-		    GpuDiagnostics::HandleValue(pipeline.pipeline), stages, draw_data,
+		    GpuDiagnostics::HandleValue(pipeline.pipeline), m_context.GetTextureCache().m_slot_images,
+		    stages, draw_data,
 		    state.vertex_info[0].mesh, mesh_groups, draw.instance_count, draw.IsIndexed(),
 		    primitive_restart_enable);
 	}

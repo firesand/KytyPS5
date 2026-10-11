@@ -3,12 +3,113 @@
 namespace ZeroCompanyMeshInputs {
 
 constexpr uint64_t MaxBytes = 768ull * 1024 * 1024;
+constexpr uint64_t MaxImageBytes = 40ull * 1024 * 1024;
 constexpr uint32_t MaxCaptures = 2;
 
 struct Chunk {
 	vk::DescriptorBufferInfo view {};
 	uint64_t destination = 0;
 };
+
+struct ImageChunk {
+	ImageId id;
+	vk::Image image;
+	vk::Format format;
+	vk::Extent3D extent;
+	VulkanImageState original;
+	uint64_t guest_address = 0, guest_size = 0;
+	uint64_t size = 0, destination = 0;
+	uint32_t bytes_per_texel = 0;
+
+	[[nodiscard]] vk::ImageLayout CopyLayout() const {
+		return original.layout == vk::ImageLayout::eGeneral ? original.layout
+		                                                    : vk::ImageLayout::eTransferSrcOptimal;
+	}
+};
+
+// Observe cache slots directly. GetImage/Transit/Download would change cache
+// ownership, LRU or tracked states; this probe must not do any of those things.
+static bool BuildImagePlan(const Common::SlotVector<Image>& images,
+                           std::span<PreparedBindings* const> stages,
+                           std::vector<ImageChunk>& chunks, uint64_t& total) {
+	const PreparedBindings* pixel = nullptr;
+	for (const auto* stage: stages) {
+		if (!stage || !stage->runtime || !*stage->runtime) return false;
+		if (stage->runtime->program->stage == ShaderType::Pixel) pixel = stage;
+	}
+	if (!pixel || pixel->runtime->program->shader_hash != 0x548ab529f34a1307ull ||
+	    pixel->images.size() != 3 || pixel->runtime->program->info.images.size() != 3) return false;
+	const auto& resources = pixel->runtime->program->info.images;
+	const std::array<uint32_t, 3> expected_bindings {66, 59, 102};
+	for (uint32_t i = 0; i < 3; ++i) {
+		const auto& binding = pixel->images[i];
+		const auto& resource = resources[i];
+		const auto kind = ShaderRecompiler::IR::DescriptorBindingForImage(resource);
+		const auto* source = images.try_get(binding.image_id);
+		if (!source || !kind || ShaderRecompiler::IR::NativeBinding(ShaderType::Pixel, *kind) !=
+		        expected_bindings[i] || resource.descriptor_index != 0 ||
+		    resource.atomic64 != (i == 2) || resource.written != (i == 2) || !resource.read ||
+		    binding.mip_views.size() > 1 || !binding.image_view ||
+		    (!binding.mip_views.empty() && binding.mip_views[0] != binding.image_view)) return false;
+		const auto& native = source->backing;
+		const bool visibility = i != 1;
+		const auto format = visibility ? vk::Format::eR32G32Uint : vk::Format::eR8Unorm;
+		const vk::Extent3D extent = visibility ? vk::Extent3D {2848, 1600, 1}
+		                                        : vk::Extent3D {128, 8192, 1};
+		const auto view_format = i == 2 ? vk::Format::eR64Uint : format;
+		const auto view = std::ranges::find(source->views, binding.image_view, &CachedImageView::view);
+		if (view == source->views.end() || view->info.format != view_format ||
+		    view->info.type != vk::ImageViewType::e2D || view->info.aspect != vk::ImageAspectFlagBits::eColor ||
+		    view->info.base_level != 0 || view->info.level_count != 1 ||
+		    view->info.base_layer != 0 || view->info.layer_count != 1 ||
+		    binding.desc.view_info.format != view_format || source->binding.is_target ||
+		    !source->registered || !native.image || native.image_type != vk::ImageType::e2D ||
+		    native.format != format || native.extent != extent || native.mip_levels != 1 ||
+		    native.layers != 1 || native.samples != 1 ||
+		    !(native.usage & vk::ImageUsageFlagBits::eTransferSrc) ||
+		    source->info.extent != extent || source->info.pixel_format != format ||
+		    source->info.samples != 1 || source->info.resources.levels != 1 ||
+		    source->info.resources.layers != 1 || source->info.HasMetadata() ||
+		    !source->info.metadata.range.Empty() || source->info.GetColorTransform() != ColorTransform::None ||
+		    source->info.data.address == 0 || binding.desc.info.data != source->info.data) return false;
+		const auto state = native.subresource_states.empty() ? native.state : native.subresource_states[0];
+		if (native.subresource_states.size() > 1 || state.layout != native.state.layout ||
+		    (visibility && state.layout != vk::ImageLayout::eGeneral) ||
+		    (!visibility && state.layout != vk::ImageLayout::eGeneral &&
+		     state.layout != vk::ImageLayout::eShaderReadOnlyOptimal)) return false;
+		const auto existing = std::ranges::find(chunks, native.image, &ImageChunk::image);
+		if (i == 2) {
+			// The sampled RG32 view and R64 atomic view must be the exact same
+			// backing and subresource. A similar guest address is insufficient.
+			if (existing == chunks.end() || existing != chunks.begin() ||
+			    binding.image_id != chunks[0].id || binding.image_id != pixel->images[0].image_id)
+				return false;
+			continue;
+		}
+		if (existing != chunks.end()) return false;
+		const uint32_t texel_bytes = visibility ? 8u : 1u;
+		const uint64_t size = uint64_t {extent.width} * extent.height * texel_bytes;
+		if (total % 4u || size > MaxImageBytes - total) return false;
+		chunks.push_back({binding.image_id, native.image, format, extent, state,
+		                  source->info.data.address, source->info.data.size, size, total, texel_bytes});
+		total += size;
+	}
+	return chunks.size() == 2 && total == 37502976;
+}
+
+static bool SameImagePlan(std::span<const ImageChunk> a, std::span<const ImageChunk> b) {
+	if (a.size() != b.size()) return false;
+	for (size_t i = 0; i < a.size(); ++i) {
+		if (a[i].id != b[i].id || a[i].image != b[i].image || a[i].format != b[i].format ||
+		    a[i].extent != b[i].extent || a[i].guest_address != b[i].guest_address ||
+		    a[i].guest_size != b[i].guest_size || a[i].size != b[i].size ||
+		    a[i].destination != b[i].destination || a[i].bytes_per_texel != b[i].bytes_per_texel ||
+		    a[i].original.layout != b[i].original.layout ||
+		    a[i].original.pl_stage != b[i].original.pl_stage ||
+		    a[i].original.access_mask != b[i].original.access_mask) return false;
+	}
+	return true;
+}
 
 static void Log(const std::string& message) {
 	::Log::WriteToConsoleAndLog(message.c_str());
@@ -73,7 +174,8 @@ static bool WriteFile(const std::filesystem::path& path, const void* bytes, uint
 	return ok;
 }
 
-static bool BuildPlan(std::span<PreparedBindings* const> stages, std::vector<Chunk>& chunks,
+static bool BuildPlan(std::span<PreparedBindings* const> stages, std::span<const ImageChunk> images,
+                      std::vector<Chunk>& chunks,
                       uint64_t& total, std::string& metadata) {
 	using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
 	metadata = "[";
@@ -141,7 +243,8 @@ static bool BuildPlan(std::span<PreparedBindings* const> stages, std::vector<Chu
 			    resource.scalar, resource.read, resource.written, resource.image_alias,
 			    Words(std::span {raw.dwords}.first(raw.dword_count)));
 		}
-		metadata += "],\"images_uncaptured\":[";
+		metadata += images.empty() ? "],\"images_uncaptured\":["
+		                           : "],\"images_uncaptured\":[],\"images_captured\":[";
 		for (uint32_t i = 0; i < program.info.images.size(); ++i) {
 			const auto& raw = snapshot.images[i];
 			if (raw.dword_count > raw.dwords.size()) return false;
@@ -149,17 +252,21 @@ static bool BuildPlan(std::span<PreparedBindings* const> stages, std::vector<Chu
 			const auto& image = prepared->images[i];
 			const auto kind = ShaderRecompiler::IR::DescriptorBindingForImage(resource);
 			if (i != 0) metadata += ',';
+			const auto captured = std::ranges::find(images, image.image_id, &ImageChunk::id);
+			if (!images.empty() && captured == images.end()) return false;
 			metadata += fmt::format(
 			    "{{\"resource\":{},\"binding\":{},\"descriptor\":{},\"raw\":{},"
 			    "\"view\":\"0x{:x}\",\"slot\":[{},{}],\"view_format\":{},"
 			    "\"guest_address\":\"0x{:x}\",\"size\":{},\"extent\":[{},{},{}],"
-			    "\"atomic64\":{},\"contents_captured\":false}}",
+			    "\"atomic64\":{}",
 			    i, kind ? ShaderRecompiler::IR::NativeBinding(program.stage, *kind) : UINT32_MAX,
 			    resource.descriptor_index, Words(std::span {raw.dwords}.first(raw.dword_count)),
 			    GpuDiagnostics::HandleValue(image.image_view), image.image_id.index,
 			    image.image_id.generation, JsonString(vk::to_string(image.desc.view_info.format)),
 			    image.desc.info.data.address, image.desc.info.data.size, image.desc.info.extent.width,
 			    image.desc.info.extent.height, image.desc.info.extent.depth, resource.atomic64);
+			metadata += images.empty() ? ",\"contents_captured\":false}"
+			    : fmt::format(",\"image_chunk\":{}}}", captured - images.begin());
 		}
 		metadata += "]}";
 	}
@@ -168,6 +275,7 @@ static bool BuildPlan(std::span<PreparedBindings* const> stages, std::vector<Chu
 }
 
 static void Capture(CommandBuffer& buffer, uint64_t submit, uint64_t pipeline,
+                    const Common::SlotVector<Image>& image_slots,
                     std::span<PreparedBindings* const> stages,
                     std::span<const uint32_t> draw_data, const ShaderMeshInputInfo& mesh,
                     uint32_t groups, uint32_t instances, bool indexed, bool restart) {
@@ -176,6 +284,10 @@ static void Capture(CommandBuffer& buffer, uint64_t submit, uint64_t pipeline,
 		return value && std::strcmp(value, "1") == 0;
 	}();
 	if (!enabled) return;
+	static const bool capture_images = [] {
+		const auto* value = std::getenv("KYTY_PROBE_MESH_IMAGES");
+		return value && std::strcmp(value, "1") == 0;
+	}();
 	if (!GpuDiagnostics::Enabled() || !GpuDiagnostics::Serialize() ||
 	    !GpuDiagnostics::SerializePreparation()) {
 		static std::atomic_flag warned = ATOMIC_FLAG_INIT;
@@ -213,9 +325,15 @@ static void Capture(CommandBuffer& buffer, uint64_t submit, uint64_t pipeline,
 		return;
 	}
 	std::vector<Chunk> chunks;
+	std::vector<ImageChunk> image_chunks;
+	uint64_t image_total = 0;
+	if (capture_images && !BuildImagePlan(image_slots, stages, image_chunks, image_total)) {
+		fail("requested_image_plan_unsupported_no_capture");
+		return;
+	}
 	uint64_t total = 0;
 	std::string stage_metadata;
-	if (!BuildPlan(stages, chunks, total, stage_metadata)) {
+	if (!BuildPlan(stages, image_chunks, chunks, total, stage_metadata)) {
 		fail("unsafe_or_oversize_bindings");
 		return;
 	}
@@ -229,7 +347,7 @@ static void Capture(CommandBuffer& buffer, uint64_t submit, uint64_t pipeline,
 	if (parent.empty()) parent = std::filesystem::current_path(error);
 	if (error) { fail("diagnostics_parent"); return; }
 	const auto space = std::filesystem::space(parent, error);
-	if (error || space.available < total + 1024 * 1024) {
+	if (error || space.available < total + image_total + 1024 * 1024) {
 		fail("insufficient_evidence_space");
 		return;
 	}
@@ -258,15 +376,17 @@ static void Capture(CommandBuffer& buffer, uint64_t submit, uint64_t pipeline,
 		}
 	}
 	std::string metadata = fmt::format(
-	    "\"schema\":1,\"capture\":{},\"guest_submit\":{},\"pipeline\":\"0x{:x}\","
-	    "\"ordering_changed\":true,\"buffer_only\":true,\"ps_images_captured\":false,"
+	    "\"schema\":{},\"capture\":{},\"guest_submit\":{},\"pipeline\":\"0x{:x}\","
+	    "\"ordering_changed\":true,\"buffer_only\":{},\"image_snapshot_requested\":{},"
 	    "\"sync\":true,\"sync_prep\":true,\"bytes\":{},\"limit_bytes\":{},"
+	    "\"image_bytes\":{},\"image_limit_bytes\":{},\"total_bytes\":{},"
 	    "\"draw_data\":{},\"mesh_groups\":[{},{},1],\"indexed\":false,"
 	    "\"mesh\":{{\"threads\":{},\"wave_size\":{},\"host_subgroup_size\":{},"
 	    "\"lds_dwords\":{},\"input_primitive\":{},\"fast_launch\":{},"
 	    "\"primitives_per_group\":{},\"vertices_per_group\":{},\"max_vertices\":{},"
 	    "\"max_primitives\":{},\"provoking_vertex\":{}}},\"stages\":{},\"chunks\":[",
-	    ordinal, submit, pipeline, total, MaxBytes, Words(draw_data), groups, instances,
+	    capture_images ? 2 : 1, ordinal, submit, pipeline, !capture_images, capture_images,
+	    total, MaxBytes, image_total, MaxImageBytes, total + image_total, Words(draw_data), groups, instances,
 	    Words(mesh.threads_num), mesh.wave_size, mesh.host_subgroup_size, mesh.lds_size_dwords,
 	    mesh.input_primitive, mesh.fast_launch, mesh.primitives_per_group, mesh.vertices_per_group,
 	    mesh.max_vertices, mesh.max_primitives, mesh.provoking_vertex, stage_metadata);
@@ -279,9 +399,32 @@ static void Capture(CommandBuffer& buffer, uint64_t submit, uint64_t pipeline,
 		    GpuDiagnostics::HandleValue(chunk.view.buffer), chunk.view.offset, chunk.view.range,
 		    chunk.destination);
 	}
+	metadata += "],\"image_chunks\":[";
+	for (uint32_t i = 0; i < image_chunks.size(); ++i) {
+		const auto& image = image_chunks[i];
+		if (i != 0) metadata += ',';
+		metadata += fmt::format(
+		    "{{\"image_chunk\":{},\"file\":\"image-{:02}.bin\",\"image_handle\":\"0x{:x}\","
+		    "\"slot\":[{},{}],\"guest_address\":\"0x{:x}\",\"guest_size\":{},"
+		    "\"format\":{},\"format_value\":{},\"extent\":[{},{},{}],"
+		    "\"samples\":1,\"mip_level\":0,\"base_array_layer\":0,\"layer_count\":1,\"aspect\":\"Color\","
+		    "\"bytes_per_texel\":{},\"row_bytes\":{},\"rows\":{},\"size\":{},\"staging_offset\":{},"
+		    "\"buffer_row_length\":0,\"buffer_image_height\":0,\"tightly_packed\":true,"
+		    "\"view_swizzle_applied\":false,\"guest_tiling_applied\":false,"
+		    "\"original_layout\":{},\"copy_layout\":{},\"restored_layout\":{},"
+		    "\"original_stage_mask\":{},\"original_access_mask\":{}}}",
+		    i, i, GpuDiagnostics::HandleValue(image.image), image.id.index, image.id.generation,
+		    image.guest_address, image.guest_size, JsonString(vk::to_string(image.format)),
+		    static_cast<uint32_t>(image.format), image.extent.width, image.extent.height,
+		    image.extent.depth, image.bytes_per_texel, uint64_t {image.extent.width} * image.bytes_per_texel,
+		    image.extent.height, image.size, image.destination,
+		    JsonString(vk::to_string(image.original.layout)), JsonString(vk::to_string(image.CopyLayout())),
+		    JsonString(vk::to_string(image.original.layout)),
+		    static_cast<uint64_t>(image.original.pl_stage), static_cast<uint64_t>(image.original.access_mask));
+	}
 	metadata += "],\"probe_environment\":{";
 	bool first = true;
-	for (const char* name: {"KYTY_PROBE_MESH_INPUTS", "KYTY_PROBE_MESH_INPUTS_SKIP_FIRST", "KYTY_PROBE_LDS_WAVE_ORDER",
+	for (const char* name: {"KYTY_PROBE_MESH_INPUTS", "KYTY_PROBE_MESH_INPUTS_SKIP_FIRST", "KYTY_PROBE_MESH_IMAGES", "KYTY_PROBE_LDS_WAVE_ORDER",
 	                       "KYTY_PROBE_LDS_WAVE_ORDER_ALL", "KYTY_PROBE_SKIP_PS_548A"}) {
 		if (!first) metadata += ',';
 		first = false;
@@ -289,7 +432,7 @@ static void Capture(CommandBuffer& buffer, uint64_t submit, uint64_t pipeline,
 		metadata += JsonString(name) + ':' + JsonString(value ? value : "");
 	}
 	metadata += '}';
-	const auto pending = "{\"status\":\"pending_gpu_copy\"," + metadata + "}\n";
+	const auto pending = "{\"status\":\"pending_gpu_copy\",\"ps_images_captured\":false," + metadata + "}\n";
 	if (!WriteFile(directory / "pending.json", pending.data(), pending.size())) {
 		fail("pending_manifest_write_failed");
 		return;
@@ -297,19 +440,60 @@ static void Capture(CommandBuffer& buffer, uint64_t submit, uint64_t pipeline,
 	auto& scheduler = buffer.GetContext().GetCommandScheduler();
 	const auto preparation_tick = scheduler.CurrentTick();
 	Log(fmt::format("MeshInputs: preparation_submit capture={} submit={} tick={} chunks={} "
-	                "bytes={} ordering_changed=true buffer_only=true ps_images_captured=false path={}\n",
-	                ordinal, submit, preparation_tick, chunks.size(), total, directory.string()));
+	                "bytes={} image_bytes={} ordering_changed=true buffer_only={} ps_images_captured=false path={}\n",
+	                ordinal, submit, preparation_tick, chunks.size(), total, image_total,
+	                !capture_images, directory.string()));
 	buffer.EndRendering();
 	scheduler.FlushAndWait();
 	const auto preparation_completed = scheduler.GetMasterSemaphore().KnownGpuTick();
 	Log(fmt::format("MeshInputs: preparation_complete capture={} submitted={} completed={} next={}\n",
 	                ordinal, preparation_tick, preparation_completed, scheduler.CurrentTick()));
+	if (capture_images) {
+		// FlushAndWait deliberately does not PopPendingOperations or recycle prepared
+		// resources. Recheck their identities and tracked states after the fence so
+		// a stale plan can never read a replacement or an unexpected layout.
+		std::vector<ImageChunk> after_preparation;
+		uint64_t checked_total = 0;
+		if (!BuildImagePlan(image_slots, stages, after_preparation, checked_total) ||
+		    checked_total != image_total || !SameImagePlan(image_chunks, after_preparation)) {
+			fail("image_plan_changed_after_preparation_pending_manifest_is_incomplete");
+			return;
+		}
+	}
 	Buffer download(buffer.GetGraphics(), scheduler, MemoryUsage::Download, 0,
 	                vk::BufferUsageFlagBits::eTransferDst, total);
 	if (download.Mapped().size() < total) { fail("download_unmapped"); return; }
+	std::unique_ptr<Buffer> image_download;
+	if (capture_images) {
+		image_download = std::make_unique<Buffer>(buffer.GetGraphics(), scheduler, MemoryUsage::Download,
+		    0, vk::BufferUsageFlagBits::eTransferDst, image_total);
+		if (image_download->Mapped().size() < image_total) { fail("image_download_unmapped"); return; }
+	}
 	const auto copy_tick = scheduler.CurrentTick();
 	const auto command = buffer.Handle();
 	std::vector<vk::BufferMemoryBarrier2> before, after;
+	std::vector<vk::ImageMemoryBarrier2> image_before, image_after;
+	for (const auto& image: image_chunks) {
+		vk::ImageMemoryBarrier2 barrier {};
+		barrier.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+		barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+		barrier.dstStageMask = vk::PipelineStageFlagBits2::eCopy;
+		barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+		barrier.oldLayout = image.original.layout;
+		barrier.newLayout = image.CopyLayout();
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.image = image.image;
+		barrier.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		image_before.push_back(barrier);
+		barrier.srcStageMask = vk::PipelineStageFlagBits2::eCopy;
+		barrier.srcAccessMask = vk::AccessFlagBits2::eTransferRead;
+		barrier.dstStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+		barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+		barrier.oldLayout = image.CopyLayout();
+		barrier.newLayout = image.original.layout;
+		image_after.push_back(barrier);
+	}
 	for (const auto& chunk: chunks) {
 		vk::BufferMemoryBarrier2 barrier {};
 		barrier.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
@@ -339,9 +523,16 @@ static void Capture(CommandBuffer& buffer, uint64_t submit, uint64_t pipeline,
 	host.offset = 0;
 	host.size = total;
 	after.push_back(host);
+	if (image_download) {
+		host.buffer = image_download->Handle();
+		host.size = image_total;
+		after.push_back(host);
+	}
 	vk::DependencyInfo dependency {};
 	dependency.bufferMemoryBarrierCount = static_cast<uint32_t>(before.size());
 	dependency.pBufferMemoryBarriers = before.data();
+	dependency.imageMemoryBarrierCount = static_cast<uint32_t>(image_before.size());
+	dependency.pImageMemoryBarriers = image_before.data();
 	command.pipelineBarrier2(dependency);
 	for (uint32_t i = 0; i < chunks.size(); ++i) {
 		const auto& chunk = chunks[i];
@@ -355,16 +546,36 @@ static void Capture(CommandBuffer& buffer, uint64_t submit, uint64_t pipeline,
 		              chunk.view.offset, chunk.view.range, chunk.destination};
 		scheduler.RecordGpuOperation(event);
 	}
+	for (uint32_t i = 0; i < image_chunks.size(); ++i) {
+		const auto& image = image_chunks[i];
+		vk::BufferImageCopy copy {};
+		copy.bufferOffset = image.destination;
+		copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		copy.imageExtent = image.extent;
+		// General is a valid copy-source layout. A sampled-only image temporarily
+		// uses TransferSrcOptimal, then returns to its original tracked layout.
+		command.copyImageToBuffer(image.image, image.CopyLayout(), image_download->Handle(), 1, &copy);
+		GpuDiagnosticEvent event;
+		event.kind = "mesh-image-copy";
+		event.guest_submit = submit;
+		event.pipeline = pipeline;
+		event.args = {ordinal, i, GpuDiagnostics::HandleValue(image.image),
+		              GpuDiagnostics::HandleValue(image_download->Handle()), image.size, image.destination};
+		scheduler.RecordGpuOperation(event);
+	}
 	dependency.bufferMemoryBarrierCount = static_cast<uint32_t>(after.size());
 	dependency.pBufferMemoryBarriers = after.data();
+	dependency.imageMemoryBarrierCount = static_cast<uint32_t>(image_after.size());
+	dependency.pImageMemoryBarriers = image_after.data();
 	command.pipelineBarrier2(dependency);
-	Log(fmt::format("MeshInputs: copy_submit capture={} submit={} tick={} bytes={}\n",
-	                ordinal, submit, copy_tick, total));
+	Log(fmt::format("MeshInputs: copy_submit capture={} submit={} tick={} bytes={} image_bytes={}\n",
+	                ordinal, submit, copy_tick, total, image_total));
 	// Do not Finish/PopPendingOperations, rebind, or allocate from shared streams.
 	// Serialize() also fences the resumed draw before a later draw can recycle a
 	// stream reservation whose old preparation tick has now completed.
 	scheduler.FlushAndWait();
 	download.Invalidate(0, total);
+	if (image_download) image_download->Invalidate(0, image_total);
 	const auto copy_completed = scheduler.GetMasterSemaphore().KnownGpuTick();
 	Log(fmt::format("MeshInputs: copy_complete capture={} submitted={} completed={} next={}\n",
 	                ordinal, copy_tick, copy_completed, scheduler.CurrentTick()));
@@ -378,18 +589,31 @@ static void Capture(CommandBuffer& buffer, uint64_t submit, uint64_t pipeline,
 		Log(fmt::format("MeshInputs: file_complete capture={} chunk={} bytes={}\n",
 		                ordinal, i, chunk.view.range));
 	}
+	for (uint32_t i = 0; i < image_chunks.size(); ++i) {
+		const auto& image = image_chunks[i];
+		if (!WriteFile(directory / fmt::format("image-{:02}.bin", i),
+		               image_download->Mapped().data() + image.destination, image.size)) {
+			fail("image_binary_write_failed_pending_manifest_is_incomplete");
+			return;
+		}
+		Log(fmt::format("MeshInputs: image_file_complete capture={} image_chunk={} bytes={} "
+		                "image=0x{:x} original_layout={} restored_layout={}\n",
+		                ordinal, i, image.size, GpuDiagnostics::HandleValue(image.image),
+		                vk::to_string(image.original.layout), vk::to_string(image.original.layout)));
+	}
 	const auto manifest = fmt::format(
-	    "{{\"status\":\"complete\",{},\"preparation_tick\":{},\"preparation_completed\":{},"
+	    "{{\"status\":\"complete\",\"ps_images_captured\":{}, {},\"preparation_tick\":{},\"preparation_completed\":{},"
 	    "\"copy_tick\":{},\"copy_completed\":{},\"resume_tick\":{}}}\n",
-	    metadata, preparation_tick, preparation_completed, copy_tick, copy_completed,
+	    capture_images, metadata, preparation_tick, preparation_completed, copy_tick, copy_completed,
 	    scheduler.CurrentTick());
 	if (!WriteFile(directory / "manifest.json", manifest.data(), manifest.size())) {
 		fail("complete_manifest_write_failed");
 		return;
 	}
 	Log(fmt::format("MeshInputs: capture_complete capture={} submit={} resume_tick={} bytes={} "
-	                "ordering_changed=true buffer_only=true ps_images_captured=false path={}\n",
-	                ordinal, submit, scheduler.CurrentTick(), total, directory.string()));
+	                "image_bytes={} ordering_changed=true buffer_only={} ps_images_captured={} path={}\n",
+	                ordinal, submit, scheduler.CurrentTick(), total, image_total, !capture_images,
+	                capture_images, directory.string()));
 }
 
 } // namespace ZeroCompanyMeshInputs
