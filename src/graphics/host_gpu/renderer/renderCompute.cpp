@@ -29,6 +29,8 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -224,6 +226,26 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 	bindings.shared_memory = {storage.Handle(), 0, size};
 }
 
+static constexpr uint32_t ParsePersistentGroupProbe(const char* text) {
+	if (text == nullptr || *text == '\0') return 0;
+	uint32_t value = 0;
+	for (; *text != '\0'; ++text) {
+		if (*text < '0' || *text > '9') return 0;
+		value = value * 10u + static_cast<uint32_t>(*text - '0');
+		// Bound every step, before another multiplication could overflow.
+		if (value > 1440u) return 0;
+	}
+	return value;
+}
+static_assert(ParsePersistentGroupProbe("1") == 1 && ParsePersistentGroupProbe("64") == 64 &&
+              ParsePersistentGroupProbe("1440") == 1440);
+static_assert(ParsePersistentGroupProbe(nullptr) == 0 && ParsePersistentGroupProbe("") == 0 &&
+              ParsePersistentGroupProbe("0") == 0 && ParsePersistentGroupProbe("1441") == 0 &&
+              ParsePersistentGroupProbe("4294967297") == 0 &&
+              ParsePersistentGroupProbe("+64") == 0 && ParsePersistentGroupProbe("-1") == 0 &&
+              ParsePersistentGroupProbe(" 64") == 0 && ParsePersistentGroupProbe("64 ") == 0 &&
+              ParsePersistentGroupProbe("0x40") == 0 && ParsePersistentGroupProbe("64x") == 0);
+
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode, bool async_compute) {
@@ -348,6 +370,22 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		m_context.PrepareBda();
 	}
 	RebindImages(bindings);
+	const uint32_t requested_group_x = thread_group_x;
+	bool persistent_group_probe = false;
+	if (GpuDiagnostics::Enabled() && program.shader_hash == 0x2ef44268a059254full &&
+	    mode == 0x41u && thread_group_x == 1440u && thread_group_y == 1u && thread_group_z == 1u &&
+	    input_info.threads_num[0] == 64u && input_info.threads_num[1] == 1u &&
+	    input_info.threads_num[2] == 1u) {
+		static const auto probe_groups = ParsePersistentGroupProbe(
+		    std::getenv("KYTY_PROBE_PERSISTENT_GROUPS"));
+		if (probe_groups != 0u) {
+			// Diagnostic worker-count experiment only; keep LDS allocation and dispatch
+			// dimensions consistent without changing shader compilation or cache keys.
+			thread_group_x = probe_groups;
+			input_info.workgroup_counts[0] = probe_groups;
+			persistent_group_probe = true;
+		}
+	}
 	BindSharedMemory(m_context, input_info, bindings);
 	RebindBuffers(bindings);
 
@@ -501,6 +539,24 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		event.shaders[0] = {program.shader_hash, compute_program.id,
 		                    static_cast<uint32_t>(program.stage)};
 		m_context.GetCommandScheduler().RecordGpuOperation(event);
+		if (persistent_group_probe) {
+			event.kind = "persistent-group-probe";
+			// args: requested x/y/z, emitted x/y/z. Record after the actual dispatch.
+			event.args = {requested_group_x, thread_group_y, thread_group_z,
+			              thread_group_x, thread_group_y, thread_group_z};
+			m_context.GetCommandScheduler().RecordGpuOperation(event);
+			// The bounded ring is normally dumped only on a stall. Preserve this
+			// experiment's applied dimensions even when every submission succeeds.
+			std::fprintf(stderr,
+			    "GPU_DIAGNOSTICS persistent-group-probe diagnostic_only=1 shader=0x%016" PRIx64
+			    " tick=%" PRIu64 " requested=%ux%ux%u emitted=%ux%ux%u mode=0x%08" PRIx32
+			    " local=%ux%ux%u\n",
+			    program.shader_hash, m_context.GetCommandScheduler().CurrentTick(),
+			    requested_group_x, thread_group_y, thread_group_z,
+			    thread_group_x, thread_group_y, thread_group_z, mode,
+			    input_info.threads_num[0], input_info.threads_num[1], input_info.threads_num[2]);
+			std::fflush(stderr);
+		}
 	}
 
 	// The removed host fence also ordered read-only dispatches before later writers.
