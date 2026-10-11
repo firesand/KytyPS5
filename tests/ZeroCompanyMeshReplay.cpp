@@ -30,6 +30,9 @@ constexpr uint64_t FnvBasis = 14695981039346656037ull;
 constexpr uint64_t MeshFnv = 0xca310497219a1d7aull;
 constexpr size_t MeshBytes = 158472;
 constexpr const char* MeshSha = "0f0e5672764bbf39aa0ac59fca99eae3a042dbad7d86a958bb2aaf707b33cc79";
+constexpr size_t PixelBytes = 36044;
+constexpr uint64_t PixelFnv = 0x7928d16868b75057ull;
+constexpr const char* PixelSha = "eb5cf448e698c6deb4cab510e27e5dfd63763ad87b74e36cb267d39d316528a3";
 
 void Require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
@@ -96,13 +99,15 @@ struct Capture {
     Json manifest;
     std::map<uint32_t, InputChunk> chunks;
     std::array<uint32_t, 9> descriptor_chunks {};
+    std::array<uint32_t, 7> pixel_chunks {};
     std::array<uint32_t, 32> push {};
     std::array<uint32_t, 3> groups {};
     std::vector<uint32_t> mesh;
+    std::vector<uint32_t> pixel;
     uint64_t bytes = 0;
     uint32_t width = 0, height = 0;
 
-    Capture(const fs::path& manifest_path, const fs::path& spv) {
+    Capture(const fs::path& manifest_path, const fs::path& spv, const fs::path& pixel_spv) {
         Require(std::endian::native == std::endian::little, "little endian host required");
         Require(fs::file_size(manifest_path) <= 1024 * 1024, "oversize manifest");
         std::ifstream in(manifest_path);
@@ -142,15 +147,18 @@ struct Capture {
             for (size_t i = 0; i < words.size(); ++i) push[start + i] = Number(words.at(i), UINT32_MAX, "push word");
         }
         Require(ms.at("user_data").size() > 8 && ms.at("user_data").at(8) == push[8], "mesh user data mismatch");
-        const auto& buffers = ms.at("buffers");
-        Require(buffers.is_array() && buffers.size() == 9, "expected nine mesh views");
+        for (uint32_t stage_index = 0; stage_index < (pixel_spv.empty() ? 1u : 2u); ++stage_index) {
+        const auto& buffers = manifest.at("stages").at(stage_index).at("buffers");
+        const uint32_t buffer_count = stage_index == 0 ? 9 : 7;
+        Require(buffers.is_array() && buffers.size() == buffer_count, "unexpected captured buffer count");
         std::set<uint32_t> seen;
         for (const auto& resource : buffers) {
-            auto index = uint32_t(Number(resource.at("descriptor"), 8, "descriptor index"));
-            Require(seen.insert(index).second && resource.at("resource") == index && resource.at("binding") == 0 &&
+            auto index = uint32_t(Number(resource.at("descriptor"), buffer_count - 1, "descriptor index"));
+            Require(seen.insert(index).second && resource.at("resource") == index && resource.at("binding") == (stage_index == 0 ? 0 : 56) &&
                     resource.at("read") == true && resource.at("write") == false, "unexpected resource binding/access");
             auto chunk = uint32_t(Number(resource.at("chunk"), 63, "chunk index"));
-            descriptor_chunks[index] = chunk;
+            if (stage_index == 0) descriptor_chunks[index] = chunk;
+            else pixel_chunks[index] = chunk;
             const auto& all_chunks = manifest.at("chunks");
             Require(all_chunks.is_array() && all_chunks.size() <= 64 && chunk < all_chunks.size(), "missing chunk");
             const auto& c = all_chunks.at(chunk);
@@ -159,7 +167,7 @@ struct Capture {
             auto offset = Number(c.at("offset"), UINT64_MAX, "original view offset");
             Require(size > 0 && size % 4 == 0 && offset % 4 == 0 && offset <= UINT64_MAX - size, "invalid view bounds");
             auto prefix = Number(resource.at("prefix"), 255, "prefix");
-            auto packed = push[9 + index / 4];
+            auto packed = push[(stage_index == 0 ? 9 : 6) + index / 4];
             Require(prefix == ((packed >> ((index % 4) * 8)) & 255) && prefix % 4 == 0 && prefix <= size &&
                     Number(resource.at("source_size"), MaxBytes, "source size") <= size - prefix, "prefix/range mismatch");
             auto name = c.at("file").get<std::string>();
@@ -171,6 +179,7 @@ struct Capture {
                 input.hash = StreamFile(input.path, size);
                 chunks.emplace(chunk, std::move(input));
             }
+        }
         }
         // Match the captured image extent, but use an independent color attachment.
         auto extent = ps.at("images_uncaptured").at(0).at("extent");
@@ -185,6 +194,25 @@ struct Capture {
             std::cerr << "SPIR-V word " << pos.index << ": " << text << '\n';
         });
         Require(validator.Validate(mesh), "captured mesh failed Vulkan1.3 SPIR-V validation");
+        if (!pixel_spv.empty()) {
+            Require(width == 2848 && height == 1600 && ps.at("memory_offset_dword") == 0, "unexpected original PS layout/extent");
+            const auto& images = ps.at("images_uncaptured");
+            Require(images.size() == 3, "expected exactly three PS image views");
+            const auto& sampled = images.at(0);
+            const auto& noise = images.at(1);
+            const auto& atomic = images.at(2);
+            Require(sampled.at("binding") == 66 && sampled.at("descriptor") == 0 && sampled.at("view_format") == "R32G32Uint" &&
+                    atomic.at("binding") == 102 && atomic.at("descriptor") == 0 && atomic.at("view_format") == "R64Uint" &&
+                    atomic.at("extent") == sampled.at("extent") && atomic.at("raw") == sampled.at("raw") &&
+                    atomic.at("slot") == sampled.at("slot") && atomic.at("guest_address") == sampled.at("guest_address"),
+                    "visibility sampled/storage views are not the expected alias");
+            Require(noise.at("binding") == 59 && noise.at("descriptor") == 0 && noise.at("view_format") == "R8Unorm" &&
+                    noise.at("extent") == Json::array({128, 8192, 1}), "unexpected noise view");
+            Require(fs::file_size(pixel_spv) == PixelBytes, "unrecognized original PS module size");
+            pixel.resize(PixelBytes / 4);
+            Require(StreamFile(pixel_spv, PixelBytes, pixel.data()) == PixelFnv, "unrecognized original PS; refusing altered SPIR-V");
+            Require(validator.Validate(pixel), "original PS failed Vulkan1.3 SPIR-V validation");
+        }
     }
 
     Json Description() const {
@@ -200,11 +228,30 @@ struct Capture {
             {"bda_descriptors", "zero dummy; exact module indexed branch disabled by push[3]=0"} };
         for (const auto& [index, c] : chunks) j["inputs"].push_back({{"chunk", index}, {"file", c.path.string()},
             {"range", c.size}, {"fnv1a64", Hex(c.hash)}});
+        uint64_t mesh_only_bytes = 0;
+        for (auto index : std::set<uint32_t>(descriptor_chunks.begin(), descriptor_chunks.end())) mesh_only_bytes += chunks.at(index).size;
+        j["mesh_bytes"] = mesh_only_bytes;
+        j["input_buffer_bytes"] = bytes;
+        if (!pixel.empty()) {
+            j["original_pixel_shader"] = true;
+            j["pixel_spirv_unchanged"] = true;
+            j["pixel_spirv_sha256_reference"] = PixelSha;
+            j["pixel_spirv_fnv1a64"] = Hex(PixelFnv);
+            j["pixel_spirv_bytes"] = PixelBytes;
+            j["image_input_mode"] = "SYNTHETIC_ZERO_INITIALIZED_NOT_CAPTURED";
+            j["original_pixel_images"] = false;
+            j["fragment_fixture"] = "unchanged PS548a; SYNTHETIC zero visibility and noise images; color is not observed";
+            j["push_constant_range"]["stages"] = "MeshEXT|Fragment";
+            j["synthetic_images"] = Json::array({
+                {{"bindings", {66, 102}}, {"formats", {"R32G32Uint", "R64Uint"}}, {"same_image", true}, {"extent", {2848, 1600, 1}}, {"initial_bits", 0}},
+                {{"bindings", {59}}, {"formats", {"R8Unorm"}}, {"extent", {128, 8192, 1}}, {"initial_bits", 0}}});
+        } else j["image_input_mode"] = "NONE";
         return j;
     }
 };
 
 struct Buffer { VkBuffer buffer {}; VkDeviceMemory memory {}; VkDeviceSize size {}; void* mapped {}; };
+struct ReplayImage { VkImage image {}; VkDeviceMemory memory {}; VkImageView sampled {}, atomic {}; VkExtent3D extent {}; };
 class Replay {
 public:
     // Timeout/device-loss uses _Exit: never destroy possibly in-flight objects or
@@ -220,6 +267,7 @@ public:
     VkImage image {};
     VkDeviceMemory image_memory {};
     VkImageView image_view {};
+    std::array<ReplayImage, 2> synthetic_images {};
     VkDescriptorSetLayout descriptor_layout {};
     VkDescriptorPool descriptor_pool {};
     VkPipelineLayout pipeline_layout {};
@@ -230,6 +278,7 @@ public:
     VkQueryPool primitives {}, statistics {};
     PFN_vkCmdDrawMeshTasksEXT draw_mesh = nullptr;
     bool use_required_subgroup = false;
+    bool fragment_required_subgroup = false;
     bool mesh_queries = false, pipeline_queries = false;
     uint64_t allocated = 0;
     Json host;
@@ -250,6 +299,12 @@ public:
             if (image_view) vkDestroyImageView(device, image_view, nullptr);
             if (image) vkDestroyImage(device, image, nullptr);
             if (image_memory) vkFreeMemory(device, image_memory, nullptr);
+            for (auto& im : synthetic_images) {
+                if (im.sampled) vkDestroyImageView(device, im.sampled, nullptr);
+                if (im.atomic) vkDestroyImageView(device, im.atomic, nullptr);
+                if (im.image) vkDestroyImage(device, im.image, nullptr);
+                if (im.memory) vkFreeMemory(device, im.memory, nullptr);
+            }
             for (auto& b : buffers) {
                 if (b.mapped) vkUnmapMemory(device, b.memory);
                 if (b.buffer) vkDestroyBuffer(device, b.buffer, nullptr);
@@ -278,20 +333,32 @@ public:
         Vk(vkEnumerateDeviceExtensionProperties(physical, nullptr, &count, nullptr), "enumerate extensions");
         std::vector<VkExtensionProperties> extensions(count);
         Vk(vkEnumerateDeviceExtensionProperties(physical, nullptr, &count, extensions.data()), "enumerate extensions");
-        for (auto name : {VK_EXT_MESH_SHADER_EXTENSION_NAME, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME}) {
+        const bool original_ps = !capture.pixel.empty();
+        std::vector<const char*> names {VK_EXT_MESH_SHADER_EXTENSION_NAME, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME};
+        if (original_ps) {
+            names.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
+            names.push_back(VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME);
+        }
+        for (auto name : names) {
             Require(std::any_of(extensions.begin(), extensions.end(), [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; }),
                     std::string("missing extension ") + name);
         }
         VkPhysicalDeviceRobustness2FeaturesEXT robust {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+        VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR};
+        VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT atomic64 {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT};
         VkPhysicalDeviceMeshShaderFeaturesEXT mesh {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
         VkPhysicalDeviceVulkan13Features f13 {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
         VkPhysicalDeviceVulkan12Features f12 {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
         VkPhysicalDeviceFeatures2 f {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         f.pNext = &f12; f12.pNext = &f13; f13.pNext = &mesh; mesh.pNext = &robust;
+        if (original_ps) { robust.pNext = &barycentric; barycentric.pNext = &atomic64; }
         vkGetPhysicalDeviceFeatures2(physical, &f);
         Require(mesh.meshShader && f.features.shaderInt64 && f.features.vertexPipelineStoresAndAtomics &&
                 f.features.robustBufferAccess && robust.robustBufferAccess2 && f12.bufferDeviceAddress &&
                 f13.dynamicRendering && f13.synchronization2, "required mesh/int64/BDA/robustness/dynamic-rendering features unavailable");
+        if (original_ps) Require(barycentric.fragmentShaderBarycentric && atomic64.shaderImageInt64Atomics &&
+                f.features.fragmentStoresAndAtomics && robust.robustImageAccess2,
+                "original PS requires barycentrics, imageatomic64, fragment stores/atomics and robustImageAccess2");
         mesh_queries = mesh.meshShaderQueries;
         pipeline_queries = mesh_queries && f.features.pipelineStatisticsQuery;
         VkPhysicalDeviceMeshShaderPropertiesEXT mp {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT};
@@ -308,6 +375,17 @@ public:
         use_required_subgroup = f13.subgroupSizeControl && (p13.requiredSubgroupSizeStages & VK_SHADER_STAGE_MESH_BIT_EXT) &&
                                 p13.minSubgroupSize <= 32 && p13.maxSubgroupSize >= 32;
         Require(use_required_subgroup || sg.subgroupSize == 32, "exact module requires subgroup32");
+        if (original_ps) {
+            Require((sg.supportedStages & VK_SHADER_STAGE_FRAGMENT_BIT) && (sg.supportedOperations & ops) == ops,
+                    "original PS subgroup ballot/shuffle unsupported");
+            fragment_required_subgroup = f13.subgroupSizeControl && (p13.requiredSubgroupSizeStages & VK_SHADER_STAGE_FRAGMENT_BIT) &&
+                                         p13.minSubgroupSize <= 32 && p13.maxSubgroupSize >= 32;
+            Require(fragment_required_subgroup || sg.subgroupSize == 32, "original PS requires subgroup32");
+            Require(properties.limits.maxDescriptorSetStorageBuffers >= 18 && properties.limits.maxPerStageDescriptorSampledImages >= 2 &&
+                    properties.limits.maxDescriptorSetSampledImages >= 2 && properties.limits.maxPerStageDescriptorStorageImages >= 1 &&
+                    properties.limits.maxDescriptorSetStorageImages >= 1 && properties.limits.maxImageDimension2D >= 8192,
+                    "original PS resource limits unsupported");
+        }
         auto round = [](uint64_t n, uint64_t g) { return ((n + g - 1) / g) * g; };
         Require(mp.meshOutputPerVertexGranularity && mp.meshOutputPerPrimitiveGranularity, "invalid mesh granularity");
         // Conservative output storage includes position + four vec4 parameters,
@@ -336,18 +414,24 @@ public:
         float priority = 1;
         VkDeviceQueueCreateInfo qi {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
         qi.queueFamilyIndex = queue_family; qi.queueCount = 1; qi.pQueuePriorities = &priority;
-        // Enable only used capabilities. No image atomics or 8/16-bit storage
-        // capability occurs in this pinned module or the replacement fragment shader.
+        // Image atomic64 and barycentrics are required only by the original PS.
+        // Neither mode declares 8/16-bit storage capabilities.
         robust = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT}; robust.robustBufferAccess2 = VK_TRUE;
+        if (original_ps) {
+            robust.robustImageAccess2 = VK_TRUE; robust.pNext = &barycentric;
+            barycentric = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR};
+            barycentric.fragmentShaderBarycentric = VK_TRUE; barycentric.pNext = &atomic64;
+            atomic64 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT}; atomic64.shaderImageInt64Atomics = VK_TRUE;
+        }
         mesh = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT}; mesh.meshShader = VK_TRUE; mesh.meshShaderQueries = mesh_queries; mesh.pNext = &robust;
-        f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES}; f13.dynamicRendering = VK_TRUE; f13.synchronization2 = VK_TRUE; f13.subgroupSizeControl = use_required_subgroup; f13.pNext = &mesh;
+        f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES}; f13.dynamicRendering = VK_TRUE; f13.synchronization2 = VK_TRUE; f13.subgroupSizeControl = use_required_subgroup || fragment_required_subgroup; f13.pNext = &mesh;
         f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES}; f12.bufferDeviceAddress = VK_TRUE; f12.pNext = &f13;
         VkPhysicalDeviceFeatures enabled {};
         enabled.shaderInt64 = VK_TRUE; enabled.vertexPipelineStoresAndAtomics = VK_TRUE; enabled.robustBufferAccess = VK_TRUE; enabled.pipelineStatisticsQuery = pipeline_queries;
-        const char* names[] {VK_EXT_MESH_SHADER_EXTENSION_NAME, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME};
+        enabled.fragmentStoresAndAtomics = original_ps;
         VkDeviceCreateInfo di {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
         di.pNext = &f12; di.queueCreateInfoCount = 1; di.pQueueCreateInfos = &qi; di.pEnabledFeatures = &enabled;
-        di.enabledExtensionCount = 2; di.ppEnabledExtensionNames = names;
+        di.enabledExtensionCount = uint32_t(names.size()); di.ppEnabledExtensionNames = names.data();
         Vk(vkCreateDevice(physical, &di, nullptr, &device), "vkCreateDevice");
         vkGetDeviceQueue(device, queue_family, 0, &queue);
         draw_mesh = reinterpret_cast<PFN_vkCmdDrawMeshTasksEXT>(vkGetDeviceProcAddr(device, "vkCmdDrawMeshTasksEXT"));
@@ -361,6 +445,10 @@ public:
                 "robustBufferAccess2", "bufferDeviceAddress", "dynamicRendering", "synchronization2"}},
             {"local_size", {128, 1, 1}}, {"guest_wave_size", 64}, {"virtual_halves", 2},
             {"max_storage_buffer_range", properties.limits.maxStorageBufferRange}};
+        if (original_ps) {
+            host["fragment_required_subgroup32"] = fragment_required_subgroup;
+            for (auto name : {"fragmentShaderBarycentric", "shaderImageInt64Atomics", "fragmentStoresAndAtomics", "robustImageAccess2"}) host["enabled_features"].push_back(name);
+        }
         std::cout << "device: " << properties.deviceName << "; subgroup32=" << (use_required_subgroup ? "required" : "default") << std::endl;
     }
 
@@ -392,7 +480,74 @@ public:
         Vk(invalidate ? vkInvalidateMappedMemoryRanges(device, 1, &range) : vkFlushMappedMemoryRanges(device, 1, &range), "mapped memory visibility");
     }
 
+    void CreateSyntheticImages(const Capture& capture) {
+        std::cout << "SYNTHETIC image setup: visibility R32G32Uint/R64Uint alias and R8Unorm noise; all initial bits zero" << std::endl;
+        for (uint32_t index = 0; index < synthetic_images.size(); ++index) {
+            auto& im = synthetic_images[index];
+            const bool visibility = index == 0;
+            im.extent = visibility ? VkExtent3D {capture.width, capture.height, 1} : VkExtent3D {128, 8192, 1};
+            const VkFormat formats[] {visibility ? VK_FORMAT_R32G32_UINT : VK_FORMAT_R8_UNORM, VK_FORMAT_R64_UINT};
+            for (uint32_t view = 0; view < (visibility ? 2u : 1u); ++view) {
+                VkFormatProperties props {}; vkGetPhysicalDeviceFormatProperties(physical, formats[view], &props);
+                auto flags = view == 0 ? VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT : VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT;
+                Require((props.optimalTilingFeatures & flags) == uint32_t(flags), "synthetic image view format lacks sampled/storage atomic support");
+            }
+            VkImageFormatListCreateInfo list {VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
+            list.viewFormatCount = visibility ? 2 : 1; list.pViewFormats = formats;
+            VkImageCreateInfo ci {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            ci.pNext = &list; ci.flags = visibility ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT : 0;
+            ci.imageType = VK_IMAGE_TYPE_2D; ci.format = formats[0]; ci.extent = im.extent;
+            ci.mipLevels = 1; ci.arrayLayers = 1; ci.samples = VK_SAMPLE_COUNT_1_BIT; ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+            ci.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            if (visibility) ci.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+            VkPhysicalDeviceImageFormatInfo2 query {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2};
+            query.pNext = &list; query.format = ci.format; query.type = ci.imageType; query.tiling = ci.tiling; query.usage = ci.usage; query.flags = ci.flags;
+            VkImageFormatProperties2 properties2 {VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2};
+            Vk(vkGetPhysicalDeviceImageFormatProperties2(physical, &query, &properties2), "synthetic image format properties");
+            const auto& p = properties2.imageFormatProperties;
+            Require(p.maxExtent.width >= im.extent.width && p.maxExtent.height >= im.extent.height &&
+                    p.maxMipLevels >= 1 && p.maxArrayLayers >= 1 && (p.sampleCounts & VK_SAMPLE_COUNT_1_BIT), "synthetic image exceeds format limits");
+            Vk(vkCreateImage(device, &ci, nullptr, &im.image), "create synthetic image");
+            VkMemoryRequirements r {}; vkGetImageMemoryRequirements(device, im.image, &r);
+            Require(r.size <= p.maxResourceSize, "synthetic image exceeds format resource size");
+            im.memory = Allocate(r, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            Vk(vkBindImageMemory(device, im.image, im.memory, 0), "bind synthetic image");
+            for (uint32_t view = 0; view < (visibility ? 2u : 1u); ++view) {
+                // R64_UINT need not support sampling. Limit each view's usage.
+                VkImageViewUsageCreateInfo usage {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+                usage.usage = view == 0 ? VK_IMAGE_USAGE_SAMPLED_BIT : VK_IMAGE_USAGE_STORAGE_BIT;
+                VkImageViewCreateInfo vi {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO}; vi.pNext = &usage;
+                vi.image = im.image; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = formats[view];
+                vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                Vk(vkCreateImageView(device, &vi, nullptr, view == 0 ? &im.sampled : &im.atomic), "create synthetic image view");
+            }
+        }
+    }
+
+    void InitializeSyntheticImages(VkCommandBuffer cmd) {
+        std::array<VkImageMemoryBarrier2, 2> barriers {};
+        for (uint32_t i = 0; i < barriers.size(); ++i) {
+            auto& b = barriers[i]; b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+            b.dstStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT; b.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = synthetic_images[i].image; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        }
+        VkDependencyInfo dep {VK_STRUCTURE_TYPE_DEPENDENCY_INFO}; dep.imageMemoryBarrierCount = uint32_t(barriers.size()); dep.pImageMemoryBarriers = barriers.data();
+        vkCmdPipelineBarrier2(cmd, &dep);
+        VkClearColorValue zero {};
+        for (auto& b : barriers) {
+            vkCmdClearColorImage(cmd, b.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &b.subresourceRange);
+            b.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT; b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            b.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+            b.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        }
+        vkCmdPipelineBarrier2(cmd, &dep);
+    }
+
     Json Run(const Capture& capture, const fs::path& out, uint32_t timeout_ms) {
+        const bool original_ps = !capture.pixel.empty();
         std::map<uint32_t, size_t> uploaded;
         const auto upload_start = std::chrono::steady_clock::now();
         std::cout << "upload begin: chunks=" << capture.chunks.size() << "; bytes=" << capture.bytes << std::endl;
@@ -406,29 +561,50 @@ public:
                   << std::endl;
         auto dummy = NewBuffer(16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         std::memset(buffers[dummy].mapped, 0, 16); Flush(buffers[dummy]);
-        auto readback = NewBuffer(uint64_t(capture.width) * capture.height * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-        VkDescriptorSetLayoutBinding binding[3] {};
+        auto readback = NewBuffer(uint64_t(capture.width) * capture.height * (original_ps ? 8 : 4), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        std::vector<VkDescriptorSetLayoutBinding> binding(3);
         binding[0] = {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 9, VK_SHADER_STAGE_MESH_BIT_EXT, nullptr};
         binding[1] = {51, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_MESH_BIT_EXT, nullptr};
         binding[2] = {52, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_MESH_BIT_EXT, nullptr};
-        VkDescriptorSetLayoutCreateInfo li {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; li.bindingCount = 3; li.pBindings = binding;
+        if (original_ps) {
+            CreateSyntheticImages(capture);
+            binding.push_back({56, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 7, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr});
+            binding.push_back({59, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr});
+            binding.push_back({66, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr});
+            binding.push_back({102, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr});
+        }
+        VkDescriptorSetLayoutCreateInfo li {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; li.bindingCount = uint32_t(binding.size()); li.pBindings = binding.data();
         Vk(vkCreateDescriptorSetLayout(device, &li, nullptr, &descriptor_layout), "descriptor layout");
-        VkDescriptorPoolSize ps {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 11};
-        VkDescriptorPoolCreateInfo pi {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; pi.maxSets = 1; pi.poolSizeCount = 1; pi.pPoolSizes = &ps;
+        const VkDescriptorPoolSize ps[] {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, original_ps ? 18u : 11u}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1}};
+        VkDescriptorPoolCreateInfo pi {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; pi.maxSets = 1; pi.poolSizeCount = original_ps ? 3 : 1; pi.pPoolSizes = ps;
         Vk(vkCreateDescriptorPool(device, &pi, nullptr, &descriptor_pool), "descriptor pool");
         VkDescriptorSetAllocateInfo da {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; da.descriptorPool = descriptor_pool; da.descriptorSetCount = 1; da.pSetLayouts = &descriptor_layout;
         VkDescriptorSet set {}; Vk(vkAllocateDescriptorSets(device, &da, &set), "descriptor set");
-        std::array<VkDescriptorBufferInfo, 11> views {};
+        std::array<VkDescriptorBufferInfo, 18> views {};
         for (size_t i = 0; i < 9; ++i) { const auto& b = buffers[uploaded.at(capture.descriptor_chunks[i])]; views[i] = {b.buffer, 0, b.size}; }
         views[9] = views[10] = {buffers[dummy].buffer, 0, 16};
-        VkWriteDescriptorSet writes[3] {};
+        std::vector<VkWriteDescriptorSet> writes(binding.size());
         for (size_t i = 0; i < 3; ++i) {
             writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[i].dstSet = set; writes[i].dstBinding = binding[i].binding;
             writes[i].descriptorCount = binding[i].descriptorCount; writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             writes[i].pBufferInfo = views.data() + (i == 0 ? 0 : 8 + i);
         }
-        vkUpdateDescriptorSets(device, 3, writes, 0, nullptr);
-        VkPushConstantRange push_range {VK_SHADER_STAGE_MESH_BIT_EXT, 0, 128};
+        std::array<VkDescriptorImageInfo, 3> image_views {};
+        if (original_ps) {
+            for (size_t i = 0; i < 7; ++i) { const auto& b = buffers[uploaded.at(capture.pixel_chunks[i])]; views[11 + i] = {b.buffer, 0, b.size}; }
+            writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[3].dstSet = set; writes[3].dstBinding = 56;
+            writes[3].descriptorCount = 7; writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[3].pBufferInfo = views.data() + 11;
+            image_views[0] = {VK_NULL_HANDLE, synthetic_images[1].sampled, VK_IMAGE_LAYOUT_GENERAL};
+            image_views[1] = {VK_NULL_HANDLE, synthetic_images[0].sampled, VK_IMAGE_LAYOUT_GENERAL};
+            image_views[2] = {VK_NULL_HANDLE, synthetic_images[0].atomic, VK_IMAGE_LAYOUT_GENERAL};
+            for (size_t i = 0; i < image_views.size(); ++i) {
+                auto& w = writes[4 + i]; w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w.dstSet = set;
+                w.dstBinding = binding[4 + i].binding; w.descriptorCount = 1; w.descriptorType = binding[4 + i].descriptorType; w.pImageInfo = &image_views[i];
+            }
+        }
+        vkUpdateDescriptorSets(device, uint32_t(writes.size()), writes.data(), 0, nullptr);
+        const VkShaderStageFlags push_stages = VK_SHADER_STAGE_MESH_BIT_EXT | (original_ps ? VK_SHADER_STAGE_FRAGMENT_BIT : 0);
+        VkPushConstantRange push_range {push_stages, 0, 128};
         VkPipelineLayoutCreateInfo pl {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO}; pl.setLayoutCount = 1; pl.pSetLayouts = &descriptor_layout; pl.pushConstantRangeCount = 1; pl.pPushConstantRanges = &push_range;
         Vk(vkCreatePipelineLayout(device, &pl, nullptr, &pipeline_layout), "pipeline layout");
         VkFormatProperties format_properties {}; vkGetPhysicalDeviceFormatProperties(physical, VK_FORMAT_R8G8B8A8_UNORM, &format_properties);
@@ -446,24 +622,27 @@ public:
         Vk(vkCreateImageView(device, &vi, nullptr, &image_view), "create color view");
         VkShaderModuleCreateInfo sm {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO}; sm.codeSize = capture.mesh.size() * 4; sm.pCode = capture.mesh.data();
         Vk(vkCreateShaderModule(device, &sm, nullptr, &ms_module), "create unchanged mesh module");
-        sm.codeSize = sizeof(ZERO_COMPANY_REPLAY_FRAG); sm.pCode = ZERO_COMPANY_REPLAY_FRAG;
-        Vk(vkCreateShaderModule(device, &sm, nullptr, &ps_module), "create attribute-hash fragment module");
+        sm.codeSize = original_ps ? capture.pixel.size() * 4 : sizeof(ZERO_COMPANY_REPLAY_FRAG);
+        sm.pCode = original_ps ? capture.pixel.data() : ZERO_COMPANY_REPLAY_FRAG;
+        Vk(vkCreateShaderModule(device, &sm, nullptr, &ps_module), "create selected fragment module");
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO}; subgroup.requiredSubgroupSize = 32;
         VkPipelineShaderStageCreateInfo stages[2] {};
         for (auto& s : stages) { s.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; s.pName = "main"; }
         stages[0].stage = VK_SHADER_STAGE_MESH_BIT_EXT; stages[0].module = ms_module; stages[0].pNext = use_required_subgroup ? &subgroup : nullptr;
         stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = ps_module;
+        stages[1].pNext = original_ps && fragment_required_subgroup ? &subgroup : nullptr;
         VkViewport viewport {0, 0, float(capture.width), float(capture.height), 0, 1};
         VkRect2D scissor {{0, 0}, {capture.width, capture.height}};
         VkPipelineViewportStateCreateInfo vp {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO}; vp.viewportCount = 1; vp.pViewports = &viewport; vp.scissorCount = 1; vp.pScissors = &scissor;
         VkPipelineRasterizationStateCreateInfo rs {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO}; rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1;
         VkPipelineMultisampleStateCreateInfo samples {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO}; samples.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-        VkPipelineColorBlendAttachmentState attachment {}; attachment.colorWriteMask = 15;
+        VkPipelineColorBlendAttachmentState attachment {}; attachment.colorWriteMask = original_ps ? 0 : 15;
         VkPipelineColorBlendStateCreateInfo blend {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO}; blend.attachmentCount = 1; blend.pAttachments = &attachment;
         VkPipelineRenderingCreateInfo render {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO}; render.colorAttachmentCount = 1; render.pColorAttachmentFormats = &ii.format;
         VkGraphicsPipelineCreateInfo gp {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO}; gp.pNext = &render; gp.stageCount = 2; gp.pStages = stages;
         gp.pViewportState = &vp; gp.pRasterizationState = &rs; gp.pMultisampleState = &samples; gp.pColorBlendState = &blend; gp.layout = pipeline_layout;
-        std::cout << "creating true MeshEXT graphics pipeline; unchanged mesh, flat attribute-hash PS" << std::endl;
+        std::cout << "creating true MeshEXT graphics pipeline; unchanged mesh, "
+                  << (original_ps ? "unchanged PS548a + SYNTHETIC images" : "flat attribute-hash PS") << std::endl;
         Vk(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &gp, nullptr, &pipeline), "create mesh graphics pipeline");
         VkCommandPoolCreateInfo cp {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO}; cp.queueFamilyIndex = queue_family;
         Vk(vkCreateCommandPool(device, &cp, nullptr, &command_pool), "command pool");
@@ -475,12 +654,14 @@ public:
         VkCommandBufferBeginInfo begin {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         Vk(vkBeginCommandBuffer(cmd, &begin), "begin commands");
         VkMemoryBarrier2 host_barrier {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2}; host_barrier.srcStageMask = VK_PIPELINE_STAGE_2_HOST_BIT; host_barrier.srcAccessMask = VK_ACCESS_2_HOST_WRITE_BIT;
-        host_barrier.dstStageMask = VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT; host_barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        host_barrier.dstStageMask = VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT | (original_ps ? VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT : 0);
+        host_barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
         VkImageMemoryBarrier2 transition {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2}; transition.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT; transition.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
         transition.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; transition.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; transition.image = image;
         transition.srcQueueFamilyIndex = transition.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; transition.subresourceRange = vi.subresourceRange;
         VkDependencyInfo dep {VK_STRUCTURE_TYPE_DEPENDENCY_INFO}; dep.memoryBarrierCount = 1; dep.pMemoryBarriers = &host_barrier; dep.imageMemoryBarrierCount = 1; dep.pImageMemoryBarriers = &transition;
         vkCmdPipelineBarrier2(cmd, &dep);
+        if (original_ps) InitializeSyntheticImages(cmd);
         if (primitives) vkCmdResetQueryPool(cmd, primitives, 0, 1);
         if (statistics) vkCmdResetQueryPool(cmd, statistics, 0, 1);
         VkRenderingAttachmentInfo color {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}; color.imageView = image_view; color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -491,18 +672,21 @@ public:
         if (statistics) vkCmdBeginQuery(cmd, statistics, 0, 0);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0, 1, &set, 0, nullptr);
-        vkCmdPushConstants(cmd, pipeline_layout, VK_SHADER_STAGE_MESH_BIT_EXT, 0, 128, capture.push.data());
+        vkCmdPushConstants(cmd, pipeline_layout, push_stages, 0, 128, capture.push.data());
         draw_mesh(cmd, capture.groups[0], capture.groups[1], capture.groups[2]);
         if (statistics) vkCmdEndQuery(cmd, statistics, 0);
         if (primitives) vkCmdEndQuery(cmd, primitives, 0);
         vkCmdEndRendering(cmd);
-        transition.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT; transition.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+        transition.srcStageMask = original_ps ? VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT : VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        transition.srcAccessMask = original_ps ? VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT : VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
         transition.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT; transition.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
-        transition.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; transition.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        transition.oldLayout = original_ps ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        transition.image = original_ps ? synthetic_images[0].image : image;
+        transition.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         dep.memoryBarrierCount = 0; dep.pMemoryBarriers = nullptr;
         vkCmdPipelineBarrier2(cmd, &dep);
         VkBufferImageCopy copy {}; copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; copy.imageExtent = ii.extent;
-        vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffers[readback].buffer, 1, &copy);
+        vkCmdCopyImageToBuffer(cmd, transition.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffers[readback].buffer, 1, &copy);
         host_barrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT;
         host_barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
         host_barrier.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT; host_barrier.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
@@ -526,15 +710,23 @@ public:
         Flush(buffers[dummy], true);
         std::array<uint32_t, 4> faults {};
         std::memcpy(faults.data(), buffers[dummy].mapped, sizeof(faults));
+        // One sequential read from a potentially uncached mapping, then hash/count
+        // in normal CPU memory. This bounded copy is <=37MiB in either mode.
+        std::vector<uint8_t> pixel_copy(buffers[readback].size);
+        std::memcpy(pixel_copy.data(), buffers[readback].mapped, pixel_copy.size());
         uint64_t covered = 0;
-        auto* pixels = static_cast<const uint8_t*>(buffers[readback].mapped);
-        for (uint64_t i = 0; i < buffers[readback].size; i += 4) if (pixels[i + 3]) ++covered;
-        result["status"] = "completed"; result["covered_pixels"] = covered;
+        auto* pixels = pixel_copy.data();
+        for (uint64_t i = 0; i < pixel_copy.size(); i += original_ps ? 8 : 4) {
+            if (original_ps) { uint64_t value; std::memcpy(&value, pixels + i, sizeof(value)); if (value != 0) ++covered; }
+            else if (pixels[i + 3]) ++covered;
+        }
+        result["status"] = "completed";
+        result[original_ps ? "visibility_pixels_changed_from_synthetic_zero" : "covered_pixels"] = covered;
         result["dummy_bda_words"] = faults;
         const bool fault = std::any_of(faults.begin(), faults.end(), [](uint32_t word) { return word != 0; });
         if (fault) result["status"] = "unexpected_bda_fault";
         result["readback_fnv1a64"] = Hex(Hash(pixels, buffers[readback].size));
-        result["raster_observed"] = covered != 0;
+        result[original_ps ? "visibility_writes_observed" : "raster_observed"] = covered != 0;
         if (primitives) { uint64_t value = 0; Vk(vkGetQueryPoolResults(device, primitives, 0, 1, sizeof(value), &value, sizeof(value), VK_QUERY_RESULT_64_BIT), "primitive query result"); result["mesh_primitives_generated"] = value; }
         if (statistics) {
             std::array<uint64_t, 2> values {};
@@ -542,10 +734,11 @@ public:
             // Values are ordered by flag bit: fragment (7), then mesh (12).
             result["fragment_shader_invocations"] = values[0]; result["mesh_shader_invocations"] = values[1];
         }
-        Write(out / "color.rgba8", pixels, buffers[readback].size);
+        Write(out / (original_ps ? "visibility.rg32uint" : "color.rgba8"), pixels, buffers[readback].size);
         WriteJson(out / "result.json", result);
         Require(!fault, "unexpected write to dummy BDA/fault storage; replay assumptions failed");
-        std::cout << "completed: covered_pixels=" << covered << "; this is mesh+fixture completion, not original PS/image validation" << std::endl;
+        std::cout << "completed: " << (original_ps ? "visibility_pixels_changed_from_SYNTHETIC_zero=" : "covered_pixels=")
+                  << covered << "; captured original image contents/raster state not tested" << std::endl;
         return result;
     }
 };
@@ -554,14 +747,19 @@ public:
 int main(int argc, char** argv) {
     try {
         if (argc < 4) {
-            std::cerr << "Usage: zero_company_mesh_replay MANIFEST MS_SPV NEW_OUTPUT_DIR [--validate-only] [--device N] [--timeout-ms N]\n";
+            std::cerr << "Usage: zero_company_mesh_replay MANIFEST MS_SPV NEW_OUTPUT_DIR [--validate-only] [--device N] [--timeout-ms N] [--original-ps-synthetic PS_SPV]\n";
             return 2;
         }
         bool validate_only = false;
+        fs::path pixel_spv;
         uint32_t device = 0, timeout = 10000;
         for (int i = 4; i < argc; ++i) {
             std::string option = argv[i];
             if (option == "--validate-only") validate_only = true;
+            else if (option == "--original-ps-synthetic" && i + 1 < argc) {
+                Require(pixel_spv.empty(), "original PS option repeated");
+                pixel_spv = fs::absolute(argv[++i]);
+            }
             else if ((option == "--device" || option == "--timeout-ms") && i + 1 < argc) {
                 std::string value = argv[++i];
                 Require(!value.empty() && value.size() <= 6 && value.find_first_not_of("0123456789") == std::string::npos, "invalid numeric option");
@@ -570,13 +768,15 @@ int main(int argc, char** argv) {
                 else { Require(n >= 100 && n <= 60000, "timeout must be 100..60000ms"); timeout = n; }
             } else throw std::runtime_error("unknown or incomplete option: " + option);
         }
-        Capture capture(fs::absolute(argv[1]), fs::absolute(argv[2]));
+        Capture capture(fs::absolute(argv[1]), fs::absolute(argv[2]), pixel_spv);
         fs::path out = fs::absolute(argv[3]);
         Require(!fs::exists(out) && fs::create_directory(out), "output must be a new directory under an existing parent");
         auto validated = capture.Description(); validated["status"] = "cpu_validated";
         validated["manifest"] = fs::absolute(argv[1]).string(); validated["mesh_spirv"] = fs::absolute(argv[2]).string();
+        if (!pixel_spv.empty()) validated["pixel_spirv"] = pixel_spv.string();
         WriteJson(out / "validation.json", validated);
         std::cout << "CPU validation complete: " << capture.bytes << " bytes, groups=" << capture.groups[0] << "; SPIR-V unchanged" << std::endl;
+        if (!pixel_spv.empty()) std::cout << "ORIGINAL PS MODE: SYNTHETIC ZERO IMAGE INPUTS; no original game image contents" << std::endl;
         if (validate_only) return 0; // Does not create a Vulkan instance or device.
         Replay replay;
         replay.Init(device, capture);

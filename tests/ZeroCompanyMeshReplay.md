@@ -79,3 +79,35 @@ Suggested comparison order: earlier completed one-group capture as control,
 then the captured two-group stalled draw. Compare query counts, coverage, pixels,
 and validation messages; a failure before submission is a harness/preflight
 failure and must not be called a reproduced GPU stall.
+
+## Optional unchanged original PS with synthetic images
+
+Add `--original-ps-synthetic PS_SPV` to either CPU validation or the manual GPU
+command. This pins the unchanged 36044-byte PS548a module, FNV-1a64
+`7928d16868b75057`, reference SHA256
+`eb5cf448e698c6deb4cab510e27e5dfd63763ad87b74e36cb267d39d316528a3`.
+All seven captured PS buffer views are restored at binding56; shared MS/PS
+chunks remain deduplicated. The original PS push words6..7 are made visible to
+the fragment stage. Barycentrics, image64 atomics, fragment storage writes,
+fragment subgroup32, robust image access2, image formats and extents must be
+supported. Unavailable features fail preflight instead of changing the shader.
+
+**Image inputs in this mode are SYNTHETIC, all bits zero.** Visibility uses one
+new2848x1600 image with sampled R32G32Uint view(binding66) and atomic R64Uint
+view(binding102). Mutable-format/extended-usage flags permit the alias; each
+view restricts its usage to sampled or storage. Noise is a new128x8192 R8Unorm
+image(binding59). Transfer clears complete before fragment sampled/storage
+accesses; the visibility image is copied only after a fragment-access/transfer
+barrier and read on the host only after the completed fence and invalidation.
+
+The original PS has no color output. Its color write mask is zero; its result
+is `visibility.rg32uint` (tight rows, two little-endian uint32 words per pixel,
+also interpretable as one little-endian uint64), modified-from-zero pixel count,
+readback fingerprint and optional invocation/primitive counters. A zero write
+count is reported as zero; it is not labeled successful rendering. JSON and
+console output prominently label synthetic input state.
+
+This mode currently accepts only schema1 manifests. It does not read future
+schema2 image payloads, restore captured image contents, or reproduce original
+raster state. Passing with synthetic zeros narrows the investigation but cannot
+exclude a content-dependent image/PS failure.
