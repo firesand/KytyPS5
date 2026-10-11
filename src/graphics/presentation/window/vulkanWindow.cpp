@@ -777,6 +777,21 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 	}
 
 	if (error) {
+		// Claude probe: KYTY_VALIDATION_NON_FATAL=1 keeps running after validation errors so that
+		// GPU-assisted validation can report everything up to a GPU stall.
+		static const bool non_fatal = [] {
+			const char* value = std::getenv("KYTY_VALIDATION_NON_FATAL");
+			return value != nullptr && value[0] == '1' && value[1] == '\0';
+		}();
+		if (non_fatal) {
+			static std::atomic<uint32_t> reported = 0;
+			const auto count = reported.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (count <= 400) {
+				LOGF_COLOR(severity_style, "[Vulkan][%s][%u][non-fatal #%u]: %s\n", severity_str,
+				           static_cast<uint32_t>(message_types), count, callback_data->pMessage);
+			}
+			return VK_FALSE;
+		}
 		EXIT_COLOR(severity_style, "[Vulkan][%s][%u]: %s\n", severity_str,
 		           static_cast<uint32_t>(message_types), callback_data->pMessage);
 	}
