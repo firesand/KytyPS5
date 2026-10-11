@@ -661,13 +661,25 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	vk::DeviceDiagnosticsConfigCreateInfoNV       diagnostics_config {};
 	vk::PhysicalDeviceDiagnosticsConfigFeaturesNV diagnostics_features {};
 	if (HasExtension(device_extensions, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
-		diagnostics_config.flags = vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableShaderDebugInfo |
-		                           vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableResourceTracking |
-		                           vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableShaderErrorReporting;
-		diagnostics_features.diagnosticsConfig = VK_TRUE;
-		diagnostics_features.pNext             = const_cast<void*>(create_info.pNext);
-		diagnostics_config.pNext               = &diagnostics_features;
-		create_info.pNext                      = &diagnostics_config;
+		vk::PhysicalDeviceDiagnosticsConfigFeaturesNV supported_diagnostics {};
+		vk::PhysicalDeviceFeatures2                   diagnostics_query {};
+		diagnostics_query.pNext = &supported_diagnostics;
+		graphics.physical_device.getFeatures2(&diagnostics_query);
+		LOGF("Vulkan NV diagnostics config supported=%s\n",
+		     supported_diagnostics.diagnosticsConfig == VK_TRUE ? "true" : "false");
+		if (supported_diagnostics.diagnosticsConfig == VK_TRUE) {
+			diagnostics_config.flags =
+			    vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableShaderDebugInfo |
+			    vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableResourceTracking |
+			    vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableAutomaticCheckpoints |
+			    vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableShaderErrorReporting;
+			diagnostics_features.diagnosticsConfig = VK_TRUE;
+			diagnostics_features.pNext             = const_cast<void*>(create_info.pNext);
+			diagnostics_config.pNext               = &diagnostics_features;
+			create_info.pNext                      = &diagnostics_config;
+			LOGF("Vulkan NV diagnostics config enabled: shader debug info, resource tracking, "
+			     "automatic checkpoints, shader error reporting\n");
+		}
 	}
 	vk::PhysicalDeviceAddressBindingReportFeaturesEXT address_binding_report {};
 	if (HasExtension(device_extensions, VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME)) {
@@ -1089,10 +1101,14 @@ void WindowContext::CreateVulkan() {
 		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME,
 		                             VK_EXT_DEVICE_FAULT_EXTENSION_NAME,
 		                             VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME,
+		                             VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME,
 		                             VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}
+		}
+		for (const auto* extension: device_extensions) {
+			LOGF("Vulkan device extension enabled: %s\n", extension);
 		}
 		if (HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
 		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {
