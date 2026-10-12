@@ -470,7 +470,11 @@ void GuestGpu::ThreadRun(void* data) {
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
-				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+				// Wake once a second so an incomplete submission is reported even when nobody
+				// waits on it (the game may be waiting for its end-of-pipe interrupt instead).
+				gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 1000000);
+				gpu->m_renderer.GetCommandScheduler().GetMasterSemaphore().CheckStall(
+				    "gpu thread idle");
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_processing = false;
@@ -493,6 +497,8 @@ void GuestGpu::ThreadRun(void* data) {
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
 					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					gpu->m_renderer.GetCommandScheduler().GetMasterSemaphore().CheckStall(
+					    "gpu thread blocked queues");
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
 							queue.front().blocked = false;

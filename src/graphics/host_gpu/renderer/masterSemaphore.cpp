@@ -8,6 +8,9 @@
 #include <atomic>
 #include <cinttypes>
 #include <cstdio>
+#include "common/logging/log.h"
+#include <chrono>
+#include <mutex>
 
 namespace Libs::Graphics {
 
@@ -66,7 +69,10 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	bool reported = false;
 	do {
 		result = m_graphics.device.waitSemaphores(
-		    &wait_info, GpuDiagnostics::Enabled() ? 5'000'000'000ull : UINT64_MAX);
+		    &wait_info, GpuDiagnostics::Enabled() ? 5'000'000'000ull : 10'000'000'000ull);
+		if (result == vk::Result::eTimeout && !GpuDiagnostics::Enabled()) {
+			CheckStall("MasterSemaphore::Wait", 0.0);
+		}
 		if (result == vk::Result::eTimeout && GpuDiagnostics::Enabled() && !reported) {
 			Refresh();
 			GpuDiagnostics::DumpStall(GpuDiagnostics::HandleValue(m_semaphore), tick,
@@ -114,9 +120,84 @@ void MasterSemaphore::Wait(uint64_t tick) {
 			}
 			std::fflush(stdout);
 		}
-	} while (result == vk::Result::eTimeout && GpuDiagnostics::Enabled());
+	} while (result == vk::Result::eTimeout);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	Refresh();
+}
+
+void MasterSemaphore::CheckStall(const char* where, double seconds) {
+	{
+		// The blocked-queue idle loop spins every 100 us; one semaphore query per 250 ms is plenty.
+		std::lock_guard lock(m_stall_mutex);
+		const auto now = std::chrono::steady_clock::now();
+		if (seconds > 0.0 && now - m_stall_checked < std::chrono::milliseconds(250)) {
+			return;
+		}
+		m_stall_checked = now;
+	}
+	Refresh();
+	const auto submitted = CurrentTick() - 1; // NextTick() hands out the tick of the last submit
+	const auto known     = KnownGpuTick();
+	std::lock_guard lock(m_stall_mutex);
+	if (known >= submitted) {
+		m_stall_tick = 0;
+		return;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (m_stall_tick != known + 1) {
+		m_stall_tick  = known + 1;
+		m_stall_since = now;
+		return;
+	}
+	const double waited = std::chrono::duration<double>(now - m_stall_since).count();
+	if (waited < seconds || m_stall_reported_tick == m_stall_tick) {
+		return;
+	}
+	m_stall_reported_tick = m_stall_tick;
+	ReportStall(where, m_stall_tick, waited);
+}
+
+void MasterSemaphore::ReportStall(const char* where, uint64_t tick, double waited_s) {
+	// Zero Company 2026-10-12: four hangs where a submitted tick never completed (the GPU thread
+	// either waited on it forever or sat idle while the game waited for its end-of-pipe event).
+	LOGF("GPU stall: tick %" PRIu64 " incomplete for %.0f s (newest submitted %" PRIu64
+	     ", completed %" PRIu64 ") at %s\n",
+	     tick, waited_s, CurrentTick() - 1, KnownGpuTick(), where);
+	std::printf("GPU stall: tick %" PRIu64 " incomplete for %.0f s at %s\n", tick, waited_s, where);
+	if (GpuDiagnostics::Enabled()) {
+		GpuDiagnostics::DumpStall(GpuDiagnostics::HandleValue(m_semaphore), tick, KnownGpuTick(),
+		                          CurrentTick());
+	}
+	uint64_t   counter = 0;
+	const auto status  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
+	LOGF("GPU stall: semaphore counter=%" PRIu64 " status=%s\n", counter,
+	     vk::to_string(status).c_str());
+	vk::FenceCreateInfo fence_info {};
+	vk::Fence           fence {};
+	if (m_graphics.device.createFence(&fence_info, nullptr, &fence) == vk::Result::eSuccess) {
+		vk::Result submit_result;
+		{
+			Common::LockGuard lock(m_graphics.queue_mutex);
+			submit_result = m_graphics.queue.submit(0, nullptr, fence);
+		}
+		vk::Result fence_result = vk::Result::eNotReady;
+		if (submit_result == vk::Result::eSuccess) {
+			fence_result = m_graphics.device.waitForFences(1, &fence, VK_TRUE, 3'000'000'000ull);
+		}
+		LOGF("GPU stall: liveness probe empty submit=%s fence wait(3s)=%s\n",
+		     vk::to_string(submit_result).c_str(), vk::to_string(fence_result).c_str());
+		std::printf("GPU stall: liveness probe empty submit=%s fence wait(3s)=%s\n",
+		            vk::to_string(submit_result).c_str(), vk::to_string(fence_result).c_str());
+		if (fence_result == vk::Result::eSuccess || submit_result != vk::Result::eSuccess) {
+			m_graphics.device.destroyFence(fence, nullptr);
+		}
+		if (submit_result != vk::Result::eSuccess || status != vk::Result::eSuccess) {
+			Common::LockGuard lock(m_graphics.queue_mutex);
+			ReportDeviceFault(m_graphics.device, m_graphics.queue);
+		}
+	}
+	std::fflush(stdout);
+	Log::Flush();
 }
 
 } // namespace Libs::Graphics

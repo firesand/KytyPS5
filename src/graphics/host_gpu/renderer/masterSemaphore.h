@@ -5,6 +5,8 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <atomic>
+#include <chrono>
+#include <mutex>
 
 namespace Libs::Graphics {
 
@@ -30,12 +32,23 @@ public:
 
 	void Refresh();
 	void Wait(uint64_t tick);
+	// Always-on stall watchdog: when the newest submitted tick has stayed incomplete for `seconds`,
+	// report it once (log + stdout), dump the diagnostics ring if enabled, and probe device
+	// liveness (empty submit + fence, VK_EXT_device_fault). Callable from any thread.
+	void CheckStall(const char* where, double seconds = 10.0);
 
 private:
+	void ReportStall(const char* where, uint64_t tick, double waited_s);
+
 	GraphicContext&       m_graphics;
 	vk::Semaphore         m_semaphore = nullptr;
 	std::atomic<uint64_t> m_gpu_tick {0};
 	std::atomic<uint64_t> m_current_tick {1};
+	std::mutex                            m_stall_mutex;
+	uint64_t                              m_stall_tick          = 0;
+	uint64_t                              m_stall_reported_tick = 0;
+	std::chrono::steady_clock::time_point m_stall_since {};
+	std::chrono::steady_clock::time_point m_stall_checked {};
 };
 
 } // namespace Libs::Graphics
