@@ -129,6 +129,7 @@ private:
 
 		SDL_AudioStream*                      stream  = nullptr;
 		Controller::DualSenseHaptics::Stream* haptics = nullptr;
+		uint32_t busy = 0; // AudioOutOutputs calls in flight; AudioOutClose waits for zero
 	};
 
 	struct PortIn {
@@ -145,8 +146,9 @@ private:
 
 	PortIn* GetAudioInPort(Id handle); // Caller holds m_mutex.
 
-	Common::Mutex m_mutex;
-	PortOut       m_out_ports[OUT_PORTS_MAX];
+	Common::Mutex   m_mutex;
+	Common::CondVar m_port_released; // signalled when a PortOut::busy count drops
+	PortOut         m_out_ports[OUT_PORTS_MAX];
 	PortIn        m_in_ports[IN_PORTS_MAX];
 
 	static bool            FormatIsFloat(Format format);
@@ -480,6 +482,15 @@ bool Audio::AudioOutClose(Id handle) {
 	if (AudioOutValid(handle)) {
 		auto& port = m_out_ports[handle.GetId()];
 
+		// AudioOut2 no longer holds its state lock across the output (df6e3e0), so an output call
+		// may still be queueing into this port: wait for it instead of destroying the SDL stream
+		// under it or letting the slot be reused with another format (review 2026-10-12).
+		for (int waited = 0; port.busy != 0 && waited < 2000; waited++) {
+			m_port_released.WaitFor(&m_mutex, 1000);
+		}
+		if (port.busy != 0) {
+			LOGF("AudioOut: closing port %d while an output call is still in flight\n", handle.GetId());
+		}
 		CloseSdlDevice(&port);
 		port = {};
 
@@ -542,7 +553,28 @@ bool Audio::AudioOutSetVolume(Id handle, uint32_t bitflag, const int* volume) {
 
 uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking) {
 	EXIT_NOT_IMPLEMENTED(num == 0 || num > OUT_PORTS_MAX);
-	EXIT_NOT_IMPLEMENTED(!AudioOutValid(params[0].handle));
+	{
+		// Pin every port for the whole call (see AudioOutClose). A handle closed in between is
+		// skipped as a whole batch rather than read through a reused slot.
+		Common::LockGuard lock(m_mutex);
+		for (uint32_t i = 0; i < num; i++) {
+			const auto id = params[i].handle.GetId();
+			if (id < 0 || id >= OUT_PORTS_MAX || !m_out_ports[id].used) {
+				for (uint32_t j = 0; j < i; j++) {
+					m_out_ports[params[j].handle.GetId()].busy--;
+				}
+				return 0;
+			}
+			m_out_ports[id].busy++;
+		}
+	}
+	const auto release = [&] {
+		Common::LockGuard lock(m_mutex);
+		for (uint32_t i = 0; i < num; i++) {
+			m_out_ports[params[i].handle.GetId()].busy--;
+		}
+		m_port_released.SignalAll();
+	};
 
 	const auto&                     first_port = m_out_ports[params[0].handle.GetId()];
 	std::array<bool, OUT_PORTS_MAX> paced {};
@@ -612,7 +644,9 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 		Common::Thread::SleepMicro(deadline - now);
 	}
 
-	return first_port.samples_num;
+	const auto result = first_port.samples_num;
+	release();
+	return result;
 }
 
 static bool RecordingDevicePresent(SDL_AudioDeviceID device) {
