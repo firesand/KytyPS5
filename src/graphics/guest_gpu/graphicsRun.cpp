@@ -667,6 +667,11 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain) {
 	EXIT_IF(g_current_execution == nullptr);
 	EXIT_IF(!g_current_execution->m_next_buffer.empty());
+	// GPU-generated command buffers (Zero Company builds some through the unbounded heap) are
+	// only known to be GPU-dirty once the write-fault records are processed; prepare the range
+	// so the host read below faults into a download instead of parsing stale CPU bytes
+	// ("unknown op" with float data at a predicated branch target, run ng-2).
+	PrepareHostRead(reinterpret_cast<uint64_t>(commands.data()), commands.size_bytes());
 	g_current_execution->m_next_buffer = commands;
 	g_current_execution->m_chain       = chain;
 }
@@ -818,6 +823,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
 			// One begin/end pair per DB; bit 63 marks each counter ready.
 			constexpr uint64_t ready_bit = 1ull << 63u;
+			PrepareHostRead(reinterpret_cast<uint64_t>(address), 16u * 2u * sizeof(uint64_t));
 			const auto* results = reinterpret_cast<const volatile uint64_t*>(address);
 			for (uint32_t db = 0; db < 16u; db++) {
 				const auto begin = results[db * 2u];
@@ -836,6 +842,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		case 0x03:
 			// The wait selector applies only to Z-pass query readiness.
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
+			PrepareHostRead(reinterpret_cast<uint64_t>(address), sizeof(uint64_t));
 			value = *reinterpret_cast<const volatile uint64_t*>(address);
 			break;
 		default: EXIT("unknown predication op: 0x%08" PRIx32 "\n", op);
@@ -914,6 +921,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 	uint32_t draw_count = max_count_or_count;
 	if (count_addr != nullptr) {
+		PrepareHostRead(reinterpret_cast<uint64_t>(count_addr), sizeof(uint32_t));
 		draw_count = *count_addr;
 		if (draw_count > max_count_or_count) {
 			draw_count = max_count_or_count;
