@@ -2058,13 +2058,19 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	// stale float (0x49080ff2) as a register offset; a still-implausible pair triggers one full
 	// resync (as for stale indirect buffers) and a re-read before giving up.
 	cp.PrepareHostRead(indirect_address, indirect_bytes);
-	// Pass 1 (review 2026-10-13): validate the WHOLE list before applying any entry. A stale list
-	// can hold valid-looking pairs before the first implausible one, and register writes have
-	// side effects, so a resync re-reads the list from entry 0; the validated bytes are then
-	// snapshotted so pass 2 applies exactly what was checked.
+	// Pass 1 (reviews 2026-10-13): snapshot the WHOLE list, validate the snapshot, and apply only
+	// that snapshot. A stale list can hold valid-looking pairs before the first implausible one and
+	// register writes have side effects, so a resync re-snapshots from entry 0; validating the same
+	// bytes that are applied means no write in between can slip an unchecked offset through.
+	std::vector<uint32_t> validated(2u * indirect_num_dw);
+	const auto take_snapshot = [&] {
+		for (size_t i = 0; i < validated.size(); i++) {
+			validated[i] = *reinterpret_cast<const volatile uint32_t*>(indirect_buffer + i);
+		}
+	};
 	const auto first_invalid = [&]() -> uint32_t {
 		for (uint32_t i = 0; i < indirect_num_dw; i++) {
-			const auto raw    = *reinterpret_cast<const volatile uint32_t*>(indirect_buffer + 2u * i);
+			const auto raw    = validated[2u * i];
 			const auto offset = NormalizeRegisterOffset(raw);
 			if (offset == Pm4::SH_NOP || raw == 0xffffffffu || offset < Pm4::SH_NUM) {
 				continue;
@@ -2073,23 +2079,24 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		}
 		return UINT32_MAX;
 	};
+	take_snapshot();
 	auto invalid = first_invalid();
 	if (invalid != UINT32_MAX) {
 		cp.ResyncStaleGuestBytes("indirect SH registers", indirect_address, indirect_bytes);
+		take_snapshot();
 		invalid = first_invalid();
 	}
 	if (invalid != UINT32_MAX) {
 		for (uint32_t j = 0; j < indirect_num_dw && j < 16; j++) {
 			LOGF("\t sh_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n", j,
-			     indirect_buffer[j * 2], indirect_buffer[j * 2 + 1]);
+			     validated[j * 2], validated[j * 2 + 1]);
 		}
 		EXIT("unsupported indirect SH register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
 		     "), value = 0x%08" PRIx32 " at 0x%016" PRIx64 " [%" PRIu32 "/%" PRIu32
 		     "] after resync\n",
-		     NormalizeRegisterOffset(indirect_buffer[invalid * 2]), indirect_buffer[invalid * 2],
-		     indirect_buffer[invalid * 2 + 1], indirect_address, invalid, indirect_num_dw);
+		     NormalizeRegisterOffset(validated[invalid * 2]), validated[invalid * 2],
+		     validated[invalid * 2 + 1], indirect_address, invalid, indirect_num_dw);
 	}
-	std::vector<uint32_t> validated(indirect_buffer, indirect_buffer + 2u * indirect_num_dw);
 	indirect_buffer = validated.data(); // pass 2 reads the snapshot, not guest memory
 
 	// Pass 2: apply the validated snapshot.
@@ -2142,10 +2149,15 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
 	const auto indirect_bytes   = static_cast<uint64_t>(indirect_num_dw) * 2u * sizeof(uint32_t);
 	cp.PrepareHostRead(indirect_address, indirect_bytes); // GPU-built list: see the SH twin
+	std::vector<uint32_t> validated(2u * indirect_num_dw); // snapshot first (see the SH twin)
+	const auto take_snapshot = [&] {
+		for (size_t i = 0; i < validated.size(); i++) {
+			validated[i] = *reinterpret_cast<const volatile uint32_t*>(indirect_buffer + i);
+		}
+	};
 	const auto first_invalid = [&]() -> uint32_t {
 		for (uint32_t i = 0; i < indirect_num_dw; i++) {
-			const auto offset =
-			    NormalizeRegisterOffset(*reinterpret_cast<const volatile uint32_t*>(indirect_buffer + 2u * i));
+			const auto offset = NormalizeRegisterOffset(validated[2u * i]);
 			if (offset == Pm4::UC_NOP || offset < Pm4::UC_NUM) {
 				continue;
 			}
@@ -2153,23 +2165,24 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 		}
 		return UINT32_MAX;
 	};
+	take_snapshot();
 	auto invalid = first_invalid();
 	if (invalid != UINT32_MAX) {
 		cp.ResyncStaleGuestBytes("indirect UC registers", indirect_address, indirect_bytes);
+		take_snapshot();
 		invalid = first_invalid();
 	}
 	if (invalid != UINT32_MAX) {
 		for (uint32_t j = 0; j < indirect_num_dw && j < 16; j++) {
 			LOGF("\t uc_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n", j,
-			     indirect_buffer[j * 2], indirect_buffer[j * 2 + 1]);
+			     validated[j * 2], validated[j * 2 + 1]);
 		}
 		EXIT("unsupported indirect UC register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
 		     "), value = 0x%08" PRIx32 " at 0x%016" PRIx64 " [%" PRIu32 "/%" PRIu32
 		     "] after resync\n",
-		     NormalizeRegisterOffset(indirect_buffer[invalid * 2]), indirect_buffer[invalid * 2],
-		     indirect_buffer[invalid * 2 + 1], indirect_address, invalid, indirect_num_dw);
+		     NormalizeRegisterOffset(validated[invalid * 2]), validated[invalid * 2],
+		     validated[invalid * 2 + 1], indirect_address, invalid, indirect_num_dw);
 	}
-	std::vector<uint32_t> validated(indirect_buffer, indirect_buffer + 2u * indirect_num_dw);
 	indirect_buffer = validated.data(); // pass 2 reads the snapshot, not guest memory
 
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
