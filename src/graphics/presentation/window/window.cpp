@@ -21,6 +21,7 @@
 #include "graphics/presentation/window/hostInput.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include <algorithm>
+#include <cstdio>
 #include "kytyGitVersion.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
@@ -749,6 +750,25 @@ void WindowContext::Run() {
 				// One line per title refresh keeps frame-rate history in the log now that the
 				// per-call flip status dumps are verbose-only (claude/flips.py reads it).
 				auto times = loop.TakeFrameTimes();
+				{
+					// Every present interval goes to frame_times.csv in the working directory
+					// (the run's runtime folder): t_s,interval_ms. The report derives p99 and
+					// 1 %-low from it; per-second summaries cannot.
+					static FILE* csv = [] {
+						FILE* file = std::fopen("frame_times.csv", "w");
+						if (file != nullptr) std::fputs("t_s,interval_ms\n", file);
+						return file;
+					}();
+					double since_last = 0.0;
+					const auto raw = loop.TakeRawFrameTimes(&since_last);
+					if (csv != nullptr) {
+						for (const auto& [t, interval]: raw) std::fprintf(csv, "%.3f,%.3f\n", t, interval);
+						std::fflush(csv);
+					}
+					if (times.empty() && since_last > 2000.0) {
+						LOGF("Status: no present for %.1f s\n", since_last / 1000.0);
+					}
+				}
 				if (times.empty()) {
 					LOGF("Status: t=%.1f frames=%" PRIu64 " fps=%.1f\n",
 					     static_cast<double>(now) / 1000.0, static_cast<uint64_t>(frames), fps);

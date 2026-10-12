@@ -35,19 +35,37 @@ struct WindowLoopState {
 	// (1-second averages hide hitches; reviews asked for p95 / worst frame).
 	std::mutex                              frame_times_mutex;
 	std::vector<float>                      frame_times_ms;
+	std::vector<std::pair<double, float>>   frame_times_raw; // (present time s, interval ms)
+	std::chrono::steady_clock::time_point   first_present {};
 	std::chrono::steady_clock::time_point   last_present {};
 	void RecordPresent() {
 		const auto now = std::chrono::steady_clock::now();
 		std::lock_guard lock(frame_times_mutex);
+		if (first_present.time_since_epoch().count() == 0) {
+			first_present = now;
+		}
 		if (last_present.time_since_epoch().count() != 0 && frame_times_ms.size() < 4096) {
-			frame_times_ms.push_back(
-			    std::chrono::duration<float, std::milli>(now - last_present).count());
+			const auto interval = std::chrono::duration<float, std::milli>(now - last_present).count();
+			frame_times_ms.push_back(interval);
+			frame_times_raw.emplace_back(std::chrono::duration<double>(now - first_present).count(),
+			                             interval);
 		}
 		last_present = now;
 	}
 	std::vector<float> TakeFrameTimes() {
 		std::lock_guard lock(frame_times_mutex);
 		return std::exchange(frame_times_ms, {});
+	}
+	// Raw present intervals since the last call, for frame_times.csv (p99 / 1 %-low need every
+	// sample, not per-second summaries), plus the time since the last present (an ongoing stall
+	// has no completed interval yet).
+	std::vector<std::pair<double, float>> TakeRawFrameTimes(double* since_last_present_ms) {
+		std::lock_guard lock(frame_times_mutex);
+		*since_last_present_ms =
+		    last_present.time_since_epoch().count() == 0
+		        ? 0.0
+		        : std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - last_present).count();
+		return std::exchange(frame_times_raw, {});
 	}
 };
 
