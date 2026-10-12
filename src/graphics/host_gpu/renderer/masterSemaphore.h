@@ -12,6 +12,15 @@ namespace Libs::Graphics {
 
 struct GraphicContext;
 
+// Always-on ring of the most recent queue submissions (every CommandScheduler, including the
+// presenter's). ReportStall prints it with each timeline's current counter so a stall shows which
+// submission is stuck and whether it waited on another semaphore (e.g. a swapchain acquire).
+namespace SubmitLog {
+void Record(vk::Semaphore timeline, uint64_t tick, uint32_t wait_count, vk::Semaphore first_wait,
+            uint64_t first_wait_value);
+void Dump(vk::Device device, vk::Semaphore reporting_timeline);
+} // namespace SubmitLog
+
 class MasterSemaphore {
 public:
 	explicit MasterSemaphore(GraphicContext& graphics);

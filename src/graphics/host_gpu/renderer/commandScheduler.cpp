@@ -371,6 +371,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
 		result = graphics.queue.submit(1, &submit_info, nullptr);
+		SubmitLog::Record(m_master.Handle(), tick, submit.num_wait_semaphores,
+		                  submit.num_wait_semaphores != 0 ? submit.wait_semaphores[0] : vk::Semaphore {},
+		                  submit.num_wait_semaphores != 0 ? submit.wait_ticks[0] : 0);
 		if (GpuDiagnostics::Enabled()) {
 			const auto semaphore = GpuDiagnostics::HandleValue(m_master.Handle());
 			GpuDiagnosticEvent event;

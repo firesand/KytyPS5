@@ -10,6 +10,9 @@
 #include <cstdio>
 #include "common/logging/log.h"
 #include <chrono>
+#include <utility>
+#include <algorithm>
+#include <array>
 #include <mutex>
 
 namespace Libs::Graphics {
@@ -157,6 +160,87 @@ void MasterSemaphore::CheckStall(const char* where, double seconds) {
 	ReportStall(where, m_stall_tick, waited);
 }
 
+namespace SubmitLog {
+namespace {
+struct Record {
+	vk::Semaphore                         timeline {};
+	uint64_t                              tick            = 0;
+	uint32_t                              wait_count      = 0;
+	vk::Semaphore                         first_wait {};
+	uint64_t                              first_wait_value = 0;
+	std::chrono::steady_clock::time_point when {};
+};
+constexpr size_t      RING = 48;
+std::mutex            g_mutex;
+std::array<Record, RING> g_ring {};
+size_t                g_next  = 0;
+size_t                g_count = 0;
+} // namespace
+
+void Record(vk::Semaphore timeline, uint64_t tick, uint32_t wait_count, vk::Semaphore first_wait,
+            uint64_t first_wait_value) {
+	std::lock_guard lock(g_mutex);
+	g_ring[g_next] = {timeline, tick, wait_count, first_wait, first_wait_value,
+	                  std::chrono::steady_clock::now()};
+	g_next         = (g_next + 1) % RING;
+	g_count        = std::min(g_count + 1, RING);
+}
+
+void Dump(vk::Device device, vk::Semaphore reporting_timeline) {
+	std::array<struct Record, RING> ring {};
+	size_t                          count = 0;
+	size_t                          first = 0;
+	{
+		std::lock_guard lock(g_mutex);
+		ring  = g_ring;
+		count = g_count;
+		first = (g_next + RING - g_count) % RING;
+	}
+	// Current counter of every timeline that appears in the ring.
+	std::array<std::pair<vk::Semaphore, uint64_t>, 8> counters {};
+	size_t                                            num_counters = 0;
+	for (size_t i = 0; i < count; i++) {
+		const auto& r     = ring[(first + i) % RING];
+		bool        known = false;
+		for (size_t k = 0; k < num_counters; k++) {
+			known |= counters[k].first == r.timeline;
+		}
+		if (!known && num_counters < counters.size()) {
+			uint64_t   value  = 0;
+			const auto status = device.getSemaphoreCounterValue(r.timeline, &value);
+			counters[num_counters++] = {r.timeline, value};
+			LOGF("GPU stall: timeline 0x%" PRIx64 "%s counter=%" PRIu64 " status=%s\n",
+			     static_cast<uint64_t>(reinterpret_cast<uintptr_t>(static_cast<VkSemaphore>(r.timeline))),
+			     r.timeline == reporting_timeline ? " (stalled)" : "", value,
+			     vk::to_string(status).c_str());
+		}
+	}
+	const auto now = std::chrono::steady_clock::now();
+	for (size_t i = 0; i < count; i++) {
+		const auto& r       = ring[(first + i) % RING];
+		uint64_t    counter = 0;
+		for (size_t k = 0; k < num_counters; k++) {
+			if (counters[k].first == r.timeline) {
+				counter = counters[k].second;
+			}
+		}
+		const double age = std::chrono::duration<double>(now - r.when).count();
+		if (r.wait_count == 0) {
+			LOGF("GPU stall:   submit tl=0x%" PRIx64 " tick=%" PRIu64 " %s age=%.1fs\n",
+			     static_cast<uint64_t>(reinterpret_cast<uintptr_t>(static_cast<VkSemaphore>(r.timeline))),
+			     r.tick, counter >= r.tick ? "done" : "PENDING", age);
+		} else {
+			LOGF("GPU stall:   submit tl=0x%" PRIx64 " tick=%" PRIu64 " %s age=%.1fs waits=%u first=0x%"
+			     PRIx64 " value=%" PRIu64 "\n",
+			     static_cast<uint64_t>(reinterpret_cast<uintptr_t>(static_cast<VkSemaphore>(r.timeline))),
+			     r.tick, counter >= r.tick ? "done" : "PENDING", age, r.wait_count,
+			     static_cast<uint64_t>(reinterpret_cast<uintptr_t>(static_cast<VkSemaphore>(r.first_wait))),
+			     r.first_wait_value);
+		}
+	}
+}
+} // namespace SubmitLog
+
 void MasterSemaphore::ReportStall(const char* where, uint64_t tick, double waited_s) {
 	// Zero Company 2026-10-12: four hangs where a submitted tick never completed (the GPU thread
 	// either waited on it forever or sat idle while the game waited for its end-of-pipe event).
@@ -172,6 +256,7 @@ void MasterSemaphore::ReportStall(const char* where, uint64_t tick, double waite
 	const auto status  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
 	LOGF("GPU stall: semaphore counter=%" PRIu64 " status=%s\n", counter,
 	     vk::to_string(status).c_str());
+	SubmitLog::Dump(m_graphics.device, m_semaphore);
 	vk::FenceCreateInfo fence_info {};
 	vk::Fence           fence {};
 	if (m_graphics.device.createFence(&fence_info, nullptr, &fence) == vk::Result::eSuccess) {
