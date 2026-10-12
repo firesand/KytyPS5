@@ -72,6 +72,10 @@ public:
 	bool   is_deleted   = false;
 	int    stream_score = 0;
 	size_t lru_id       = 0;
+	// Tick whose completion makes the device copy meaningful (the join copies from the buffers
+	// this one replaced). A BAR readback before that tick is free would copy unpopulated memory
+	// and then un-dirty the page (stale-buffer workflow 2026-10-13, mechanism #1).
+	uint64_t ready_tick = 0;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }

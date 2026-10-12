@@ -138,6 +138,15 @@ public:
 	void OnCommandBoundary();
 	// Diagnostics (GPU thread): the cached buffer covering vaddr, and upload statistics by path.
 	[[nodiscard]] std::string DescribeBufferAt(uint64_t vaddr);
+	// Stale-buffer probe (GPU thread): whether the 16 KiB entry has a write stamp at all, the
+	// owning buffer's ready tick, and the owner's current device bytes (BAR-mapped buffers only;
+	// the caller waits for the GPU first).
+	// Per-16 KiB-page tick of the last recorded GPU write (BAR readback gate); callable by the
+	// renderer when it commits written bindings.
+	void NoteGpuWrite(uint64_t vaddr, uint64_t size, uint64_t tick);
+	[[nodiscard]] bool     HasGpuWriteStamp(uint64_t vaddr) const;
+	[[nodiscard]] uint64_t OwnerReadyTick(uint64_t vaddr) const;
+	bool                   PeekDeviceCopy(uint64_t vaddr, void* out, uint64_t size);
 	struct SyncStats {
 		uint64_t obtain_calls = 0, obtain_bytes = 0, obtain_pages = 0;
 		uint64_t range_calls = 0, range_bytes = 0, range_pages = 0;
@@ -189,7 +198,6 @@ private:
 	                                      std::span<const void* const> sources, uint64_t total_size);
 	void QueueGpuModified(uint64_t vaddr, uint64_t size); // any thread
 	// Last GPU-write tick per 16 KiB page (0 = known complete), for TryBarReadback.
-	void NoteGpuWrite(uint64_t vaddr, uint64_t size, uint64_t tick);
 	// Copies completed GPU data straight from host-visible device memory (no queue drain).
 	[[nodiscard]] bool TryBarReadback(const Buffer& buffer, std::span<const vk::BufferCopy> copies);
 	// GPU thread. Only touches m_gpu_modified_ranges: it can run under the texture cache lock

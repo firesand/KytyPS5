@@ -1080,6 +1080,24 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		        (pipeline_bind_point == vk::PipelineBindPoint::eCompute &&
 		         shader_stage != vk::ShaderStageFlagBits::eCompute));
 	}
+	// Written buffer ranges were stamped at ObtainBuffer time; a submit between preparation and
+	// this commit (stream-buffer wrap, descriptor-heap wait) moves the draw/dispatch into a later
+	// tick than the stamp says, and a BAR readback could then read the pre-write bytes. Re-stamp
+	// with the tick the command is actually recorded in (stale-buffer workflow 2026-10-13, fix 3).
+	{
+		auto&      cache = m_context.GetBufferCache();
+		const auto tick  = m_context.GetCommandScheduler().CurrentTick();
+		for (const auto* writer: prepared_bindings) {
+			const auto& program = *writer->runtime->program;
+			for (const auto& resource: program.info.buffers) {
+				if (!resource.written || resource.descriptor_index == UINT32_MAX) continue;
+				const auto& written = writer->buffer_sources[resource.descriptor_index];
+				if (written.size != 0) {
+					cache.NoteGpuWrite(written.address, written.size, tick);
+				}
+			}
+		}
+	}
 	for (const auto* reader: prepared_bindings) {
 		const auto& reads = reader->runtime->resources->specialization_reads;
 		if (reads.empty()) continue;

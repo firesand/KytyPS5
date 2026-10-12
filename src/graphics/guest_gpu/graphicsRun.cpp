@@ -419,7 +419,10 @@ void CommandProcessor::ResyncStaleGuestBytes(const char* what, uint64_t vaddr, u
 	auto& cache = m_renderer.GetBufferCache();
 	GetScheduler().Current().EndRendering();
 	// A fresh write-fault pass over everything written so far, waited to completion including the
-	// priority operation that marks the pages; the caller's re-read then faults and downloads.
+	// priority operation that marks the pages; the caller's re-read then faults and downloads —
+	// for pages inside a declared unbounded range only. A page the tracker already calls clean
+	// (e.g. after a premature readback) is not repaired here; see the device-copy probe in
+	// ProcessIndirectBuffer.
 	cache.MarkWriteFaultsDirty();
 	cache.FlushWriteFaults(true);
 	cache.OnCommandBoundary();
@@ -827,9 +830,38 @@ void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands,
 				     cache.InUnboundedWriteRange(base, parent.commands.size_bytes()) ? "yes" : "no");
 				const auto* words = parent.commands.data() + parent.offset_dw;
 				const auto  avail = parent.commands.size() - parent.offset_dw;
-				for (size_t i = 0; i < std::min<size_t>(avail, 4); i++) {
+				for (size_t i = 0; i < std::min<size_t>(avail, 16); i++) {
 					LOGF("\t parent[%zu] = 0x%08" PRIx32 "\n", i, words[i]);
 				}
+			}
+			// Stale-buffer workflow (2026-10-13) mechanism #1: a BAR readback copied the owner's
+			// device memory before its join copy had executed and un-dirtied the page; the write-
+			// fault resync cannot repair a page the tracker already calls clean. Decide from the
+			// device copy itself: wait for the GPU, then look at what the owner buffer holds.
+			const auto ready = cache.OwnerReadyTick(address);
+			LOGF("CommandProcessor: stale indirect buffer: write-stamp=%s owner-ready-tick=%" PRIu64
+			     " (%s)\n",
+			     cache.HasGpuWriteStamp(address) ? "yes" : "no", ready,
+			     GetScheduler().IsFree(ready) ? "free" : "IN FLIGHT");
+			GetScheduler().FlushAndWait();
+			std::array<uint32_t, 8> device {};
+			if (cache.PeekDeviceCopy(address, device.data(), sizeof(device))) {
+				LOGF("CommandProcessor: stale indirect buffer: device copy = %08x %08x %08x %08x %08x %08x %08x %08x\n",
+				     device[0], device[1], device[2], device[3], device[4], device[5], device[6], device[7]);
+				if (LooksLikePm4Header(device[0]) && device[0] != commands[0]) {
+					// The GPU-built command stream is in VRAM and the host copy is stale: restore
+					// the host bytes from the device copy and continue. Loud on purpose: this is
+					// a mitigation for a lost download, not the fix for its cause.
+					std::vector<uint32_t> restored(commands.size());
+					if (cache.PeekDeviceCopy(address, restored.data(), commands.size_bytes())) {
+						LibKernel::Memory::WriteBacking(address, restored.data(), commands.size_bytes());
+						LOGF("CommandProcessor: stale indirect buffer 0x%016" PRIx64 "/%zu RECOVERED from "
+						     "the device copy (lost download: BAR readback before the owner was ready?)\n",
+						     address, commands.size());
+					}
+				}
+			} else {
+				LOGF("CommandProcessor: stale indirect buffer: no mapped owner to peek\n");
 			}
 		}
 	}

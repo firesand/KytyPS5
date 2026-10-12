@@ -454,6 +454,7 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 		const auto old_id = (it++)->second;
 		JoinOverlap(id, old_id, !overlap.has_stream_leap);
 	}
+	m_slot_buffers[id].ready_tick = m_scheduler.CurrentTick(); // after the join copies
 	Register(id);
 	return id;
 }
@@ -731,7 +732,10 @@ void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size, uint64_t tick) {
 		return;
 	}
 	for (auto page = first; page <= last; ++page) {
-		m_gpu_write_ticks[page] = tick;
+		// Monotonic: a later marking with an older (or 0 = complete) tick must not hide a write
+		// still in flight on the same 16 KiB entry (stale-buffer workflow 2026-10-13, fix 2).
+		auto& stamp = m_gpu_write_ticks[page];
+		stamp       = std::max(stamp, tick);
 	}
 }
 
@@ -746,7 +750,8 @@ bool BufferCache::TryBarReadback(const Buffer& buffer, std::span<const vk::Buffe
 		return false;
 	}
 	const auto address = buffer.CpuAddress();
-	auto       latest  = m_bar_block_tick;
+	// The join/initial copies into this buffer must have executed, not only the page's writes.
+	auto latest = std::max(m_bar_block_tick, buffer.ready_tick);
 	for (const auto& copy: copies) {
 		const auto first = (address + copy.srcOffset) >> CACHING_PAGEBITS;
 		const auto last  = (address + copy.srcOffset + copy.size - 1) >> CACHING_PAGEBITS;
@@ -942,6 +947,35 @@ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 			m_sync_stats.range_pages += m_last_upload_pages;
 		}
 	}
+}
+
+bool BufferCache::HasGpuWriteStamp(uint64_t vaddr) const {
+	return m_gpu_write_ticks.contains(vaddr >> CACHING_PAGEBITS);
+}
+
+uint64_t BufferCache::OwnerReadyTick(uint64_t vaddr) const {
+	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (owner == nullptr || !*owner) {
+		return 0;
+	}
+	return m_slot_buffers[*owner].ready_tick;
+}
+
+bool BufferCache::PeekDeviceCopy(uint64_t vaddr, void* out, uint64_t size) {
+	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (owner == nullptr || !*owner) {
+		return false;
+	}
+	auto& buffer = m_slot_buffers[*owner];
+	if (buffer.Mapped().empty() || !buffer.IsInBounds(vaddr, size)) {
+		return false;
+	}
+	const auto offset = buffer.Offset(vaddr);
+	if (!buffer.IsCoherent()) {
+		buffer.Invalidate(offset, size);
+	}
+	std::memcpy(out, buffer.Mapped().data() + offset, size);
+	return true;
 }
 
 std::string BufferCache::DescribeBufferAt(uint64_t vaddr) {
