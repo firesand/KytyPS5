@@ -76,6 +76,10 @@ public:
 	// this one replaced). A BAR readback before that tick is free would copy unpopulated memory
 	// and then un-dirty the page (stale-buffer workflow 2026-10-13, mechanism #1).
 	uint64_t ready_tick = 0;
+	// Tick of the last recorded GPU-side write INTO this buffer (staging upload, written binding,
+	// fill/copy destination, join copy). A host-side read of its device bytes (BAR readback or a
+	// host join) is only meaningful once this tick is free.
+	uint64_t last_gpu_write_tick = 0;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }

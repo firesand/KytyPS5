@@ -430,11 +430,28 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t
 // copy (which then gates BAR readbacks of the new buffer through ready_tick). Without this every
 // new buffer would wait for the current tick before any BAR readback (ng-39: menu 7 vs 12 fps).
 bool BufferCache::HostJoinPossible(const Buffer& new_buffer, const Buffer& overlap) {
+	// Experimental (KYTY_HOST_JOIN=1): off by default until delayed-upload->join and A->B->C join
+	// regressions exist (Codex P1 2026-10-13). The default records GPU joins as before; a new
+	// buffer only gets a ready_tick when such a copy was recorded.
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_HOST_JOIN");
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
+	}();
+	if (!enabled) {
+		return false;
+	}
 	if (new_buffer.Mapped().empty() || overlap.Mapped().empty() || !overlap.IsCoherent() ||
 	    !new_buffer.IsCoherent()) {
 		return false;
 	}
 	if (m_bar_block_tick != 0 && !m_scheduler.IsFree(m_bar_block_tick)) {
+		return false;
+	}
+	// Every producer of the overlap's device bytes must have executed: its own join copies
+	// (ready_tick) and any recorded upload / written binding / fill / copy into it
+	// (last_gpu_write_tick), not only the per-page write stamps below.
+	if ((overlap.ready_tick != 0 && !m_scheduler.IsFree(overlap.ready_tick)) ||
+	    (overlap.last_gpu_write_tick != 0 && !m_scheduler.IsFree(overlap.last_gpu_write_tick))) {
 		return false;
 	}
 	const auto address = overlap.CpuAddress();
@@ -470,6 +487,7 @@ bool BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 		gpu_copy = false;
 	} else {
 		new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0, offset, overlap.Size());
+		new_buffer.last_gpu_write_tick = m_scheduler.CurrentTick();
 		m_sync_stats.gpu_joins++;
 	}
 	DeleteBuffer(overlap_id);
@@ -519,6 +537,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	m_last_upload_bytes = total_size;
 	m_last_upload_pages = copies.size();
 	if (source) {
+		buffer.last_gpu_write_tick = m_scheduler.CurrentTick(); // the staging copy below
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
 		const auto native = command.Handle();
@@ -620,6 +639,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
 		NoteGpuWrite(vaddr, size, m_scheduler.CurrentTick());
+		buffer.last_gpu_write_tick = m_scheduler.CurrentTick();
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
