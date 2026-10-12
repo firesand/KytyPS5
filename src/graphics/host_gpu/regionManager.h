@@ -208,7 +208,6 @@ public:
 								m_hot.Unset(page);
 								m_fault_counts[page] = 0;
 								m_unchanged[page]    = 0;
-								m_hash_valid.Unset(page); // non-hot uploads bypass the hash: forget it
 								s_hot_stats.demoted++;
 								continue;
 							}
@@ -235,9 +234,6 @@ public:
 			if constexpr (filter_hot && source == DirtySource::Cpu) {
 				EmitUploadRun(first, last, func);
 			} else {
-				if constexpr (source == DirtySource::Cpu) {
-					m_hash_valid.UnsetRange(first, last); // uploaded without a hash
-				}
 				func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
 			}
 		}
@@ -305,10 +301,7 @@ private:
 		}
 		size_t run_begin = first;
 		for (size_t page = first; page < last; ++page) {
-			if (!m_hot.Get(page)) {
-				m_hash_valid.Unset(page); // uploaded below without a hash: the old one is stale
-				continue;
-			}
+			if (!m_hot.Get(page)) continue;
 			const auto hash =
 			    HashTrackerPage(reinterpret_cast<const void*>(m_cpu_addr + page * TRACKER_PAGE_SIZE));
 			s_hot_stats.hashed++;
