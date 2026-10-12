@@ -800,9 +800,9 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
     vk::DebugUtilsMessageTypeFlagsEXT             message_types,
     const vk::DebugUtilsMessengerCallbackDataEXT* callback_data, void* /*user_data*/) {
 	EXIT_IF(callback_data == nullptr);
-	EXIT_IF(callback_data->pMessage == nullptr);
 
 	if (message_types & vk::DebugUtilsMessageTypeFlagBitsEXT::eDeviceAddressBinding) {
+		// Handled before the pMessage check: binding reports carry their data in pNext.
 		// Claude probe: record every GPU address binding so a device fault address can be
 		// mapped to the object (buffer, image, shader code) that owned it.
 		for (const auto* next = static_cast<const vk::BaseInStructure*>(callback_data->pNext);
@@ -828,6 +828,7 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 		}
 		return VK_FALSE;
 	}
+	EXIT_IF(callback_data->pMessage == nullptr);
 
 	const char*     severity_str   = nullptr;
 	fmt::text_style severity_style = Log::Color::Default;
@@ -1033,6 +1034,23 @@ void WindowContext::CreateVulkan() {
 		                                       &graphic_ctx.debug_messenger) !=
 		    vk::Result::eSuccess) {
 			EXIT("Could not create debug messenger");
+		}
+	} else if (HasExtension(r.available_extensions, VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) {
+		// Without validation layers still listen to VK_EXT_device_address_binding_report so a
+		// device fault address can be mapped to the allocation that owned it: ng-30's fault
+		// report found an empty ring because this messenger only existed with validation on.
+		vk::DebugUtilsMessengerCreateInfoEXT binding_create_info {};
+		binding_create_info.messageSeverity = vk::DebugUtilsMessageSeverityFlagBitsEXT::eVerbose |
+		                                      vk::DebugUtilsMessageSeverityFlagBitsEXT::eInfo |
+		                                      vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning |
+		                                      vk::DebugUtilsMessageSeverityFlagBitsEXT::eError;
+		binding_create_info.messageType     = vk::DebugUtilsMessageTypeFlagBitsEXT::eDeviceAddressBinding;
+		binding_create_info.pfnUserCallback = VulkanDebugMessengerCallback;
+		if (VulkanCreateDebugUtilsMessengerEXT(graphic_ctx.instance, &binding_create_info, nullptr,
+		                                       &graphic_ctx.debug_messenger) == vk::Result::eSuccess) {
+			LOGF("Vulkan address binding report: messenger created (device fault address mapping)\n");
+		} else {
+			LOGF("Vulkan address binding report: messenger not created\n");
 		}
 	}
 
