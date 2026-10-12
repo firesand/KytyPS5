@@ -2058,46 +2058,48 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	// stale float (0x49080ff2) as a register offset; a still-implausible pair triggers one full
 	// resync (as for stale indirect buffers) and a re-read before giving up.
 	cp.PrepareHostRead(indirect_address, indirect_bytes);
-	bool resynced = false;
+	// Pass 1 (review 2026-10-13): validate the WHOLE list before applying any entry. A stale list
+	// can hold valid-looking pairs before the first implausible one, and register writes have
+	// side effects, so a resync re-reads the list from entry 0; the validated bytes are then
+	// snapshotted so pass 2 applies exactly what was checked.
+	const auto first_invalid = [&]() -> uint32_t {
+		for (uint32_t i = 0; i < indirect_num_dw; i++) {
+			const auto raw    = *reinterpret_cast<const volatile uint32_t*>(indirect_buffer + 2u * i);
+			const auto offset = NormalizeRegisterOffset(raw);
+			if (offset == Pm4::SH_NOP || raw == 0xffffffffu || offset < Pm4::SH_NUM) {
+				continue;
+			}
+			return i;
+		}
+		return UINT32_MAX;
+	};
+	auto invalid = first_invalid();
+	if (invalid != UINT32_MAX) {
+		cp.ResyncStaleGuestBytes("indirect SH registers", indirect_address, indirect_bytes);
+		invalid = first_invalid();
+	}
+	if (invalid != UINT32_MAX) {
+		for (uint32_t j = 0; j < indirect_num_dw && j < 16; j++) {
+			LOGF("\t sh_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n", j,
+			     indirect_buffer[j * 2], indirect_buffer[j * 2 + 1]);
+		}
+		EXIT("unsupported indirect SH register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
+		     "), value = 0x%08" PRIx32 " at 0x%016" PRIx64 " [%" PRIu32 "/%" PRIu32
+		     "] after resync\n",
+		     NormalizeRegisterOffset(indirect_buffer[invalid * 2]), indirect_buffer[invalid * 2],
+		     indirect_buffer[invalid * 2 + 1], indirect_address, invalid, indirect_num_dw);
+	}
+	std::vector<uint32_t> validated(indirect_buffer, indirect_buffer + 2u * indirect_num_dw);
+	indirect_buffer = validated.data(); // pass 2 reads the snapshot, not guest memory
 
+	// Pass 2: apply the validated snapshot.
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
 		auto value          = indirect_buffer[1];
 
-		// Not sure if this is correct
-		// if (raw_cmd_offset != cmd_offset) {
-		// 	LOGF_COLOR(Log::Color::Red,
-		// 	           "\t temporary: normalized indirect SH register offset 0x%08" PRIx32
-		// 	           " -> 0x%08" PRIx32 "\n",
-		// 	           raw_cmd_offset, cmd_offset);
-		// }
-
-		// Not sure if this is correct
 		if (cmd_offset == Pm4::SH_NOP || raw_cmd_offset == 0xffffffffu) {
 			continue;
-		}
-
-		if (cmd_offset >= Pm4::SH_NUM && !resynced) {
-			resynced = true;
-			cp.ResyncStaleGuestBytes("indirect SH registers", indirect_address, indirect_bytes);
-			raw_cmd_offset = *reinterpret_cast<const volatile uint32_t*>(indirect_buffer);
-			cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
-			value          = *reinterpret_cast<const volatile uint32_t*>(indirect_buffer + 1);
-			if (cmd_offset == Pm4::SH_NOP || raw_cmd_offset == 0xffffffffu) {
-				continue;
-			}
-		}
-		if (cmd_offset >= Pm4::SH_NUM) {
-			const auto* dump_regs = indirect_buffer - static_cast<size_t>(i) * 2u;
-			for (uint32_t j = 0; j < indirect_num_dw && j < 16; j++) {
-				LOGF("\t sh_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
-				     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);
-			}
-			EXIT("unsupported indirect SH register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
-			     "), value = 0x%08" PRIx32 " at 0x%016" PRIx64 " [%" PRIu32 "/%" PRIu32
-			     "] after resync\n",
-			     cmd_offset, raw_cmd_offset, value, indirect_address, i, indirect_num_dw);
 		}
 
 		auto pfunc = g_hw_sh_indirect_func[cmd_offset];
@@ -2140,37 +2142,43 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
 	const auto indirect_bytes   = static_cast<uint64_t>(indirect_num_dw) * 2u * sizeof(uint32_t);
 	cp.PrepareHostRead(indirect_address, indirect_bytes); // GPU-built list: see the SH twin
-	bool resynced = false;
+	const auto first_invalid = [&]() -> uint32_t {
+		for (uint32_t i = 0; i < indirect_num_dw; i++) {
+			const auto offset =
+			    NormalizeRegisterOffset(*reinterpret_cast<const volatile uint32_t*>(indirect_buffer + 2u * i));
+			if (offset == Pm4::UC_NOP || offset < Pm4::UC_NUM) {
+				continue;
+			}
+			return i;
+		}
+		return UINT32_MAX;
+	};
+	auto invalid = first_invalid();
+	if (invalid != UINT32_MAX) {
+		cp.ResyncStaleGuestBytes("indirect UC registers", indirect_address, indirect_bytes);
+		invalid = first_invalid();
+	}
+	if (invalid != UINT32_MAX) {
+		for (uint32_t j = 0; j < indirect_num_dw && j < 16; j++) {
+			LOGF("\t uc_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n", j,
+			     indirect_buffer[j * 2], indirect_buffer[j * 2 + 1]);
+		}
+		EXIT("unsupported indirect UC register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
+		     "), value = 0x%08" PRIx32 " at 0x%016" PRIx64 " [%" PRIu32 "/%" PRIu32
+		     "] after resync\n",
+		     NormalizeRegisterOffset(indirect_buffer[invalid * 2]), indirect_buffer[invalid * 2],
+		     indirect_buffer[invalid * 2 + 1], indirect_address, invalid, indirect_num_dw);
+	}
+	std::vector<uint32_t> validated(indirect_buffer, indirect_buffer + 2u * indirect_num_dw);
+	indirect_buffer = validated.data(); // pass 2 reads the snapshot, not guest memory
+
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
 		auto value          = indirect_buffer[1];
 
-		// Not sure if this is correct
-		// if (raw_cmd_offset != cmd_offset) {
-		// 	LOGF_COLOR(Log::Color::Red,
-		// 	           "\t temporary: normalized indirect UC register offset 0x%08" PRIx32
-		// 	           " -> 0x%08" PRIx32 "\n",
-		// 	           raw_cmd_offset, cmd_offset);
-		// }
 		if (cmd_offset == Pm4::UC_NOP) {
 			continue;
-		}
-		if (cmd_offset >= Pm4::UC_NUM && !resynced) {
-			resynced = true;
-			cp.ResyncStaleGuestBytes("indirect UC registers", indirect_address, indirect_bytes);
-			raw_cmd_offset = *reinterpret_cast<const volatile uint32_t*>(indirect_buffer);
-			cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
-			value          = *reinterpret_cast<const volatile uint32_t*>(indirect_buffer + 1);
-			if (cmd_offset == Pm4::UC_NOP) {
-				continue;
-			}
-		}
-		if (cmd_offset >= Pm4::UC_NUM) {
-			EXIT("unsupported indirect UC register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
-			     "), value = 0x%08" PRIx32 " at 0x%016" PRIx64 " [%" PRIu32 "/%" PRIu32
-			     "] after resync\n",
-			     cmd_offset, raw_cmd_offset, value, indirect_address, i, indirect_num_dw);
 		}
 
 		auto pfunc = g_hw_uc_indirect_func[cmd_offset & (Pm4::UC_NUM - 1)];
