@@ -598,8 +598,9 @@ void GuestGpu::ThreadRun(void* data) {
 
 		EXIT_IF(!has_submission);
 		const bool complete = gpu->Process(submission);
-		if (complete || submission.command_execution.MadeProgress() ||
-		    submission.constant_execution.MadeProgress()) {
+		// Progress of this slice only: a finished constant-engine stream keeps its old flag on
+		// later slices (it is no longer processed), which reset the timer forever (review).
+		if (complete || gpu->m_last_slice_progress) {
 			blocked_since = {}; // the blocked-queue timer counts only retries without progress
 		}
 
@@ -634,7 +635,8 @@ bool GuestGpu::Process(Submission& submission) {
 	}
 
 	cp.BufferInit();
-	bool complete = true;
+	bool complete         = true;
+	m_last_slice_progress = true;
 
 	switch (submission.type) {
 		case SubmissionType::Graphics: {
@@ -661,6 +663,7 @@ bool GuestGpu::Process(Submission& submission) {
 					break;
 				}
 			}
+			m_last_slice_progress = progressed;
 			if (progressed) {
 				if (complete) {
 					m_renderer.RunGarbageCollector();
@@ -687,6 +690,7 @@ bool GuestGpu::Process(Submission& submission) {
 			}
 			complete = cp.Process(submission.command_execution, submission.commands) ==
 			           Pm4ProcessResult::Complete;
+			m_last_slice_progress = submission.command_execution.MadeProgress();
 			if (submission.command_execution.MadeProgress()) {
 				if (complete) {
 					m_renderer.RunGarbageCollector();
@@ -773,12 +777,44 @@ void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands,
 		ResyncStaleGuestBytes("indirect buffer", reinterpret_cast<uint64_t>(commands.data()),
 		                      commands.size_bytes());
 		static std::atomic<uint32_t> reports {0};
-		if (reports.fetch_add(1, std::memory_order_relaxed) < 50) {
+		const bool still_invalid = !LooksLikePm4Header(commands[0]);
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 50 || still_invalid) {
 			LOGF("CommandProcessor: indirect buffer 0x%016" PRIx64 "/%zu started with 0x%08" PRIx32
 			     " (not a PM4 header): resynced GPU writes, now 0x%08" PRIx32 " (%s)\n",
 			     reinterpret_cast<uint64_t>(commands.data()), commands.size(), first,
 			     *reinterpret_cast<const volatile uint32_t*>(commands.data()),
-			     LooksLikePm4Header(commands[0]) ? "valid" : "still invalid");
+			     still_invalid ? "still invalid" : "valid");
+		}
+		if (still_invalid) {
+			// ng-35 (intro, t=498): float transform data at the buffer start survived the resync.
+			// Record what the caches know about the page and where the packet came from, so the
+			// next occurrence tells a stale parent packet from an untracked GPU writer.
+			auto&      cache   = m_renderer.GetBufferCache();
+			const auto address = reinterpret_cast<uint64_t>(commands.data());
+			uint32_t   backing = 0;
+			(void)LibKernel::Memory::TryReadBacking(address, &backing, sizeof(backing));
+			LOGF("CommandProcessor: stale indirect buffer 0x%016" PRIx64 ": %s unbounded-range=%s "
+			     "last-gpu-write-tick=%" PRIu64 " now-tick=%" PRIu64 " pending-unbounded=%s "
+			     "backing=0x%08" PRIx32 "\n",
+			     address, cache.DescribeBufferAt(address).c_str(),
+			     cache.InUnboundedWriteRange(address, commands.size_bytes()) ? "yes" : "no",
+			     cache.LastGpuWriteTick(address), GetScheduler().CurrentTick(),
+			     cache.HasPendingUnboundedWrites() ? "yes" : "no", backing);
+			if (!g_current_execution->m_buffer_stack.empty()) {
+				const auto& parent = g_current_execution->m_buffer_stack.back();
+				const auto  base   = reinterpret_cast<uint64_t>(parent.commands.data());
+				const auto  at     = base + uint64_t {parent.offset_dw} * sizeof(uint32_t);
+				LOGF("CommandProcessor: stale indirect buffer referenced from 0x%016" PRIx64
+				     " (parent 0x%016" PRIx64 "/%zu +0x%x, %s, unbounded-range=%s)\n",
+				     at, base, parent.commands.size(), parent.offset_dw,
+				     cache.DescribeBufferAt(at).c_str(),
+				     cache.InUnboundedWriteRange(base, parent.commands.size_bytes()) ? "yes" : "no");
+				const auto* words = parent.commands.data() + parent.offset_dw;
+				const auto  avail = parent.commands.size() - parent.offset_dw;
+				for (size_t i = 0; i < std::min<size_t>(avail, 4); i++) {
+					LOGF("\t parent[%zu] = 0x%08" PRIx32 "\n", i, words[i]);
+				}
+			}
 		}
 	}
 	g_current_execution->m_next_buffer = commands;

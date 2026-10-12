@@ -115,6 +115,15 @@ public:
 	// 528 MiB clamped range at bind time, which made every CPU access to the heap fault).
 	void NoteUnboundedWrite(uint64_t vaddr, uint64_t size) { m_write_fault_ranges.Add(vaddr, size); }
 	void MarkWriteFaultsDirty() { m_write_faults_dirty = true; }
+	// Diagnostics (GPU thread): declared unbounded-write range membership and the last tick a
+	// tracked GPU write touched the page (0 = none recorded).
+	[[nodiscard]] bool InUnboundedWriteRange(uint64_t vaddr, uint64_t size) const {
+		return m_write_fault_ranges.Intersects(vaddr, size);
+	}
+	[[nodiscard]] uint64_t LastGpuWriteTick(uint64_t vaddr) const {
+		const auto it = m_gpu_write_ticks.find(vaddr >> CACHING_PAGEBITS);
+		return it != m_gpu_write_ticks.end() ? it->second : 0;
+	}
 	// Unbounded-heap GPU writes recorded or in flight whose pages are not yet marked GPU-dirty.
 	[[nodiscard]] bool HasPendingUnboundedWrites() const noexcept {
 		return m_write_faults_dirty || m_write_fault_tick != 0;
@@ -177,7 +186,7 @@ private:
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
-	                                      uint64_t total_size);
+	                                      std::span<const void* const> sources, uint64_t total_size);
 	void QueueGpuModified(uint64_t vaddr, uint64_t size); // any thread
 	// Last GPU-write tick per 16 KiB page (0 = known complete), for TryBarReadback.
 	void NoteGpuWrite(uint64_t vaddr, uint64_t size, uint64_t tick);
