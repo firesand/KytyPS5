@@ -14,6 +14,8 @@
 #include <span>
 #include <type_traits>
 #include <unordered_map>
+#include <atomic>
+#include <chrono>
 
 namespace Libs::Graphics {
 
@@ -105,7 +107,13 @@ public:
 	explicit PipelineCache(GraphicContext& graphics);
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
-	void Save();
+	// final=true also releases the driver cache object (shutdown); periodic saves keep it.
+	void Save(bool final = true);
+	// Saves from the GPU thread when new pipelines accumulated for a while, so a crash or a
+	// killed process keeps the driver compiles that already happened (Zero Company spends 5-6 s
+	// per large post-process pipeline and its first sessions never reached the shutdown save).
+	void        MaybeSave();
+	static void EmergencySave();
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
@@ -177,6 +185,9 @@ private:
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
+	uint32_t                              m_unsaved_pipelines = 0;
+	std::chrono::steady_clock::time_point m_last_save {};
+	static inline std::atomic<PipelineCache*> s_live {nullptr};
 
 	void InitializeDriverCache();
 };

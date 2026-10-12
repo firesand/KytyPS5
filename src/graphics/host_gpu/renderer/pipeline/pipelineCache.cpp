@@ -26,6 +26,7 @@
 #include <atomic>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
@@ -35,6 +36,7 @@
 #include <utility>
 #include <vector>
 #include <xxhash.h>
+#include <chrono>
 
 namespace Libs::Graphics {
 
@@ -483,10 +485,13 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
+	m_last_save = std::chrono::steady_clock::now();
+	s_live.store(this, std::memory_order_release);
 }
 
 PipelineCache::~PipelineCache() {
-	Save();
+	s_live.store(nullptr, std::memory_order_release);
+	Save(true);
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
 			(void)key;
@@ -588,7 +593,7 @@ void PipelineCache::InitializeDriverCache() {
 	}
 }
 
-void PipelineCache::Save() {
+void PipelineCache::Save(bool final) {
 	if (m_driver_cache == nullptr) {
 		return;
 	}
@@ -640,10 +645,37 @@ void PipelineCache::Save() {
 		                 Common::PathToString(m_driver_cache_path));
 		return;
 	}
-	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
-	                 Common::PathToString(m_driver_cache_path));
-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-	m_driver_cache = nullptr;
+	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}{}", payload.size(),
+	                 Common::PathToString(m_driver_cache_path), final ? "" : " (periodic)");
+	m_unsaved_pipelines = 0;
+	m_last_save         = std::chrono::steady_clock::now();
+	if (final) {
+		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+		m_driver_cache = nullptr;
+	}
+}
+
+void PipelineCache::MaybeSave() {
+	// KYTY_PIPELINE_CACHE_SAVE_SECONDS overrides the 60 s interval (0 disables periodic saves).
+	static const auto interval = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_CACHE_SAVE_SECONDS");
+		return std::chrono::seconds(value != nullptr ? std::atoi(value) : 60);
+	}();
+	if (interval.count() <= 0 || m_unsaved_pipelines == 0 || m_driver_cache == nullptr ||
+	    std::chrono::steady_clock::now() - m_last_save < interval) {
+		return;
+	}
+	Save(false);
+}
+
+void PipelineCache::EmergencySave() {
+	// Runs from the fatal-exit path on whichever thread failed. Taking the pointer makes the save
+	// single-shot and keeps a failure inside Save() from recursing; vkGetPipelineCacheData may run
+	// alongside pipeline creation on the GPU thread (pipeline caches are internally synchronized).
+	auto* cache = s_live.exchange(nullptr, std::memory_order_acq_rel);
+	if (cache != nullptr && cache->m_unsaved_pipelines != 0) {
+		cache->Save(false);
+	}
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
@@ -962,6 +994,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
+	++m_unsaved_pipelines;
 
 	return *iter->second;
 }
@@ -990,6 +1023,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
+	++m_unsaved_pipelines;
 
 	return *iter->second;
 }

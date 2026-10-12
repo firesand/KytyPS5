@@ -94,6 +94,10 @@ void Shutdown() {
 	g_renderer = nullptr;
 }
 
+void EmergencyShutdown() {
+	Libs::Graphics::PipelineCache::EmergencySave();
+}
+
 void GraphicsDbgDumpDcb(const char* type, uint32_t num_dw, const uint32_t* cmd_buffer) {
 	EXIT_IF(type == nullptr);
 
@@ -166,6 +170,7 @@ struct RegisterDefaultsStorage {
 };
 
 #include "libs/agcRegisterDefaults.inc"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
 #include <fmt/format.h>
 

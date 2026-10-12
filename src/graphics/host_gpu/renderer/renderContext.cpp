@@ -239,6 +239,7 @@ void RenderContext::RunGarbageCollector() {
 	m_texture_cache.ProcessDownloadImages();
 	m_texture_cache.RunGarbageCollector();
 	m_buffer_cache.RunGarbageCollector();
+	m_pipeline_cache.MaybeSave();
 }
 
 void RenderContext::AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id) {
