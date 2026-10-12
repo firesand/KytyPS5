@@ -461,15 +461,17 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
 	std::vector<vk::BufferCopy> copies;
+	std::vector<const void*>    sources; // per copy: hot-page snapshot, or null = guest memory
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, is_written,
-	    [&](uint64_t address, uint64_t bytes) noexcept {
+	    [&](uint64_t address, uint64_t bytes, const void* snapshot) noexcept {
 		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
+		    sources.push_back(snapshot);
 		    total_size += bytes;
 	    },
-	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+	    [&]() noexcept { source = UploadCopies(buffer, copies, sources, total_size); });
 	m_last_upload_bytes = total_size;
 	m_last_upload_pages = copies.size();
 	if (source) {
@@ -505,16 +507,24 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 }
 
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
-                                     uint64_t total_size) {
+                                     std::span<const void* const> sources, uint64_t total_size) {
 	if (copies.empty()) {
 		return nullptr;
 	}
+	// sources[i] (when given and non-null) is the tracker's immutable snapshot of copy i; the
+	// remembered page hash describes that snapshot, so it, not live guest memory, is uploaded.
+	const auto source_of = [&](size_t i, const vk::BufferCopy& copy) {
+		if (i < sources.size() && sources[i] != nullptr) {
+			return sources[i];
+		}
+		return reinterpret_cast<const void*>(buffer.CpuAddress() + copy.dstOffset);
+	};
 
 	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
 	if (mapped != nullptr) {
-		for (auto& copy: copies) {
-			const auto address = buffer.CpuAddress() + copy.dstOffset;
-			std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
+		for (size_t i = 0; i < copies.size(); i++) {
+			auto& copy = copies[i];
+			std::memcpy(mapped + copy.srcOffset, source_of(i, copy), copy.size);
 			copy.srcOffset += base_offset;
 		}
 		m_staging_buffer.Commit();
@@ -523,10 +533,9 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 
 	auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0,
 	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size);
-	for (const auto& copy: copies) {
-		const auto address = buffer.CpuAddress() + copy.dstOffset;
-		std::memcpy(temporary->Mapped().data() + copy.srcOffset,
-		            reinterpret_cast<const void*>(address), copy.size);
+	for (size_t i = 0; i < copies.size(); i++) {
+		const auto& copy = copies[i];
+		std::memcpy(temporary->Mapped().data() + copy.srcOffset, source_of(i, copy), copy.size);
 	}
 	temporary->Flush(0, total_size);
 	const auto handle = temporary->Handle();

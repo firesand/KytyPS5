@@ -3,6 +3,8 @@
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 
+#include <algorithm>
+#include <functional>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -389,7 +391,7 @@ void TestCpuDirtyUpload() {
   bool uploaded = false;
   tracker.ForEachUploadRange(
       address + 16, 32, false,
-      [&](uint64_t upload_address, uint64_t upload_size) noexcept {
+      [&](uint64_t upload_address, uint64_t upload_size, const void*) noexcept {
         Check(upload_address == address && upload_size == page_size,
               "upload range was not page aligned");
         ranges++;
@@ -415,7 +417,7 @@ void TestCleanUploadPreservesOwnership() {
   auto *memory = AllocateFixedGuestRange(region_size * 2, region_size);
   const auto address = reinterpret_cast<uint64_t>(memory);
   tracker.ForEachUploadRange(address, region_size * 2, false,
-                             [](uint64_t, uint64_t) noexcept {},
+                             [](uint64_t, uint64_t, const void*) noexcept {},
                              []() noexcept {});
 
   for (const auto start : {address + 63 * page_size,
@@ -429,7 +431,7 @@ void TestCleanUploadPreservesOwnership() {
     ResetProtectionLog();
     tracker.ForEachUploadRange(
         start, 2 * page_size, false,
-        [&](uint64_t, uint64_t) noexcept { ranges++; },
+        [&](uint64_t, uint64_t, const void*) noexcept { ranges++; },
         [&]() noexcept { completions++; });
     Check(ranges == 0 && completions == 1 && g_protection_calls == 0 &&
               !tracker.IsRegionCpuModified(start, 2 * page_size),
@@ -437,7 +439,7 @@ void TestCleanUploadPreservesOwnership() {
 
     tracker.ForEachUploadRange(
         start, 2 * page_size, true,
-        [&](uint64_t, uint64_t) noexcept { ranges++; },
+        [&](uint64_t, uint64_t, const void*) noexcept { ranges++; },
         [&]() noexcept { completions++; });
     Check(ranges == 0 && completions == 2 &&
               tracker.IsRegionGpuModified(start, page_size) &&
@@ -465,7 +467,7 @@ void BenchmarkCleanUploads() {
   auto *memory = AllocateFixedGuestRange(size, 0);
   const auto address = reinterpret_cast<uint64_t>(memory);
   tracker.ForEachUploadRange(address, size, false,
-                             [](uint64_t, uint64_t) noexcept {},
+                             [](uint64_t, uint64_t, const void*) noexcept {},
                              []() noexcept {});
   std::puts("chunk_bytes,sweeps,calls,elapsed_ns,ns_per_sweep,ns_per_call");
   for (const uint64_t chunk : {size, Libs::Graphics::TRACKER_REGION_SIZE,
@@ -480,7 +482,7 @@ void BenchmarkCleanUploads() {
       for (uint64_t offset = 0; offset < size; offset += chunk) {
         tracker.ForEachUploadRange(
             address + offset, chunk, false,
-            [&](uint64_t, uint64_t) noexcept { ranges++; },
+            [&](uint64_t, uint64_t, const void*) noexcept { ranges++; },
             [&]() noexcept { completions++; });
       }
       sweeps++;
@@ -509,7 +511,7 @@ void TestRangeInvalidation() {
   const auto address = reinterpret_cast<uint64_t>(memory);
 
   tracker.ForEachUploadRange(
-      address, size, true, [](uint64_t, uint64_t) noexcept {},
+      address, size, true, [](uint64_t, uint64_t, const void*) noexcept {},
       []() noexcept {});
   Check(tracker.IsRegionGpuModified(address, size) && !IsWritable(memory),
         "range invalidation setup did not establish GPU ownership");
@@ -540,7 +542,7 @@ void TestGpuReacquisitionAfterInvalidation() {
   const auto address = reinterpret_cast<uint64_t>(memory);
 
   tracker.ForEachUploadRange(
-      address, page_size, true, [](uint64_t, uint64_t) noexcept {},
+      address, page_size, true, [](uint64_t, uint64_t, const void*) noexcept {},
       []() noexcept {});
   Check(tracker.IsRegionGpuModified(address, page_size) &&
             !tracker.IsRegionCpuModified(address, page_size),
@@ -554,7 +556,7 @@ void TestGpuReacquisitionAfterInvalidation() {
     reacquire.acquire();
     tracker.ForEachUploadRange(
         address + 16, 32, true,
-        [&](uint64_t, uint64_t) noexcept { uploads++; }, []() noexcept {});
+        [&](uint64_t, uint64_t, const void*) noexcept { uploads++; }, []() noexcept {});
     reacquired.release();
   });
   tracker.InvalidateRegion(address + 16, 32, [&] {
@@ -587,7 +589,7 @@ void TestGpuDirtyBits() {
   const auto address = reinterpret_cast<uint64_t>(memory);
 
   tracker.ForEachUploadRange(
-      address, page_size, true, [](uint64_t, uint64_t) noexcept {},
+      address, page_size, true, [](uint64_t, uint64_t, const void*) noexcept {},
       []() noexcept {});
   Check(tracker.IsRegionGpuModified(address, page_size) &&
             !tracker.IsRegionGpuModified(address + page_size, page_size) &&
@@ -611,7 +613,7 @@ void TestExactDirtyIntervalsSharingTrackerPage() {
   const auto address = reinterpret_cast<uint64_t>(memory);
 
   tracker.ForEachUploadRange(
-      address, page_size, false, [](uint64_t, uint64_t) noexcept {},
+      address, page_size, false, [](uint64_t, uint64_t, const void*) noexcept {},
       []() noexcept {});
   RangeSet exact_dirty;
   exact_dirty.Add(address + 64, 16);
@@ -656,7 +658,7 @@ void TestGpuDownloadProtectionMirrors() {
   const auto address = reinterpret_cast<uint64_t>(memory);
 
   tracker.ForEachUploadRange(
-      address, page_size * 4, false, [](uint64_t, uint64_t) noexcept {},
+      address, page_size * 4, false, [](uint64_t, uint64_t, const void*) noexcept {},
       []() noexcept {});
   tracker.MarkRegionAsGpuModified(address + 16, 32);
   tracker.MarkRegionAsGpuModified(address + page_size * 2 + 16, 32);
@@ -735,7 +737,7 @@ void TestCrossRegionUpload() {
     uint32_t ranges = 0;
     tracker.ForEachUploadRange(
         boundary - page_size, page_size * 2, is_written,
-        [&](uint64_t start, uint64_t size) noexcept {
+        [&](uint64_t start, uint64_t size, const void*) noexcept {
           Check(start == boundary - page_size + ranges * page_size &&
                     size == page_size,
                 "cold upload did not visit both region boundaries exactly");
@@ -781,7 +783,7 @@ void TestConcurrentColdUploads() {
       uint32_t ranges = 0;
       tracker.ForEachUploadRange(
           page, page_size, true,
-          [&](uint64_t upload_address, uint64_t upload_size) noexcept {
+          [&](uint64_t upload_address, uint64_t upload_size, const void*) noexcept {
             Check(upload_address == page && upload_size == page_size,
                   "concurrent cold upload lost its dirty page");
             ranges++;
@@ -838,7 +840,7 @@ void TestUploadDoesNotSerializeDisjointRegion() {
   std::atomic_bool query_result{false};
   std::jthread uploader([&] {
     tracker.ForEachUploadRange(
-        allocation_base, page_size, true, [](uint64_t, uint64_t) noexcept {},
+        allocation_base, page_size, true, [](uint64_t, uint64_t, const void*) noexcept {},
         [&]() noexcept {
           upload_entered.release();
           finish_upload.acquire();
@@ -880,10 +882,10 @@ void TestDownloadDoesNotSerializeDisjointRegion() {
         "test allocation does not span two tracker regions");
 
   tracker.ForEachUploadRange(
-      allocation_base, page_size, true, [](uint64_t, uint64_t) noexcept {},
+      allocation_base, page_size, true, [](uint64_t, uint64_t, const void*) noexcept {},
       []() noexcept {});
   tracker.ForEachUploadRange(
-      second_region, page_size, false, [](uint64_t, uint64_t) noexcept {},
+      second_region, page_size, false, [](uint64_t, uint64_t, const void*) noexcept {},
       []() noexcept {});
 
   std::binary_semaphore download_entered{0};
@@ -940,7 +942,7 @@ void TestGpuUnmarkUsesRegionMask() {
 
   const auto sparse_begin = region_base + page_size;
   tracker.ForEachUploadRange(
-      sparse_begin, page_size * 3, false, [](uint64_t, uint64_t) noexcept {},
+      sparse_begin, page_size * 3, false, [](uint64_t, uint64_t, const void*) noexcept {},
       []() noexcept {});
   tracker.MarkRegionAsGpuModified(sparse_begin, page_size);
   tracker.MarkRegionAsGpuModified(sparse_begin + page_size * 2, page_size);
@@ -966,7 +968,7 @@ void TestGpuUnmarkUsesRegionMask() {
   const auto boundary = region_base + region_size;
   const auto cross_begin = boundary - page_size;
   tracker.ForEachUploadRange(
-      cross_begin, page_size * 2, false, [](uint64_t, uint64_t) noexcept {},
+      cross_begin, page_size * 2, false, [](uint64_t, uint64_t, const void*) noexcept {},
       []() noexcept {});
   tracker.MarkRegionAsGpuModified(cross_begin, page_size * 2);
   ResetProtectionLog();
@@ -999,7 +1001,7 @@ void TestFullRegionGpuUnmarkBatching() {
         "test allocation does not contain a complete tracker region");
 
   tracker.ForEachUploadRange(
-      region_base, region_size, false, [](uint64_t, uint64_t) noexcept {},
+      region_base, region_size, false, [](uint64_t, uint64_t, const void*) noexcept {},
       []() noexcept {});
   tracker.MarkRegionAsGpuModified(region_base, region_size);
   Check(tracker.IsRegionGpuModified(region_base, region_size) &&
@@ -1035,12 +1037,12 @@ void TestFullRegionGpuUnmarkBatching() {
   const auto address = reinterpret_cast<uint64_t>(memory);
   if (std::strcmp(name, "gpu-dirty-explicit-cpu") == 0) {
     tracker.ForEachUploadRange(
-        address, page_size, true, [](uint64_t, uint64_t) noexcept {},
+        address, page_size, true, [](uint64_t, uint64_t, const void*) noexcept {},
         []() noexcept {});
     tracker.MarkRegionAsCpuModified(address, page_size);
   } else if (std::strcmp(name, "reentrant-upload") == 0) {
     tracker.ForEachUploadRange(
-        address, page_size, true, [](uint64_t, uint64_t) noexcept {},
+        address, page_size, true, [](uint64_t, uint64_t, const void*) noexcept {},
         [&]() noexcept {
           (void)tracker.IsRegionCpuModified(address, page_size);
         });
@@ -1189,6 +1191,98 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
 
 } // namespace Libs::LibKernel::Memory
 
+// Hot-page content hashing: the remembered hash must describe the bytes the GPU holds. Covers the
+// A -> B -> A interleaving (guest write between hashing and copying), demotion followed by an
+// unhashed upload and re-promotion with the old content, and the upload-from-snapshot contract
+// (second review, 2026-10-12).
+void TestHotPageSnapshotHash() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  constexpr uint64_t page = Libs::Graphics::TRACKER_PAGE_SIZE;
+  uint8_t *memory = Allocate(harness.page_manager, 16);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  std::vector<uint8_t> gpu(page, 0);
+  struct Emitted { uint64_t address; uint64_t size; const void *snapshot; };
+  std::vector<Emitted> emitted;
+  // One sync: the "GPU" copies each emitted range from the snapshot when given, else from guest
+  // memory. `between` runs after the ranges were emitted and before the copy (a racing writer).
+  auto sync = [&](const std::function<void()> &between = {}) {
+    emitted.clear();
+    tracker.ForEachUploadRange(
+        address, page, false,
+        [&](uint64_t upload_address, uint64_t upload_size, const void *snapshot) noexcept {
+          emitted.push_back({upload_address, upload_size, snapshot});
+        },
+        [&]() noexcept {
+          if (between) between();
+          for (const auto &range : emitted) {
+            const auto *source = range.snapshot != nullptr
+                                     ? static_cast<const uint8_t *>(range.snapshot)
+                                     : reinterpret_cast<const uint8_t *>(range.address);
+            std::memcpy(gpu.data() + (range.address - address), source, range.size);
+          }
+        });
+  };
+  auto fill = [&](uint8_t value) { std::memset(memory, value, page); };
+  auto gpu_is = [&](uint8_t value) {
+    return std::all_of(gpu.begin(), gpu.end(), [value](uint8_t b) { return b == value; });
+  };
+
+  // Promote the page: KYTY_HOT_PAGE_FAULTS (default 8) CPU-dirty transitions.
+  fill(0xA1);
+  for (int i = 0; i < 8; i++) {
+    tracker.MarkRegionAsCpuModified(address, page);
+    sync();
+  }
+  Check(gpu_is(0xA1), "hot promotion uploads did not deliver the page");
+  // Hot pages stay dirty: an unchanged page is skipped, a changed one uploaded.
+  sync();
+  Check(emitted.empty() && gpu_is(0xA1), "unchanged hot page was uploaded again");
+  fill(0xB2);
+  sync();
+  Check(emitted.size() == 1 && emitted[0].snapshot != nullptr && gpu_is(0xB2),
+        "changed hot page was not uploaded from a snapshot");
+
+  // A -> B -> A: a guest write between the hash and the copy must not leave the GPU with bytes
+  // the remembered hash does not describe. The snapshot was taken at hash time, so the GPU gets
+  // A (what was hashed); the later guest content B is uploaded by the next sync.
+  fill(0xA1);
+  sync([&] { fill(0xC3); });
+  Check(emitted.size() == 1 && gpu_is(0xA1), "snapshot upload did not deliver the hashed bytes");
+  sync();
+  Check(emitted.size() == 1 && gpu_is(0xC3), "content written during the copy was not uploaded");
+  fill(0xA1);
+  sync();
+  Check(emitted.size() == 1 && gpu_is(0xA1), "return to an older content was skipped (stale hash)");
+
+  // Demotion (KYTY_HOT_DEMOTE_SYNCS=3 set in main) forgets the hash. A clean page is
+  // write-protected, so, like the fault handler would, mark it CPU-dirty before writing to it.
+  sync();
+  sync();
+  sync();
+  Check(emitted.empty() && gpu_is(0xA1), "unchanged syncs before demotion uploaded");
+  tracker.MarkRegionAsCpuModified(address, page);
+  fill(0xB2);
+  sync(); // the demotion sync: the page leaves the hot set and is uploaded as a plain range
+  Check(emitted.size() == 1 && emitted[0].snapshot == nullptr && gpu_is(0xB2),
+        "demoted page was not uploaded as a plain (unhashed) range");
+  for (int i = 0; i < 7; i++) {
+    tracker.MarkRegionAsCpuModified(address, page);
+    sync();
+    Check(gpu_is(0xB2), "plain re-upload of the demoted page failed");
+  }
+  // The 8th transition re-promotes the page; its content is the old hashed A again. Without the
+  // demotion invalidation the stale H(A) would match and the upload would be skipped (GPU = B).
+  tracker.MarkRegionAsCpuModified(address, page);
+  fill(0xA1);
+  sync();
+  Check(emitted.size() == 1 && emitted[0].snapshot != nullptr && gpu_is(0xA1),
+        "re-promotion with the previously hashed content skipped the upload (stale hash)");
+  sync();
+  Check(emitted.empty() && gpu_is(0xA1), "re-promoted page was not skipped when unchanged");
+  Release(memory);
+}
+
 int main(int argc, char **argv) {
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
@@ -1197,8 +1291,10 @@ int main(int argc, char **argv) {
     BenchmarkCleanUploads();
     return 0;
   }
+  setenv("KYTY_HOT_DEMOTE_SYNCS", "3", 1); // read once, by the first sync that sees a hot page
   TestGuestRange();
   TestRangeSet();
+  TestHotPageSnapshotHash();
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();

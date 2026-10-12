@@ -147,10 +147,11 @@ public:
 	template <typename RangeFunc, typename UploadFunc>
 	void ForEachUploadRange(uint64_t vaddr, uint64_t size, bool is_written, RangeFunc&& range_func,
 	                        UploadFunc&& upload_func) {
-		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
+		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t, const void*>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		CheckNotInUploadCallback();
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
+		RegionManager::ResetSnapshots();
 		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			manager->lock.lock();
 			manager->ForEachModifiedRange<DirtySource::Cpu, true, /*filter_hot=*/true>(
@@ -163,17 +164,10 @@ public:
 		if (is_written) {
 			Iterate<false>(vaddr, size,
 			               [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-				               manager->VerifyUploadHashes();
 				               manager->template ChangeState<DirtySource::Gpu, true>(
 				                   manager->GetCpuAddr() + offset, bytes);
 				               manager->lock.unlock();
 			               });
-		} else {
-			Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t, uint64_t) {
-				manager->lock.lock();
-				manager->VerifyUploadHashes();
-				manager->lock.unlock();
-			});
 		}
 		s_upload_owner = previous_upload_owner;
 	}

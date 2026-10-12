@@ -10,6 +10,7 @@
 #include <array>
 #include <vector>
 #include <mutex>
+#include <cstring>
 #include <utility>
 
 #if defined(_MSC_VER)
@@ -208,6 +209,7 @@ public:
 								m_hot.Unset(page);
 								m_fault_counts[page] = 0;
 								m_unchanged[page]    = 0;
+								m_hash_valid.Unset(page); // non-hot uploads bypass the hash: forget it
 								s_hot_stats.demoted++;
 								continue;
 							}
@@ -222,6 +224,10 @@ public:
 					// The GPU takes ownership (written binding): the pages leave the hot set.
 					m_hot.UnsetRange(start, end);
 					for (auto page = start; page < end; ++page) m_fault_counts[page] = 0;
+					if (m_hot.None() && m_has_hot.exchange(false, std::memory_order_acq_rel) &&
+					    m_hot_region_count != nullptr) {
+						m_hot_region_count->fetch_sub(1, std::memory_order_acq_rel);
+					}
 				}
 			}
 			if constexpr (source == DirtySource::Cpu) {
@@ -234,6 +240,9 @@ public:
 			if constexpr (filter_hot && source == DirtySource::Cpu) {
 				EmitUploadRun(first, last, func);
 			} else {
+				if constexpr (source == DirtySource::Cpu) {
+					m_hash_valid.UnsetRange(first, last); // uploaded without a hash
+				}
 				func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
 			}
 		}
@@ -259,29 +268,12 @@ public:
 	}
 	static HotPageStats TakeHotStats() { return std::exchange(s_hot_stats, {}); }
 
-	// The hash is taken before the upload copies the page (the copy happens in the caller's
-	// upload callback). A CPU write in between leaves a hash that does not describe the uploaded
-	// bytes, and a later write back to the hashed content would then be skipped. Re-hash after
-	// the copy and forget hashes that no longer match. Caller holds `lock`.
-	void VerifyUploadHashes() {
-		if (m_hash_pending.empty()) {
-			return;
-		}
-		if (m_page_hash != nullptr) {
-			for (const auto page: m_hash_pending) {
-				if (!m_hash_valid.Get(page)) {
-					continue;
-				}
-				const auto now = HashTrackerPage(
-				    reinterpret_cast<const void*>(m_cpu_addr + page * TRACKER_PAGE_SIZE));
-				if (now != (*m_page_hash)[page]) {
-					m_hash_valid.Unset(page);
-					s_hot_stats.invalidated++;
-				}
-			}
-		}
-		m_hash_pending.clear();
-	}
+	// Upload snapshots (GPU thread): immutable copies of the changed hot pages emitted by one
+	// MemoryTracker::ForEachUploadRange call. The remembered hash is the snapshot's hash and the
+	// upload copies the snapshot, so the hash always describes the bytes the GPU holds; a guest
+	// write between hashing and copying (A -> B -> A, review 2026-10-12) can no longer leave a
+	// stale "unchanged" verdict. Reset at the start of every upload call.
+	static void ResetSnapshots() { s_snapshot_used = 0; }
 
 	// Buffer created or destroyed over this range: its GPU copy is new, so no hash is current.
 	void InvalidatePageHashes(uint64_t vaddr, uint64_t size) {
@@ -290,28 +282,48 @@ public:
 	}
 
 private:
-	// Emits the upload ranges of one dirty run, skipping hot pages whose XXH3 equals the hash
-	// taken at their previous upload. Caller holds `lock`; hot pages are writable, so reading
-	// them cannot fault.
+	static uint8_t* TakeSnapshotPage() {
+		if (s_snapshot_used == s_snapshot_pool.size()) {
+			s_snapshot_pool.push_back(std::make_unique<std::array<uint8_t, TRACKER_PAGE_SIZE>>());
+		}
+		return s_snapshot_pool[s_snapshot_used++]->data();
+	}
+	static void ReleaseSnapshotPage() { --s_snapshot_used; }
+
+	// Emits the upload ranges of one dirty run as func(address, bytes, snapshot): snapshot is
+	// null for plain guest memory, or the immutable copy to upload for a changed hot page. Hot
+	// pages whose snapshot hash equals the hash remembered at their previous upload are skipped.
+	// Caller holds `lock`; hot pages are writable, so reading them cannot fault.
 	template <typename Func>
 	void EmitUploadRun(size_t first, size_t last, Func&& func) {
 		if (!HotHashEnabled() || !HasHotPages()) {
-			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
+			m_hash_valid.UnsetRange(first, last); // uploaded without a hash
+			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE,
+			     nullptr);
 			return;
 		}
-		size_t run_begin = first;
+		size_t     run_begin = first;
+		const auto flush_run = [&](size_t end) {
+			if (run_begin < end) {
+				func(m_cpu_addr + run_begin * TRACKER_PAGE_SIZE,
+				     (end - run_begin) * TRACKER_PAGE_SIZE, nullptr);
+			}
+		};
 		for (size_t page = first; page < last; ++page) {
-			if (!m_hot.Get(page)) continue;
-			const auto hash =
-			    HashTrackerPage(reinterpret_cast<const void*>(m_cpu_addr + page * TRACKER_PAGE_SIZE));
+			if (!m_hot.Get(page)) {
+				m_hash_valid.Unset(page); // uploaded below without a hash: the old one is stale
+				continue;
+			}
+			auto* snapshot = TakeSnapshotPage();
+			std::memcpy(snapshot, reinterpret_cast<const void*>(m_cpu_addr + page * TRACKER_PAGE_SIZE),
+			            TRACKER_PAGE_SIZE);
+			const auto hash = HashTrackerPage(snapshot);
 			s_hot_stats.hashed++;
 			if (m_hash_valid.Get(page) && m_page_hash != nullptr && (*m_page_hash)[page] == hash) {
 				if (m_unchanged[page] < 255) ++m_unchanged[page];
 				s_hot_stats.skipped++;
-				if (run_begin < page) {
-					func(m_cpu_addr + run_begin * TRACKER_PAGE_SIZE,
-					     (page - run_begin) * TRACKER_PAGE_SIZE);
-				}
+				ReleaseSnapshotPage();
+				flush_run(page);
 				run_begin = page + 1;
 				continue;
 			}
@@ -321,11 +333,11 @@ private:
 			(*m_page_hash)[page] = hash;
 			m_hash_valid.Set(page);
 			m_unchanged[page] = 0;
-			m_hash_pending.push_back(static_cast<uint32_t>(page));
+			flush_run(page);
+			func(m_cpu_addr + page * TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE, snapshot);
+			run_begin = page + 1;
 		}
-		if (run_begin < last) {
-			func(m_cpu_addr + run_begin * TRACKER_PAGE_SIZE, (last - run_begin) * TRACKER_PAGE_SIZE);
-		}
+		flush_run(last);
 	}
 
 public:
@@ -360,9 +372,11 @@ private:
 	// Hot-page content tracking (GPU thread, under `lock`).
 	std::unique_ptr<std::array<uint64_t, TRACKER_REGION_PAGES>> m_page_hash;
 	RegionBits                                                  m_hash_valid;
-	std::vector<uint32_t>                                       m_hash_pending;
 	std::array<uint8_t, TRACKER_REGION_PAGES>                   m_unchanged {};
 	inline static HotPageStats                                  s_hot_stats {};
+	inline static thread_local std::vector<std::unique_ptr<std::array<uint8_t, TRACKER_PAGE_SIZE>>>
+	                                        s_snapshot_pool;
+	inline static thread_local size_t      s_snapshot_used = 0;
 	template <bool track, bool is_read>
 	void UpdateProtection() {
 		const auto protection = is_read ? ~m_gpu_dirty : m_cpu_dirty;
