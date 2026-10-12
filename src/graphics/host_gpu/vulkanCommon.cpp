@@ -4,6 +4,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/renderer/gpuDiagnostics.h"
 
+#include <spirv-tools/optimizer.hpp>
 #include <array>
 #include <chrono>
 #include <thread>
@@ -12,6 +13,7 @@
 #include <atomic>
 #include <vector>
 #include <cstdio>
+#include <cstdlib>
 #include <cinttypes>
 
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
@@ -133,7 +135,37 @@ void RequireVulkanSuccess(vk::Result result, const char* operation) {
 	}
 }
 
+// KYTY_SPIRV_OPT=1 (probe): run SPIRV-Tools' performance passes on every module before the driver
+// sees it. Off by default; A/B material for driver compile time and GPU throughput.
+static bool SpirvOptEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SPIRV_OPT");
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
+	}();
+	return enabled;
+}
+
 vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device) {
+	std::vector<uint32_t> optimized;
+	if (SpirvOptEnabled()) {
+		const auto         start = std::chrono::steady_clock::now();
+		spvtools::Optimizer optimizer(SPV_ENV_VULKAN_1_3);
+		optimizer.SetMessageConsumer([](spv_message_level_t, const char*, const spv_position_t&,
+		                                const char* message) { std::printf("spirv-opt: %s\n", message); });
+		optimizer.RegisterPerformancePasses();
+		const bool ok = optimizer.Run(code.data(), code.size(), &optimized, spvtools::ValidatorOptions(),
+		                              /*skip_validation=*/true);
+		const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+		static std::atomic<uint32_t> reports {0};
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 100 || !ok) {
+			std::printf("spirv-opt: %s %zu -> %zu words in %.1f ms\n", ok ? "ok" : "FAILED (original kept)",
+			            code.size(), ok ? optimized.size() : code.size(), ms);
+			std::fflush(stdout);
+		}
+		if (ok && !optimized.empty()) {
+			code = optimized;
+		}
+	}
 	vk::ShaderModuleCreateInfo create_info {};
 	create_info.codeSize    = code.size_bytes();
 	create_info.pCode       = code.data();
