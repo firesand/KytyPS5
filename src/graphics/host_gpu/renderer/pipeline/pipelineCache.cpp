@@ -561,6 +561,8 @@ void PipelineCache::InitializeDriverCache() {
 				PipelineCacheLog(
 				    "Vulkan pipeline cache: invalidating {} (driver, emulator, or data mismatch)",
 				    path);
+			} else {
+				m_saved_payload_hash = payload_hash;
 			}
 		} else {
 			file.Close();
@@ -623,6 +625,12 @@ void PipelineCache::Save(bool final) {
 	payload.resize(size);
 	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
 	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
+	if (!final && payload_hash == m_saved_payload_hash) {
+		// Pipelines were created from cached blobs only: the driver data on disk is current.
+		m_unsaved_pipelines = 0;
+		m_last_save         = std::chrono::steady_clock::now();
+		return;
+	}
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
@@ -647,8 +655,9 @@ void PipelineCache::Save(bool final) {
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}{}", payload.size(),
 	                 Common::PathToString(m_driver_cache_path), final ? "" : " (periodic)");
-	m_unsaved_pipelines = 0;
-	m_last_save         = std::chrono::steady_clock::now();
+	m_unsaved_pipelines  = 0;
+	m_last_save          = std::chrono::steady_clock::now();
+	m_saved_payload_hash = payload_hash;
 	if (final) {
 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 		m_driver_cache = nullptr;

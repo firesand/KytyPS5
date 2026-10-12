@@ -187,6 +187,7 @@ private:
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	uint32_t                              m_unsaved_pipelines = 0;
 	std::chrono::steady_clock::time_point m_last_save {};
+	uint64_t                              m_saved_payload_hash = 0; // last blob on disk
 	static inline std::atomic<PipelineCache*> s_live {nullptr};
 
 	void InitializeDriverCache();
