@@ -547,6 +547,10 @@ static bool ResolveTextureMipView(const TileSurfaceDescription& description, boo
 	return false;
 }
 
+// Shader whose image bindings are being resolved (set by the two binding loops), for the
+// NullStorageImage report.
+static thread_local uint64_t s_resolving_shader = 0;
+
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
@@ -565,9 +569,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			// image): loud, once per descriptor slot (rendering-defect workflow 2026-10-13, F0).
 			static std::atomic<uint32_t> reported {0};
 			if (reported.fetch_add(1, std::memory_order_relaxed) < 32) {
-				LOGF("NullStorageImage: descriptor_index=%u written=%d read=%d atomic=%d\n",
-				     resource.descriptor_index, resource.written ? 1 : 0, resource.read ? 1 : 0,
-				     resource.atomic ? 1 : 0);
+				LOGF("NullStorageImage: shader=0x%016" PRIx64 " descriptor_index=%u written=%d read=%d "
+				     "atomic=%d\n",
+				     s_resolving_shader, resource.descriptor_index, resource.written ? 1 : 0,
+				     resource.read ? 1 : 0, resource.atomic ? 1 : 0);
 			}
 		}
 		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
@@ -802,6 +807,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.images.resize(program.info.images.size());
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
+	s_resolving_shader = program.shader_hash;
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
@@ -982,6 +988,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	EXIT_IF(images.size() != program.info.images.size());
 	auto& texture_cache = m_context.GetTextureCache();
 	// Acquire each view before a later overlapping descriptor can replace its image.
+		s_resolving_shader = program.shader_hash;
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		const auto old_image = texture_cache.m_slot_images.try_get(images[i].image_id);
 		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
