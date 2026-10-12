@@ -1159,9 +1159,10 @@ void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_
 // pass marked them, i.e. stale CPU bytes (audit 2026-10-12; UE5 loaders wait on such results).
 // While such writes are pending the store is deferred behind the write-fault pass (priority
 // order) and performed on the GPU thread, so a protected page takes the tracker's merge path.
-// KYTY_EOP_LABEL_DEFER=1 enables the deferred store; it is off by default: the first version
-// (58c4a83) cost most of the frame rate and the second (498d034) froze the boot and died on a
-// null host write at t=104 s (ng-27), so it needs more work before it can be the default.
+// KYTY_EOP_LABEL_DEFER=1 enables the deferred store (off by default until validated): v1 (58c4a83)
+// hopped through the GPU thread's command queue and lost most of the frame rate; v2 (498d034)
+// called BufferCache::InvalidateMemory from the priority thread (readback path) and crashed; v3
+// writes through the backing mapping and only marks the tracker.
 template <typename T>
 void CommandProcessor::WriteEopLabel(T* dst, T value) {
 	static const bool defer = [] {
@@ -1182,9 +1183,9 @@ void CommandProcessor::WriteEopLabel(T* dst, T value) {
 		// a GPU-dirty page goes through the GPU thread so the store takes the merge path. Either
 		// way wake the GPU thread: a WAIT_REG_MEM on this label retries only every 100 ms.
 		const auto address = reinterpret_cast<uint64_t>(dst);
-		if (!cache.IsRegionGpuModified(address, sizeof(T))) {
-			LibKernel::Memory::WriteBacking(address, &value, sizeof(T));
-			cache.InvalidateMemory(address, sizeof(T));
+		if (!cache.IsRegionGpuModified(address, sizeof(T)) &&
+		    LibKernel::Memory::TryWriteBacking(address, &value, sizeof(T))) {
+			cache.MarkLabelWritten(address, sizeof(T)); // tracker only: no readback off the GPU thread
 			gpu->Wake();
 			return;
 		}

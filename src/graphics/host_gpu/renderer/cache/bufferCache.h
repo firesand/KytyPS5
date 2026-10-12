@@ -63,6 +63,11 @@ public:
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// A host-side label store from a non-GPU thread: tracker-only CPU-modified mark (no readback,
+	// no scheduler access), safe from the priority thread.
+	void MarkLabelWritten(uint64_t vaddr, uint64_t size) {
+		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+	}
 
 	// Write-fault entry: InvalidateMemory with the fault-ahead window (see MemoryTracker).
 
