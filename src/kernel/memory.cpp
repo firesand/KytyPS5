@@ -2371,7 +2371,7 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 		return KERNEL_ERROR_EBUSY;
 	}
 
-	LOGF("\t in_addr  = 0x%016" PRIx64 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t in_addr  = 0x%016" PRIx64 "\n"
 	     "\t out_addr = 0x%016" PRIx64 "\n"
 	     "\t size     = %" PRIu64 "\n"
 	     "\t mode     = %s\n"
@@ -3151,7 +3151,7 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		shared_reason = GuestBackingStore::GetFailureReasonName(shared_failure);
 	}
 
-	LOGF("\t in_addr  = 0x%016" PRIx64 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t in_addr  = 0x%016" PRIx64 "\n"
 	     "\t out_addr = 0x%016" PRIx64 "\n"
 	     "\t dmem     = 0x%016" PRIx64 "\n"
 	     "\t size     = 0x%016" PRIx64 "\n"
@@ -3518,7 +3518,7 @@ int KYTY_SYSV_ABI KernelReserveVirtualRange(void** addr, size_t len, int flags, 
 
 	const auto in_addr = (addr != nullptr ? reinterpret_cast<uint64_t>(*addr) : 0);
 
-	LOGF("\t in_addr   = 0x%016" PRIx64 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t in_addr   = 0x%016" PRIx64 "\n"
 	     "\t len       = 0x%016" PRIx64 "\n"
 	     "\t flags     = 0x%08" PRIx32 "\n"
 	     "\t alignment = 0x%016" PRIx64 "\n",
@@ -3981,7 +3981,7 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
-	LOGF("\t entries         = %p\n"
+	if (::Log::VerboseEnabled()) LOGF("\t entries         = %p\n"
 	     "\t num_entries     = %d\n"
 	     "\t num_entries_out = %p\n"
 	     "\t flags           = 0x%08" PRIx32 "\n",
@@ -4005,7 +4005,7 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 	for (int i = 0; i < num_entries; i++, processed++) {
 		auto* entry = &entries[i];
 
-		LOGF("\t [%d] start = %p, offset = 0x%016" PRIx64 ", length = 0x%016" PRIx64
+		if (::Log::VerboseEnabled()) LOGF("\t [%d] start = %p, offset = 0x%016" PRIx64 ", length = 0x%016" PRIx64
 		     ", prot = 0x%02" PRIx32 ", type = 0x%02" PRIx32 ", op = %d\n",
 		     i, entry->start, entry->offset, entry->length,
 		     static_cast<uint32_t>(entry->protection), static_cast<uint32_t>(entry->type),

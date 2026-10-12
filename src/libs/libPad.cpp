@@ -249,7 +249,7 @@ static int KYTY_SYSV_ABI MouseClose(int32_t handle) {
 static int KYTY_SYSV_ABI MouseRead(int32_t handle, MouseData* data, int32_t num) {
 	PRINT_NAME();
 
-	LOGF("\t handle = %" PRId32 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t handle = %" PRId32 "\n"
 	     "\t data   = 0x%016" PRIx64 "\n"
 	     "\t num    = %" PRId32 "\n",
 	     handle, reinterpret_cast<uint64_t>(data), num);
@@ -346,7 +346,7 @@ static int KYTY_SYSV_ABI KeyboardClose(int32_t handle) {
 static int KYTY_SYSV_ABI KeyboardRead(int32_t handle, KeyboardData* data, int32_t num) {
 	PRINT_NAME();
 
-	LOGF("\t handle = %" PRId32 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t handle = %" PRId32 "\n"
 	     "\t data   = 0x%016" PRIx64 "\n"
 	     "\t num    = %" PRId32 "\n",
 	     handle, reinterpret_cast<uint64_t>(data), num);

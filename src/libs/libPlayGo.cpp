@@ -10,6 +10,7 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <atomic>
 
 namespace Libs {
 
@@ -140,11 +141,22 @@ int KYTY_SYSV_ABI PlayGoClose(int handle) {
 	return OK;
 }
 
+// Zero Company polled a handle-only stub about 1.25 million times per second for 15 s at
+// start-up (19 M log lines); report call bursts instead of logging every call.
+static void LogCallBurst(const char* name, std::atomic<uint64_t>& calls) {
+	const auto count = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (count % 100000 == 0) {
+		LOGF("%s: called %" PRIu64 " times\n", name, count);
+	}
+}
+
 int KYTY_SYSV_ABI PlayGoGetLocus(int handle, const uint16_t* chunk_ids, uint32_t number_of_entries,
                                  int8_t* out_loci) {
 	PRINT_NAME();
 
-	LOGF("\t handle = %d\n", handle);
+	static std::atomic<uint64_t> calls {0};
+	LogCallBurst("PlayGoGetLocus", calls);
+	if (::Log::VerboseEnabled()) LOGF("\t handle = %d\n", handle);
 
 	if (auto ret = validate_handle(handle); ret != OK) {
 		return ret;
@@ -158,7 +170,7 @@ int KYTY_SYSV_ABI PlayGoGetLocus(int handle, const uint16_t* chunk_ids, uint32_t
 	ensure_chunks_loaded();
 
 	for (uint32_t i = 0; i < number_of_entries; i++) {
-		LOGF("\t chunk_ids[%u] = %" PRIu16 "\n", i, chunk_ids[i]);
+		if (::Log::VerboseEnabled()) LOGF("\t chunk_ids[%u] = %" PRIu16 "\n", i, chunk_ids[i]);
 
 		if (is_valid_chunk(chunk_ids[i])) {
 			out_loci[i] = PLAYGO_LOCUS_LOCAL_FAST;
@@ -173,7 +185,9 @@ int KYTY_SYSV_ABI PlayGoGetLocus(int handle, const uint16_t* chunk_ids, uint32_t
 int KYTY_SYSV_ABI PlayGoGetInstallSpeed(int handle, int32_t* out_speed) {
 	PRINT_NAME();
 
-	LOGF("\t handle = %d\n", handle);
+	static std::atomic<uint64_t> calls {0};
+	LogCallBurst("PlayGoGetInstallSpeed", calls);
+	if (::Log::VerboseEnabled()) LOGF("\t handle = %d\n", handle);
 
 	if (auto ret = validate_handle(handle); ret != OK) {
 		return ret;

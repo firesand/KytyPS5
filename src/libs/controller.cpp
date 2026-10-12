@@ -1225,10 +1225,21 @@ int KYTY_SYSV_ABI PadSetTriggerEffect(int handle, const PadTriggerEffectParam* p
 	return g_controller->SetTriggerEffect(*param) ? OK : PAD_ERROR_INVALID_ARG;
 }
 
+// Zero Company polled a handle-only stub about 1.25 million times per second for 15 s at
+// start-up (19 M log lines); report call bursts instead of logging every call.
+static void LogCallBurst(const char* name, std::atomic<uint64_t>& calls) {
+	const auto count = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (count % 100000 == 0) {
+		LOGF("%s: called %" PRIu64 " times\n", name, count);
+	}
+}
+
 int KYTY_SYSV_ABI PadGetTriggerEffectState(int handle, PadTriggerEffectStateInformation* info) {
 	PRINT_NAME();
 
-	LOGF("\t handle = %d\n", handle);
+	static std::atomic<uint64_t> calls {0};
+	LogCallBurst("PadGetTriggerEffectState", calls);
+	if (::Log::VerboseEnabled()) LOGF("\t handle = %d\n", handle);
 
 	if (const auto error = PadCheckHandle(handle); error != OK) {
 		return error;
