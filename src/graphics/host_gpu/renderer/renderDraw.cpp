@@ -1425,6 +1425,11 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		default: EXIT("unknown index_type_and_size: %u\n", args.index_type_and_size);
 	}
 	index_source.size = static_cast<uint64_t>(args.index_count) * index_source.guest_element_size;
+	// The host-side reads below (restart-marker scan, 8-bit widening) see GPU-built index data
+	// only once pending unbounded writes are published (host-read audit 2026-10-12).
+	if (args.index_addr != nullptr && index_source.size != 0) {
+		m_context.GetBufferCache().PrepareHostRead(index_source.address, index_source.size);
+	}
 	const bool primitive_restart = ResolvePrimitiveRestart(buffer, index_source);
 
 	std::vector<uint16_t> expanded_indices;

@@ -201,10 +201,9 @@ void GuestGpu::ReportBlockedQueues(double seconds) {
 		const auto& submission = queue.front();
 		const auto& why        = GetProcessor(id).LastSuspend();
 		uint64_t    value      = 0;
-		if (why.addr != 0 && why.size == sizeof(uint32_t)) {
-			value = *reinterpret_cast<const volatile uint32_t*>(why.addr);
-		} else if (why.addr != 0 && why.size == sizeof(uint64_t)) {
-			value = *reinterpret_cast<const volatile uint64_t*>(why.addr);
+		if (why.addr != 0 && (why.size == sizeof(uint32_t) || why.size == sizeof(uint64_t))) {
+			// Backing read: a page-fault download must not run under m_queue_mutex (diagnostic).
+			(void)LibKernel::Memory::TryReadBacking(why.addr, &value, why.size);
 		}
 		const auto where = why.addr != 0 ? m_renderer.GetBufferCache().DescribeBufferAt(why.addr)
 		                                 : std::string {};
