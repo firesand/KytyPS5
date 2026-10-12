@@ -168,6 +168,8 @@ private:
 	                      void* dst_gpu_addr, T value, uint32_t interrupt_selector,
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution);
+	template <typename T>
+	void WriteEopLabel(T* dst, T value);
 	void SuspendPm4();
 	void SuspendPm4(const char* kind, uint64_t addr = 0, uint64_t ref = 0, uint64_t mask = 0,
 	                uint32_t func = 0, uint32_t size = 0);

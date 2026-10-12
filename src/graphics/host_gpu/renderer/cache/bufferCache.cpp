@@ -817,8 +817,11 @@ void BufferCache::MarkWriteFaultOverflow() {
 void BufferCache::FlushWriteFaults(bool wait) {
 	if (m_write_faults_dirty && m_scheduler.Active()) {
 		m_write_faults_dirty = false;
-		m_write_fault_tick   = m_scheduler.CurrentTick();
 		m_fault_manager.ProcessWriteFaultBuffer();
+		// Taken after Process(): reusing a slot can submit the open buffer, which moves the
+		// compress pass and its mark operation to the next tick (audit 2026-10-12: a host read
+		// then waited one tick too early and parsed pages before they were protected).
+		m_write_fault_tick = m_scheduler.CurrentTick();
 	}
 	if (!wait || m_write_fault_tick == 0) {
 		return;

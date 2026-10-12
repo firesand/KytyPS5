@@ -102,6 +102,10 @@ public:
 	// 528 MiB clamped range at bind time, which made every CPU access to the heap fault).
 	void NoteUnboundedWrite(uint64_t vaddr, uint64_t size) { m_write_fault_ranges.Add(vaddr, size); }
 	void MarkWriteFaultsDirty() { m_write_faults_dirty = true; }
+	// Unbounded-heap GPU writes recorded or in flight whose pages are not yet marked GPU-dirty.
+	[[nodiscard]] bool HasPendingUnboundedWrites() const noexcept {
+		return m_write_faults_dirty || m_write_fault_tick != 0;
+	}
 	void FlushWriteFaults(bool wait);
 	// Before the host reads guest memory that unbounded writes may have touched.
 	void PrepareHostRead(uint64_t vaddr, uint64_t size);

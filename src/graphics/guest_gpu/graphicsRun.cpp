@@ -751,8 +751,10 @@ void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands,
 	if (!commands.empty() && !LooksLikePm4Header(commands[0])) {
 		const auto first = commands[0];
 		GetScheduler().Current().EndRendering();
+		// A fresh write-fault pass over everything written so far, waited to completion including
+		// the priority operation that marks the pages; the re-read below then faults and downloads.
+		m_renderer.GetBufferCache().MarkWriteFaultsDirty();
 		m_renderer.GetBufferCache().FlushWriteFaults(true);
-		GetScheduler().Wait(GetScheduler().CurrentTick());
 		m_renderer.GetBufferCache().OnCommandBoundary();
 		static std::atomic<uint32_t> reports {0};
 		if (reports.fetch_add(1, std::memory_order_relaxed) < 50) {
@@ -1147,6 +1149,31 @@ void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_
 	                                      static_cast<int>(display_buffer_index));
 }
 
+// End-of-pipe labels used to be stored at record time. With lazily tracked unbounded-heap GPU
+// writes in flight, a poller could then see "done" and read result pages before the write-fault
+// pass marked them, i.e. stale CPU bytes (audit 2026-10-12; UE5 loaders wait on such results).
+// While such writes are pending the store is deferred behind the write-fault pass (priority
+// order) and performed on the GPU thread, so a protected page takes the tracker's merge path.
+// KYTY_EOP_LABEL_DEFER=0 restores the immediate store.
+template <typename T>
+void CommandProcessor::WriteEopLabel(T* dst, T value) {
+	static const bool defer = [] {
+		const char* env = std::getenv("KYTY_EOP_LABEL_DEFER");
+		return env == nullptr || env[0] != '0';
+	}();
+	auto& cache = m_renderer.GetBufferCache();
+	if (!defer || !cache.HasPendingUnboundedWrites()) {
+		std::memcpy(dst, &value, sizeof(value));
+		return;
+	}
+	cache.FlushWriteFaults(false);
+	auto* gpu = g_gpu_state;
+	EXIT_IF(gpu == nullptr);
+	GetScheduler().DeferPriorityOperation([gpu, dst, value] {
+		gpu->SendCommand([dst, value] { std::memcpy(dst, &value, sizeof(value)); });
+	});
+}
+
 template <typename T>
 void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_write_dest,
                                         uint32_t eop_event_type, uint32_t cache_action,
@@ -1199,7 +1226,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 	auto write32 = [&](bool with_writeback) {
 		auto* dst  = static_cast<uint32_t*>(dst_gpu_addr);
 		auto  data = static_cast<uint32_t>(value);
-		std::memcpy(dst, &data, sizeof(data));
+		WriteEopLabel(dst, data);
 
 		if (with_interrupt) {
 			if (with_writeback) {
@@ -1253,7 +1280,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 				}
 				auto write64 = [&](bool with_writeback) {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
-					std::memcpy(dst, &value, sizeof(value));
+					WriteEopLabel(dst, value);
 
 					if (with_interrupt) {
 						if (with_writeback) {

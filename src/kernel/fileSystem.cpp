@@ -608,6 +608,35 @@ int KYTY_SYSV_ABI KernelFcntl(int d, int command, int arg) {
 	}
 }
 
+
+// Host file data lands in guest memory through a scratch buffer: a direct read(2) into a page
+// the tracker re-protected after InvalidateMemory returns short (EFAULT) instead of faulting
+// into the handler (audit 2026-10-12), and UE5's loader then waits for bytes that never come.
+// A memcpy faults normally, so the tracker sees every byte.
+static void ReadIntoGuest(Common::File& file, void* buf, uint32_t nbytes, uint32_t* bytes_read) {
+	thread_local std::vector<uint8_t> scratch;
+	constexpr uint32_t                chunk_max = 1u << 20;
+	uint32_t                          total     = 0;
+	while (total < nbytes) {
+		const auto chunk = std::min(nbytes - total, chunk_max);
+		if (scratch.size() < chunk) {
+			scratch.resize(chunk);
+		}
+		uint32_t got = 0;
+		file.Read(scratch.data(), chunk, &got);
+		if (got != 0) {
+			std::memcpy(static_cast<uint8_t*>(buf) + total, scratch.data(), got);
+		}
+		total += got;
+		if (got < chunk) {
+			break;
+		}
+	}
+	if (bytes_read != nullptr) {
+		*bytes_read = total;
+	}
+}
+
 int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	PRINT_NAME();
 
@@ -661,7 +690,7 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
 	                         std::min<uint64_t>(nbytes, remaining));
 	uint32_t bytes_read = 0;
-	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
+	ReadIntoGuest(file->f, buf, static_cast<uint32_t>(nbytes), &bytes_read);
 
 	file->mutex.Unlock();
 
@@ -787,7 +816,7 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 	                         std::min<uint64_t>(nbytes, remaining));
 	uint32_t bytes_read = 0;
 	file->f.Seek(offset);
-	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
+	ReadIntoGuest(file->f, buf, static_cast<uint32_t>(nbytes), &bytes_read);
 	file->f.Seek(pos);
 
 	file->mutex.Unlock();
@@ -888,7 +917,7 @@ int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, in
 		const auto count = static_cast<uint32_t>(std::min<uint64_t>(buffer.iov_len, remaining));
 		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buffer.iov_base), count);
 		uint32_t bytes = 0;
-		file->f.Read(buffer.iov_base, count, &bytes);
+		ReadIntoGuest(file->f, buffer.iov_base, count, &bytes);
 		bytes_read += bytes;
 		remaining -= bytes;
 		if (bytes < count) {

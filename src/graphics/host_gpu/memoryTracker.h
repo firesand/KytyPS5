@@ -60,11 +60,13 @@ public:
 		}
 	}
 	void MarkBdaSyncPending(uint64_t vaddr, uint64_t size);
-	// KYTY_FAULT_AHEAD_PAGES (default 16, 0 disables): pages a CPU write fault unprotects ahead.
+	// KYTY_FAULT_AHEAD_PAGES (default 0 = off): pages a CPU write fault unprotects ahead. The
+	// window gave no measurable frame-rate gain and marks pages CPU-dirty that a pending GPU
+	// write-fault record may still own (audit 2026-10-12), so it is opt-in.
 	static size_t FaultAheadPages() {
 		static const size_t pages = [] {
 			const char* value = std::getenv("KYTY_FAULT_AHEAD_PAGES");
-			return value != nullptr ? static_cast<size_t>(std::atoi(value)) : size_t {16};
+			return value != nullptr ? static_cast<size_t>(std::atoi(value)) : size_t {0};
 		}();
 		return pages;
 	}
