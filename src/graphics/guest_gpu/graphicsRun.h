@@ -73,6 +73,7 @@ private:
 	bool              Process(Submission& submission);
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);
+	void              ReportBlockedQueues(double seconds);
 
 	RenderContext&                                 m_renderer;
 	Common::Mutex                                  m_queue_mutex;

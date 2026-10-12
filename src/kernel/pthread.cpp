@@ -1092,7 +1092,7 @@ void Initialize() {
 	g_pthread_context->SetDefaultCondattr(default_condattr);
 	g_pthread_context->SetDefaultAttr(default_attr);
 
-	PRINT_NAME_ENABLE(true);
+	PRINT_NAME_ENABLE(::Log::VerboseEnabled());
 
 	Common::Thread thread(FreeDetachedThreads, nullptr);
 	thread.Detach();
@@ -2260,7 +2260,7 @@ int KYTY_SYSV_ABI PthreadRwlockDestroy(PthreadRwlock* rwlock) {
 		}
 	}
 
-	LOGF("\trwlock destroy: %s, 0\n", (*rwlock)->name.c_str());
+	if (::Log::VerboseEnabled()) LOGF("\trwlock destroy: %s, 0\n", (*rwlock)->name.c_str());
 
 	delete *rwlock;
 	*rwlock = nullptr;
@@ -3301,7 +3301,7 @@ int KYTY_SYSV_ABI PthreadCreate(Pthread* thread, const PthreadAttr* attr,
 
 	PthreadAttrDbgPrint(&created_thread->attr);
 
-	PRINT_NAME_ENABLE(true);
+	PRINT_NAME_ENABLE(::Log::VerboseEnabled());
 
 	if (result < 0) {
 		return result;

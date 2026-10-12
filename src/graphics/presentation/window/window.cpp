@@ -295,7 +295,7 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 		LOGF("Controller %s: %d, time = %.04f\n", (f.added ? "added" : "removed"), f.id,
 		     f.timestamp_seconds);
 	} else if (f.axis) {
-		LOGF("Controller axis: %d, axis = %d, value = %d, time = %.04f\n", f.id, f.axis_id,
+		if (::Log::VerboseEnabled()) LOGF("Controller axis: %d, axis = %d, value = %d, time = %.04f\n", f.id, f.axis_id,
 		     f.axis_value, f.timestamp_seconds);
 	} else {
 		LOGF("Controller button: "

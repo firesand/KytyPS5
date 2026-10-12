@@ -65,7 +65,9 @@ static void ReleaseDmem();
 template <typename... Args>
 static void AgcTrace(const char* format, const Args&... args) {
 	if (Config::GraphicsDebugDumpEnabled()) {
-		LOGF(format, args...);
+		if (::Log::VerboseEnabled()) {
+			LOGF(format, args...);
+		}
 	}
 }
 
@@ -273,7 +275,7 @@ struct CommandBuffer {
 			return;
 		}
 
-		LOGF("\t bottom      = 0x%016" PRIx64 "\n"
+		if (::Log::VerboseEnabled()) LOGF("\t bottom      = 0x%016" PRIx64 "\n"
 		     "\t top         = 0x%016" PRIx64 "\n"
 		     "\t cursor_up   = 0x%016" PRIx64 "\n"
 		     "\t cursor_down = 0x%016" PRIx64 "\n"
@@ -352,7 +354,7 @@ struct Label {
 int KYTY_SYSV_ABI AgcInit(uint32_t* state, uint32_t ver) {
 	PRINT_NAME();
 
-	LOGF("\t state = 0x%016" PRIx64 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t state = 0x%016" PRIx64 "\n"
 	     "\t ver   = %u\n",
 	     reinterpret_cast<uint64_t>(state), ver);
 
@@ -420,64 +422,64 @@ static void dbg_dump_shader(const Shader* h) {
 		return;
 	}
 
-	LOGF("\t file_header  = 0x%08" PRIx32 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t file_header  = 0x%08" PRIx32 "\n"
 	     "\t version      = 0x%08" PRIx32 "\n"
 	     "\t user_data    = 0x%016" PRIx64 "\n",
 	     h->file_header, h->version, reinterpret_cast<uint64_t>(h->user_data));
 	if (h->user_data != nullptr) {
-		LOGF("\t\t direct_resource_count    = 0x%04" PRIx16 "\n"
+		if (::Log::VerboseEnabled()) LOGF("\t\t direct_resource_count    = 0x%04" PRIx16 "\n"
 		     "\t\t direct_resource_offset   = 0x%016" PRIx64 "\n",
 		     h->user_data->direct_resource_count,
 		     reinterpret_cast<uint64_t>(h->user_data->direct_resource_offset));
 		for (int i = 0; i < static_cast<int>(h->user_data->direct_resource_count); i++) {
-			LOGF("\t\t\t offset[%02d] = %04" PRIx16 "\n", i,
+			if (::Log::VerboseEnabled()) LOGF("\t\t\t offset[%02d] = %04" PRIx16 "\n", i,
 			     h->user_data->direct_resource_offset[i]);
 		}
 		for (int imm = 0; imm < 4; imm++) {
-			LOGF("\t\t sharp_resource_count  [%d] = 0x%04" PRIx16 "\n", imm,
+			if (::Log::VerboseEnabled()) LOGF("\t\t sharp_resource_count  [%d] = 0x%04" PRIx16 "\n", imm,
 			     h->user_data->sharp_resource_count[imm]);
-			LOGF("\t\t sharp_resource_offset [%d] = 0x%016" PRIx64 "\n", imm,
+			if (::Log::VerboseEnabled()) LOGF("\t\t sharp_resource_offset [%d] = 0x%016" PRIx64 "\n", imm,
 			     reinterpret_cast<uint64_t>(h->user_data->sharp_resource_offset[imm]));
 			for (int i = 0; i < static_cast<int>(h->user_data->sharp_resource_count[imm]); i++) {
-				LOGF("\t\t\t offset_dw[%d] = %04" PRIx16 ", size = %" PRIu16 "\n", i,
+				if (::Log::VerboseEnabled()) LOGF("\t\t\t offset_dw[%d] = %04" PRIx16 ", size = %" PRIu16 "\n", i,
 				     static_cast<uint16_t>(h->user_data->sharp_resource_offset[imm][i].offset_dw),
 				     static_cast<uint16_t>(h->user_data->sharp_resource_offset[imm][i].size));
 			}
 		}
-		LOGF("\t\t eud_size_dw    = 0x%04" PRIx16 "\n"
+		if (::Log::VerboseEnabled()) LOGF("\t\t eud_size_dw    = 0x%04" PRIx16 "\n"
 		     "\t\t srt_size_dw    = 0x%04" PRIx16 "\n",
 		     h->user_data->eud_size_dw, h->user_data->srt_size_dw);
 	}
-	LOGF("\t code             = 0x%016" PRIx64 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t code             = 0x%016" PRIx64 "\n"
 	     "\t num_cx_registers = 0x%02" PRIx8 "\n"
 	     "\t cx_registers     = 0x%016" PRIx64 "\n",
 	     reinterpret_cast<uint64_t>(h->code), h->num_cx_registers,
 	     reinterpret_cast<uint64_t>(h->cx_registers));
 	for (int i = 0; i < static_cast<int>(h->num_cx_registers); i++) {
-		LOGF("\t\t cx[%d]: offset = %08" PRIx32 ", value = %08" PRIx32 "\n", i,
+		if (::Log::VerboseEnabled()) LOGF("\t\t cx[%d]: offset = %08" PRIx32 ", value = %08" PRIx32 "\n", i,
 		     h->cx_registers[i].offset, h->cx_registers[i].value);
 	}
-	LOGF("\t num_sh_registers = 0x%02" PRIx8 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t num_sh_registers = 0x%02" PRIx8 "\n"
 	     "\t sh_registers     = 0x%016" PRIx64 "\n",
 	     h->num_sh_registers, reinterpret_cast<uint64_t>(h->sh_registers));
 	for (int i = 0; i < static_cast<int>(h->num_sh_registers); i++) {
-		LOGF("\t\t sh[%d]: offset = %08" PRIx32 ", value = %08" PRIx32 "\n", i,
+		if (::Log::VerboseEnabled()) LOGF("\t\t sh[%d]: offset = %08" PRIx32 ", value = %08" PRIx32 "\n", i,
 		     h->sh_registers[i].offset, h->sh_registers[i].value);
 	}
-	LOGF("\t specials                          = 0x%016" PRIx64 "\n",
+	if (::Log::VerboseEnabled()) LOGF("\t specials                          = 0x%016" PRIx64 "\n",
 	     reinterpret_cast<uint64_t>(h->specials));
-	LOGF("\t\t ge_cntl:              offset = %08" PRIx32 ", value = %08" PRIx32 "\n",
+	if (::Log::VerboseEnabled()) LOGF("\t\t ge_cntl:              offset = %08" PRIx32 ", value = %08" PRIx32 "\n",
 	     h->specials->ge_cntl.offset, h->specials->ge_cntl.value);
-	LOGF("\t\t vgt_shader_stages_en: offset = %08" PRIx32 ", value = %08" PRIx32 "\n",
+	if (::Log::VerboseEnabled()) LOGF("\t\t vgt_shader_stages_en: offset = %08" PRIx32 ", value = %08" PRIx32 "\n",
 	     h->specials->vgt_shader_stages_en.offset, h->specials->vgt_shader_stages_en.value);
-	LOGF("\t\t vgt_gs_out_prim_type: offset = %08" PRIx32 ", value = %08" PRIx32 "\n",
+	if (::Log::VerboseEnabled()) LOGF("\t\t vgt_gs_out_prim_type: offset = %08" PRIx32 ", value = %08" PRIx32 "\n",
 	     h->specials->vgt_gs_out_prim_type.offset, h->specials->vgt_gs_out_prim_type.value);
-	LOGF("\t\t ge_user_vgpr_en:      offset = %08" PRIx32 ", value = %08" PRIx32 "\n",
+	if (::Log::VerboseEnabled()) LOGF("\t\t ge_user_vgpr_en:      offset = %08" PRIx32 ", value = %08" PRIx32 "\n",
 	     h->specials->ge_user_vgpr_en.offset, h->specials->ge_user_vgpr_en.value);
-	LOGF("\t\t dispatch_modifier = %08" PRIx32 "\n", h->specials->dispatch_modifier);
-	LOGF("\t\t user_data_range: start = %08" PRIx32 ", end = %08" PRIx32 "\n",
+	if (::Log::VerboseEnabled()) LOGF("\t\t dispatch_modifier = %08" PRIx32 "\n", h->specials->dispatch_modifier);
+	if (::Log::VerboseEnabled()) LOGF("\t\t user_data_range: start = %08" PRIx32 ", end = %08" PRIx32 "\n",
 	     h->specials->user_data_range.start, h->specials->user_data_range.end);
-	LOGF("\t\t draw_modifier: enbl_start_vertex_offset   = %08" PRIx32 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t\t draw_modifier: enbl_start_vertex_offset   = %08" PRIx32 "\n"
 	     "\t\t draw_modifier: enbl_start_index_offset    = %08" PRIx32 "\n"
 	     "\t\t draw_modifier: enbl_start_instance_offset = %08" PRIx32 "\n"
 	     "\t\t draw_modifier: enbl_draw_index            = %08" PRIx32 "\n"
@@ -501,7 +503,7 @@ static void dbg_dump_shader(const Shader* h) {
 	     static_cast<uint32_t>(h->specials->draw_modifier.reserved), h->num_input_semantics,
 	     reinterpret_cast<uint64_t>(h->input_semantics));
 	for (int i = 0; i < static_cast<int>(h->num_input_semantics); i++) {
-		LOGF("\t\t input_semantics[%d]: semantic         = %08" PRIx32 "\n"
+		if (::Log::VerboseEnabled()) LOGF("\t\t input_semantics[%d]: semantic         = %08" PRIx32 "\n"
 		     "\t\t input_semantics[%d]: hardware_mapping = %08" PRIx32 "\n"
 		     "\t\t input_semantics[%d]: size_in_elements = %08" PRIx32 "\n"
 		     "\t\t input_semantics[%d]: is_f16           = %08" PRIx32 "\n"
@@ -526,11 +528,11 @@ static void dbg_dump_shader(const Shader* h) {
 		     static_cast<uint32_t>(h->input_semantics[i].default_value), i,
 		     static_cast<uint32_t>(h->input_semantics[i].default_value_hi));
 	}
-	LOGF("\t num_output_semantics              = 0x%04" PRIx16 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t num_output_semantics              = 0x%04" PRIx16 "\n"
 	     "\t output_semantics                  = 0x%016" PRIx64 "\n",
 	     h->num_output_semantics, reinterpret_cast<uint64_t>(h->output_semantics));
 	for (int i = 0; i < static_cast<int>(h->num_output_semantics); i++) {
-		LOGF("\t\t output_semantics[%d]: semantic         = %08" PRIx32 "\n"
+		if (::Log::VerboseEnabled()) LOGF("\t\t output_semantics[%d]: semantic         = %08" PRIx32 "\n"
 		     "\t\t output_semantics[%d]: hardware_mapping = %08" PRIx32 "\n"
 		     "\t\t output_semantics[%d]: size_in_elements = %08" PRIx32 "\n"
 		     "\t\t output_semantics[%d]: is_f16           = %08" PRIx32 "\n"
@@ -555,7 +557,7 @@ static void dbg_dump_shader(const Shader* h) {
 		     static_cast<uint32_t>(h->output_semantics[i].default_value), i,
 		     static_cast<uint32_t>(h->output_semantics[i].default_value_hi));
 	}
-	LOGF("\t header_size                       = 0x%08" PRIx32 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t header_size                       = 0x%08" PRIx32 "\n"
 	     "\t shader_size                       = 0x%08" PRIx32 "\n"
 	     "\t embedded_constant_buffer_size_dqw = 0x%08" PRIx32 "\n"
 	     "\t target                            = 0x%08" PRIx32 "\n"
@@ -671,7 +673,7 @@ int KYTY_SYSV_ABI AgcCreateShader(Shader** dst, void* header, const volatile voi
 	EXIT_NOT_IMPLEMENTED(header == nullptr);
 	EXIT_NOT_IMPLEMENTED(code == nullptr);
 
-	LOGF("\t header = 0x%016" PRIx64 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t header = 0x%016" PRIx64 "\n"
 	     "\t code   = 0x%016" PRIx64 "\n",
 	     reinterpret_cast<uint64_t>(header), reinterpret_cast<uint64_t>(code));
 
@@ -705,7 +707,7 @@ int KYTY_SYSV_ABI AgcCreateShader(Shader** dst, void* header, const volatile voi
 
 	auto base = reinterpret_cast<uint64_t>(code);
 
-	LOGF("\t base   = 0x%016" PRIx64 "\n", base);
+	if (::Log::VerboseEnabled()) LOGF("\t base   = 0x%016" PRIx64 "\n", base);
 
 	ShaderMappedData map;
 	map.type                = static_cast<Prospero::ShaderBinaryType>(h->type);
@@ -774,7 +776,7 @@ static void merge_shader_register_max_field(ShaderRegister* dst, const ShaderReg
 static int fuse_shader_halves(Shader* fused_result, const Shader* front,
                               const Shader* back, void* scratch_mem,
                               bool recompute_shared_vgprs) {
-	LOGF("\t fused_result = 0x%016" PRIx64 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t fused_result = 0x%016" PRIx64 "\n"
 	     "\t front        = 0x%016" PRIx64 "\n"
 	     "\t back         = 0x%016" PRIx64 "\n"
 	     "\t scratch_mem  = 0x%016" PRIx64 "\n",
@@ -1503,7 +1505,7 @@ int KYTY_SYSV_ABI AgcGetDataPacketPayloadAddress(uint32_t** addr, uint32_t* cmd,
 
 	static std::atomic<uint32_t> log_count {0};
 	if (log_count.fetch_add(1) < 64) {
-		LOGF("\t addr = 0x%016" PRIx64 "\n"
+		if (::Log::VerboseEnabled()) LOGF("\t addr = 0x%016" PRIx64 "\n"
 		     "\t cmd  = 0x%016" PRIx64 "\n"
 		     "\t type = %d\n",
 		     reinterpret_cast<uint64_t>(addr), reinterpret_cast<uint64_t>(cmd), type);
@@ -1528,7 +1530,7 @@ int KYTY_SYSV_ABI AgcGetDataPacketPayloadRange(MemoryRange* range, uint32_t* cmd
 	static std::atomic<uint32_t> log_count {0};
 	const bool                   should_log = (log_count.fetch_add(1) < 64);
 	if (should_log) {
-		LOGF("\t range = 0x%016" PRIx64 "\n"
+		if (::Log::VerboseEnabled()) LOGF("\t range = 0x%016" PRIx64 "\n"
 		     "\t cmd   = 0x%016" PRIx64 "\n"
 		     "\t type  = %d\n",
 		     reinterpret_cast<uint64_t>(range), reinterpret_cast<uint64_t>(cmd), type);
@@ -1554,7 +1556,7 @@ int KYTY_SYSV_ABI AgcGetDataPacketPayloadRange(MemoryRange* range, uint32_t* cmd
 	}
 
 	if (should_log) {
-		LOGF("\t cmd_id = 0x%08" PRIx32 ", len = %" PRIu32 "\n"
+		if (::Log::VerboseEnabled()) LOGF("\t cmd_id = 0x%08" PRIx32 ", len = %" PRIu32 "\n"
 		     "\t base   = 0x%016" PRIx64 "\n"
 		     "\t size   = 0x%016" PRIx64 "\n",
 		     cmd_id, len, reinterpret_cast<uint64_t>(range->m_base), range->m_size);
@@ -1590,7 +1592,7 @@ int KYTY_SYSV_ABI AgcJumpPatchSetTarget(uint32_t* cmd, const volatile uint32_t* 
 	auto cmd_id = cmd[0];
 	auto op     = (cmd_id >> 8u) & 0xffu;
 
-	LOGF("\t cmd_id         = 0x%08" PRIx32 ", op = 0x%02" PRIx32 ", len = %" PRIu32 "\n", cmd_id,
+	if (::Log::VerboseEnabled()) LOGF("\t cmd_id         = 0x%08" PRIx32 ", op = 0x%02" PRIx32 ", len = %" PRIu32 "\n", cmd_id,
 	     op, KYTY_PM4_LEN(cmd_id));
 
 	if (op != Pm4::IT_INDIRECT_BUFFER) {
@@ -1627,7 +1629,7 @@ int KYTY_SYSV_ABI AgcSuspendPoint() {
 
 uint32_t* KYTY_SYSV_ABI AgcDcbContextStateOp(CommandBuffer* buf, uint32_t operation) {
 	PRINT_NAME();
-	LOGF("\t operation = 0x%08" PRIx32 "\n", operation);
+	if (::Log::VerboseEnabled()) LOGF("\t operation = 0x%08" PRIx32 "\n", operation);
 
 	const auto size_dw = context_state_op_size_dw(operation);
 	if (buf == nullptr || size_dw == 0) {
@@ -1759,7 +1761,7 @@ int KYTY_SYSV_ABI AgcDriverUnregisterResource() {
 int KYTY_SYSV_ABI AgcDriverRegisterWorkloadStream(uint32_t stream_id, const void* stream) {
 	PRINT_NAME();
 
-	LOGF("\t stream_id = %" PRIu32 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t stream_id = %" PRIu32 "\n"
 	     "\t stream    = 0x%016" PRIx64 "\n",
 	     stream_id, reinterpret_cast<uint64_t>(stream));
 
@@ -1812,7 +1814,7 @@ uint32_t* KYTY_SYSV_ABI AgcCbDispatch(CommandBuffer* buf, uint32_t thread_group_
 
 	static std::atomic<uint32_t> log_count {0};
 	if (log_count.fetch_add(1) < 64) {
-		LOGF("\t thread_group_x = %" PRIu32 "\n"
+		if (::Log::VerboseEnabled()) LOGF("\t thread_group_x = %" PRIu32 "\n"
 		     "\t thread_group_y = %" PRIu32 "\n"
 		     "\t thread_group_z = %" PRIu32 "\n"
 		     "\t modifier       = 0x%08" PRIx32 "\n",
@@ -1928,7 +1930,7 @@ uint32_t* KYTY_SYSV_ABI AgcCbSetShRegisterRangeDirect(CommandBuffer* buf, uint32
 
 	static std::atomic<uint32_t> log_count {0};
 	if (log_count.fetch_add(1) < 64) {
-		LOGF("\t buf        = 0x%016" PRIx64 "\n"
+		if (::Log::VerboseEnabled()) LOGF("\t buf        = 0x%016" PRIx64 "\n"
 		     "\t offset     = %" PRIx32 "\n"
 		     "\t values     = 0x%016" PRIx64 "\n"
 		     "\t num_values = %" PRIu32 "\n",
@@ -1960,7 +1962,7 @@ uint32_t* KYTY_SYSV_ABI AgcCbSetShRegisterRangeDirect(CommandBuffer* buf, uint32
 uint32_t KYTY_SYSV_ABI AgcCbSetShRegisterRangeDirectGetSize(uint32_t num_values) {
 	PRINT_NAME();
 
-	LOGF("\t num_values = %" PRIu32 "\n", num_values);
+	if (::Log::VerboseEnabled()) LOGF("\t num_values = %" PRIu32 "\n", num_values);
 
 	return 4u * num_values + 8u;
 }
@@ -2105,7 +2107,7 @@ uint32_t* KYTY_SYSV_ABI AgcCbSetUcRegistersDirect(CommandBuffer*                
 int KYTY_SYSV_ABI AgcDebugRaiseException(uint32_t exception_id) {
 	PRINT_NAME();
 
-	LOGF("\t exception_id = 0x%08" PRIx32 "\n", exception_id);
+	if (::Log::VerboseEnabled()) LOGF("\t exception_id = 0x%08" PRIx32 "\n", exception_id);
 
 	return OK;
 }
@@ -2119,7 +2121,7 @@ uint32_t* KYTY_SYSV_ABI AgcCbReleaseMem(CommandBuffer* buf, uint8_t action, uint
 
 	static std::atomic<uint32_t> log_count {0};
 	if (log_count.fetch_add(1) < 64) {
-		LOGF("\t action           = 0x%02" PRIx8 "\n"
+		if (::Log::VerboseEnabled()) LOGF("\t action           = 0x%02" PRIx8 "\n"
 		     "\t gcr_cntl         = 0x%04" PRIx16 "\n"
 		     "\t dst              = %" PRIu8 "\n"
 		     "\t cache_policy     = 0x%02" PRIx8 "\n"
@@ -2233,7 +2235,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbWaitUntilSafeForRendering(CommandBuffer* buf,
                                                         uint32_t       display_buffer_index) {
 	PRINT_NAME();
 
-	LOGF("\t video_out_handle     = %" PRIu32 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t video_out_handle     = %" PRIu32 "\n"
 	     "\t display_buffer_index = %" PRIu32 "\n",
 	     video_out_handle, display_buffer_index);
 
@@ -2261,7 +2263,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetWorkloadsActive(CommandBuffer* buf, uint32_t st
                                                  uint32_t        workload_count) {
 	PRINT_NAME();
 
-	LOGF("\t stream_id      = %" PRIu32 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t stream_id      = %" PRIu32 "\n"
 	     "\t workload_ids   = 0x%016" PRIx64 "\n"
 	     "\t workload_count = %" PRIu32 "\n",
 	     stream_id, reinterpret_cast<uint64_t>(workload_ids), workload_count);
@@ -2314,7 +2316,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetWorkloadComplete(CommandBuffer* buf, uint32_t s
                                                   uint32_t workload_id) {
 	PRINT_NAME();
 
-	LOGF("\t stream_id   = %" PRIu32 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t stream_id   = %" PRIu32 "\n"
 	     "\t workload_id = %" PRIu32 "\n",
 	     stream_id, workload_id);
 
@@ -3074,7 +3076,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbEventWrite(CommandBuffer* buf, uint8_t event_type,
 
 	static std::atomic<uint32_t> log_count {0};
 	if (log_count.fetch_add(1) < 64) {
-		LOGF("\t event_type = 0x%02" PRIx8 "\n"
+		if (::Log::VerboseEnabled()) LOGF("\t event_type = 0x%02" PRIx8 "\n"
 		     "\t address    = 0x%016" PRIx64 "\n",
 		     event_type, reinterpret_cast<uint64_t>(address));
 	}
@@ -3137,7 +3139,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbAcquireMem(CommandBuffer* buf, uint8_t engine, uin
 
 	static std::atomic<uint32_t> log_count {0};
 	if (log_count.fetch_add(1) < 64) {
-		LOGF("\t engine      = 0x%02" PRIx8 "\n"
+		if (::Log::VerboseEnabled()) LOGF("\t engine      = 0x%02" PRIx8 "\n"
 		     "\t cb_db_op    = 0x%08" PRIx32 "\n"
 		     "\t gcr_cntl    = 0x%08" PRIx32 "\n"
 		     "\t base        = 0x%016" PRIx64 "\n"
@@ -3614,7 +3616,7 @@ uint32_t KYTY_SYSV_ABI AgcDcbRewindGetSize() {
 uint32_t* KYTY_SYSV_ABI AgcDcbRewind(CommandBuffer* buf, uint32_t initial_state) {
 	PRINT_NAME();
 
-	LOGF("\t initial_state = 0x%08" PRIx32 "\n", initial_state);
+	if (::Log::VerboseEnabled()) LOGF("\t initial_state = 0x%08" PRIx32 "\n", initial_state);
 
 	if (buf == nullptr) {
 		return nullptr;
@@ -3637,7 +3639,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetPredication(CommandBuffer* buf, uint8_t conditi
                                              uint32_t count_in_dwords) {
 	PRINT_NAME();
 
-	LOGF("\t condition       = 0x%02" PRIx8 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t condition       = 0x%02" PRIx8 "\n"
 	     "\t op              = 0x%02" PRIx8 "\n"
 	     "\t wait_op         = 0x%02" PRIx8 "\n"
 	     "\t address         = 0x%016" PRIx64 "\n"
@@ -3672,7 +3674,7 @@ uint32_t* KYTY_SYSV_ABI AgcUnknownKRzWekV120(CommandBuffer* buf, uint32_t arg1, 
                                              uint32_t arg3) {
 	PRINT_NAME();
 
-	LOGF("\t argc = 4\n"
+	if (::Log::VerboseEnabled()) LOGF("\t argc = 4\n"
 	     "\t arg0 = 0x%016" PRIx64 "\n"
 	     "\t arg1 = 0x%08" PRIx32 "\n"
 	     "\t arg2 = 0x%08" PRIx32 "\n"
@@ -3737,11 +3739,11 @@ uint32_t KYTY_SYSV_ABI AgcGetPacketSize(uint32_t* packet) {
 int KYTY_SYSV_ABI AgcSetPacketPredication(uint32_t* packet, uint32_t predication) {
 	PRINT_NAME();
 
-	LOGF("\t packet      = 0x%016" PRIx64 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t packet      = 0x%016" PRIx64 "\n"
 	     "\t predication = 0x%08" PRIx32 "\n",
 	     reinterpret_cast<uint64_t>(packet), predication);
 
-	LOGF("\t packet0     = 0x%08" PRIx32 ", op = 0x%02" PRIx32 ", r = 0x%02" PRIx32
+	if (::Log::VerboseEnabled()) LOGF("\t packet0     = 0x%08" PRIx32 ", op = 0x%02" PRIx32 ", r = 0x%02" PRIx32
 	     ", len = %" PRIu32 "\n",
 	     packet[0], (packet[0] >> 8u) & 0xffu, KYTY_PM4_R(packet[0]), AgcGetPacketSize(packet));
 
@@ -3754,7 +3756,7 @@ int KYTY_SYSV_ABI AgcSetRangePredication(uint32_t* start, const volatile uint32_
                                          uint32_t predication) {
 	PRINT_NAME();
 
-	LOGF("\t start       = 0x%016" PRIx64 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t start       = 0x%016" PRIx64 "\n"
 	     "\t end         = 0x%016" PRIx64 "\n"
 	     "\t predication = 0x%08" PRIx32 "\n",
 	     reinterpret_cast<uint64_t>(start), reinterpret_cast<uint64_t>(end), predication);
@@ -3897,7 +3899,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbWriteData(CommandBuffer* buf, uint8_t dst, uint8_t
 uint32_t KYTY_SYSV_ABI AgcDcbWriteDataGetSize(uint32_t num_dwords) {
 	PRINT_NAME();
 
-	LOGF("\t num_dwords = %" PRIu32 "\n", num_dwords);
+	if (::Log::VerboseEnabled()) LOGF("\t num_dwords = %" PRIu32 "\n", num_dwords);
 
 	return 4u * num_dwords + 16u;
 }
@@ -3909,7 +3911,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbGetLodStats(CommandBuffer* buf, uint8_t cache_poli
                                           uint32_t reporting_interval_in_100k_clocks) {
 	PRINT_NAME();
 
-	LOGF("\t cache_policy                      = 0x%02" PRIx8 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t cache_policy                      = 0x%02" PRIx8 "\n"
 	     "\t buffer                            = 0x%016" PRIx64 "\n"
 	     "\t buffer_size_in_bytes              = %" PRIu32 "\n"
 	     "\t reset_count                       = %" PRIu32 "\n"
@@ -3992,7 +3994,7 @@ int KYTY_SYSV_ABI AgcWaitRegMemPatchAddress(uint32_t* cmd, const volatile void* 
 int KYTY_SYSV_ABI AgcWaitRegMemPatchReference(uint32_t* cmd, uint64_t reference) {
 	PRINT_NAME();
 
-	LOGF("\t cmd       = 0x%016" PRIx64 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t cmd       = 0x%016" PRIx64 "\n"
 	     "\t reference = 0x%016" PRIx64 "\n",
 	     reinterpret_cast<uint64_t>(cmd), reference);
 
@@ -4040,7 +4042,7 @@ int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchAddress(uint32_t*             cmd,
 int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchData(uint32_t* cmd, uint64_t data) {
 	PRINT_NAME();
 
-	LOGF("\t cmd  = 0x%016" PRIx64 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t cmd  = 0x%016" PRIx64 "\n"
 	     "\t data = 0x%016" PRIx64 "\n",
 	     reinterpret_cast<uint64_t>(cmd), data);
 
@@ -4406,7 +4408,7 @@ static void submit_command_buffer(uint32_t queue, uint32_t* commands, uint32_t s
 int KYTY_SYSV_ABI AgcDriverSubmitCommandBuffer(void* queue_context, const Packet* packet) {
 	PRINT_NAME();
 
-	LOGF("\t queue_context = 0x%016" PRIx64 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t queue_context = 0x%016" PRIx64 "\n"
 	     "\t packet        = 0x%016" PRIx64 "\n",
 	     reinterpret_cast<uint64_t>(queue_context), reinterpret_cast<uint64_t>(packet));
 
@@ -4415,7 +4417,7 @@ int KYTY_SYSV_ABI AgcDriverSubmitCommandBuffer(void* queue_context, const Packet
 	}
 
 	const uint32_t queue = get_driver_queue(queue_context);
-	LOGF("\t queue = 0x%08" PRIx32 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t queue = 0x%08" PRIx32 "\n"
 	     "\t addr  = 0x%016" PRIx64 "\n"
 	     "\t size  = 0x%08" PRIx32 "\n"
 	     "\t flags = 0x%02" PRIx8 "\n",
@@ -4431,7 +4433,7 @@ int KYTY_SYSV_ABI AgcDriverSubmitMultiCommandBuffers(void*            queue_cont
                                                      uint32_t         count) {
 	PRINT_NAME();
 
-	LOGF("\t queue_context = 0x%016" PRIx64 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t queue_context = 0x%016" PRIx64 "\n"
 	     "\t count         = %" PRIu32 "\n",
 	     reinterpret_cast<uint64_t>(queue_context), count);
 
@@ -4472,7 +4474,7 @@ int KYTY_SYSV_ABI AgcDriverSubmitMultiAcbs(uint32_t queue, uint32_t* const* acbs
                                            const uint32_t* sizes_in_dwords, uint32_t count) {
 	PRINT_NAME();
 
-	LOGF("\t queue = 0x%08" PRIx32 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t queue = 0x%08" PRIx32 "\n"
 	     "\t count = %" PRIu32 "\n",
 	     queue, count);
 
@@ -4546,7 +4548,7 @@ int KYTY_SYSV_ABI AgcDriverSetTFRing(const volatile void* base, uint32_t size) {
 	g_tessellation_driver_state.tf_ring_base = reinterpret_cast<uint64_t>(base);
 	g_tessellation_driver_state.tf_ring_size = size;
 
-	LOGF("\t base = 0x%016" PRIx64 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t base = 0x%016" PRIx64 "\n"
 	     "\t size = 0x%08" PRIx32 "\n",
 	     g_tessellation_driver_state.tf_ring_base, g_tessellation_driver_state.tf_ring_size);
 
@@ -4560,7 +4562,7 @@ int KYTY_SYSV_ABI AgcDriverSetHsOffchipParam(uint64_t value0, uint64_t value1, u
 	g_tessellation_driver_state.hs_offchip_value1 = value1;
 	g_tessellation_driver_state.hs_offchip_value2 = value2;
 
-	LOGF("\t value0 = 0x%016" PRIx64 "\n"
+	if (::Log::VerboseEnabled()) LOGF("\t value0 = 0x%016" PRIx64 "\n"
 	     "\t value1 = 0x%016" PRIx64 "\n"
 	     "\t value2 = 0x%016" PRIx64 "\n",
 	     value0, value1, value2);

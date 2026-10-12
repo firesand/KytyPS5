@@ -279,7 +279,7 @@ static KYTY_SYSV_ABI void init_env(const InitEnvParams* params) {
 	g_argv = params->argv;
 	g_envp = params->argv + params->argc + 1;
 
-	LOGF("\t argc = %d\n"
+	if (::Log::VerboseEnabled()) LOGF("\t argc = %d\n"
 	     "\t argv = 0x%016" PRIx64 "\n"
 	     "\t envp = 0x%016" PRIx64 "\n",
 	     g_argc, reinterpret_cast<uint64_t>(g_argv), reinterpret_cast<uint64_t>(g_envp));

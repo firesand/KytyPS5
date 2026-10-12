@@ -21,6 +21,8 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cinttypes>
 #include <cstdlib>
 #include <array>
 #include <atomic>
@@ -184,6 +186,34 @@ int GuestGpu::GetFrameNum() const {
 	return m_done_num;
 }
 
+void GuestGpu::ReportBlockedQueues(double seconds) {
+	// m_queue_mutex is held by the caller (the GPU thread's scheduling loop).
+	for (uint32_t id = 0; id < QueueCount; id++) {
+		const auto& queue = m_queues[id];
+		if (queue.empty()) {
+			continue;
+		}
+		const auto& submission = queue.front();
+		const auto& why        = GetProcessor(id).LastSuspend();
+		uint64_t    value      = 0;
+		if (why.addr != 0 && why.size == sizeof(uint32_t)) {
+			value = *reinterpret_cast<const volatile uint32_t*>(why.addr);
+		} else if (why.addr != 0 && why.size == sizeof(uint64_t)) {
+			value = *reinterpret_cast<const volatile uint64_t*>(why.addr);
+		}
+		const auto where = why.addr != 0 ? m_renderer.GetBufferCache().DescribeBufferAt(why.addr)
+		                                 : std::string {};
+		LOGF("GPU blocked: queue %u type %d (%zu queued, started %d) for %.0f s: %s addr=0x%016" PRIx64
+		     " func=%u ref=0x%" PRIx64 " mask=0x%" PRIx64 " value=0x%" PRIx64 " %s\n",
+		     id, static_cast<int>(submission.type), queue.size(), submission.started ? 1 : 0, seconds,
+		     why.kind != nullptr ? why.kind : "?", why.addr, why.func, why.ref, why.mask, value,
+		     where.c_str());
+	}
+	std::printf("GPU blocked: every queue blocked for %.0f s (details in the log)\n", seconds);
+	std::fflush(stdout);
+	Log::Flush();
+}
+
 CommandProcessor& GuestGpu::GetProcessor(uint32_t queue_id) {
 	EXIT_IF(queue_id >= QueueCount);
 	if (queue_id == 0) {
@@ -259,20 +289,20 @@ void CommandProcessor::ResetDeCe() {
 
 void CommandProcessor::WaitCe() {
 	if (m_ce_count <= m_de_count && !m_ce_complete) {
-		SuspendPm4();
+		SuspendPm4("wait_ce", 0, m_de_count, m_ce_count);
 	}
 }
 
 void CommandProcessor::WaitDeDiff(uint32_t diff) {
 	EXIT_IF(m_de_count > m_ce_count);
 	if (m_ce_count - m_de_count >= diff) {
-		SuspendPm4();
+		SuspendPm4("wait_de_diff", 0, diff, m_ce_count - m_de_count);
 	}
 }
 
 void CommandProcessor::WaitForRewind(bool valid) {
 	if (!valid) {
-		SuspendPm4();
+		SuspendPm4("wait_rewind");
 	}
 }
 
@@ -317,7 +347,7 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 
 	(void)poll;
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
-		SuspendPm4();
+		SuspendPm4("wait_reg_mem", reinterpret_cast<uint64_t>(addr), ref, mask, func, sizeof(T));
 	}
 }
 
@@ -460,6 +490,9 @@ void GuestGpu::ThreadRun(void* data) {
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 
+	// Every queue blocked (WaitRegMem/CE/rewind) with nothing else to do: report after 5 s.
+	std::chrono::steady_clock::time_point blocked_since {};
+	std::chrono::steady_clock::time_point blocked_reported {};
 	for (;;) {
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
@@ -496,6 +529,15 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
+					const auto now = std::chrono::steady_clock::now();
+					if (blocked_since == std::chrono::steady_clock::time_point {}) {
+						blocked_since = now;
+					} else if (now - blocked_since > std::chrono::seconds(5) &&
+					           now - blocked_reported > std::chrono::seconds(30)) {
+						blocked_reported = now;
+						gpu->ReportBlockedQueues(
+						    std::chrono::duration<double>(now - blocked_since).count());
+					}
 					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
 					gpu->m_renderer.GetCommandScheduler().GetMasterSemaphore().CheckStall(
 					    "gpu thread blocked queues");
@@ -506,8 +548,9 @@ void GuestGpu::ThreadRun(void* data) {
 					}
 					continue;
 				}
-				auto& queue = gpu->m_queues[static_cast<uint32_t>(selected_queue)];
-				submission  = std::move(queue.front());
+				blocked_since = {};
+				auto& queue   = gpu->m_queues[static_cast<uint32_t>(selected_queue)];
+				submission    = std::move(queue.front());
 				queue.pop_front();
 				gpu->m_submission_count--;
 				gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
@@ -697,6 +740,12 @@ void CommandProcessor::SuspendPm4() {
 	g_current_execution->m_suspended = true;
 }
 
+void CommandProcessor::SuspendPm4(const char* kind, uint64_t addr, uint64_t ref, uint64_t mask,
+                                  uint32_t func, uint32_t size) {
+	m_last_suspend = {kind, addr, ref, mask, func, size};
+	SuspendPm4();
+}
+
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
@@ -846,7 +895,8 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 				const auto end   = results[db * 2u + 1u];
 				if ((begin & end & ready_bit) == 0) {
 					if (wait_op == 0) {
-						SuspendPm4();
+						SuspendPm4("predication_results", reinterpret_cast<uint64_t>(address), 0, 0,
+						           0, 16u * 2u * sizeof(uint64_t));
 					} else {
 						m_predicate_skip = false;
 					}

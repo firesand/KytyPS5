@@ -338,7 +338,7 @@ static int32_t KYTY_SYSV_ABI PngEncDelete(void* handle) {
 } // namespace PngEnc
 
 LIB_DEFINE(InitPngEnc_1) {
-	PRINT_NAME_ENABLE(true);
+	PRINT_NAME_ENABLE(::Log::VerboseEnabled());
 
 	LIB_FUNC("9030RnBDoh4", PngEnc::PngEncQueryMemorySize);
 	LIB_FUNC("7aGTPfrqT9s", PngEnc::PngEncCreate);

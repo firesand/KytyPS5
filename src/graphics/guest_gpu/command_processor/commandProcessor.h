@@ -149,6 +149,18 @@ public:
 	void                   SetSubmitId(uint64_t submit_id) { m_submit_id = submit_id; }
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
 
+	// Why PM4 processing was last suspended; the GPU thread reports it when every queue stays
+	// blocked (the game then usually waits for an end-of-pipe event that cannot come).
+	struct SuspendInfo {
+		const char* kind = nullptr;
+		uint64_t    addr = 0;
+		uint64_t    ref  = 0;
+		uint64_t    mask = 0;
+		uint32_t    func = 0;
+		uint32_t    size = 0;
+	};
+	[[nodiscard]] const SuspendInfo& LastSuspend() const { return m_last_suspend; }
+
 private:
 	template <typename T>
 	void WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_write_dest, uint32_t eop_event_type,
@@ -157,10 +169,13 @@ private:
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
+	void SuspendPm4(const char* kind, uint64_t addr = 0, uint64_t ref = 0, uint64_t mask = 0,
+	                uint32_t func = 0, uint32_t size = 0);
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 
 	RenderContext&   m_renderer;
+	SuspendInfo      m_last_suspend {};
 	HW::Context      m_ctx;
 	HW::Context      m_saved_ctx;
 	bool             m_context_state_pushed = false;
