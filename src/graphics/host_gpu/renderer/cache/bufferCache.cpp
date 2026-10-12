@@ -425,15 +425,55 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t
 	return {first, last, begin, end, has_stream_leap};
 }
 
-void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score) {
+// A replaced buffer whose device bytes are all complete can be copied on the host through the
+// BAR mappings right now; only an overlap with a GPU write still in flight needs a recorded GPU
+// copy (which then gates BAR readbacks of the new buffer through ready_tick). Without this every
+// new buffer would wait for the current tick before any BAR readback (ng-39: menu 7 vs 12 fps).
+bool BufferCache::HostJoinPossible(const Buffer& new_buffer, const Buffer& overlap) {
+	if (new_buffer.Mapped().empty() || overlap.Mapped().empty() || !overlap.IsCoherent() ||
+	    !new_buffer.IsCoherent()) {
+		return false;
+	}
+	if (m_bar_block_tick != 0 && !m_scheduler.IsFree(m_bar_block_tick)) {
+		return false;
+	}
+	const auto address = overlap.CpuAddress();
+	const auto first   = address >> CACHING_PAGEBITS;
+	const auto last    = (address + overlap.Size() - 1) >> CACHING_PAGEBITS;
+	for (auto page = first; page <= last; ++page) {
+		const auto found = m_gpu_write_ticks.find(page);
+		if (found != m_gpu_write_ticks.end()) {
+			if (found->second != 0 && !m_scheduler.IsFree(found->second)) {
+				return false; // a GPU write to the old buffer is still in flight
+			}
+			continue;
+		}
+		// No stamp: a GPU-dirty page marked by a path without a tick has unknown completion.
+		if (m_gpu_modified_ranges.Intersects(page << CACHING_PAGEBITS, CACHING_PAGESIZE)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score) {
 	auto& new_buffer = m_slot_buffers[new_id];
 	auto& overlap    = m_slot_buffers[overlap_id];
 	if (accumulate_stream_score) {
 		new_buffer.IncreaseStreamScore(overlap.StreamScore() + 1);
 	}
-	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
-	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
+	const auto offset   = overlap.CpuAddress() - new_buffer.CpuAddress();
+	bool       gpu_copy = true;
+	if (HostJoinPossible(new_buffer, overlap)) {
+		std::memcpy(new_buffer.Mapped().data() + offset, overlap.Mapped().data(), overlap.Size());
+		m_sync_stats.host_joins++;
+		gpu_copy = false;
+	} else {
+		new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0, offset, overlap.Size());
+		m_sync_stats.gpu_joins++;
+	}
 	DeleteBuffer(overlap_id);
+	return gpu_copy;
 }
 
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
@@ -450,11 +490,14 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
 	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", overlap.begin,
 	                     overlap.end - overlap.begin);
+	bool gpu_copy = false;
 	for (auto it = overlap.first; it != overlap.last;) {
 		const auto old_id = (it++)->second;
-		JoinOverlap(id, old_id, !overlap.has_stream_leap);
+		gpu_copy |= JoinOverlap(id, old_id, !overlap.has_stream_leap);
 	}
-	m_slot_buffers[id].ready_tick = m_scheduler.CurrentTick(); // after the join copies
+	if (gpu_copy) {
+		m_slot_buffers[id].ready_tick = m_scheduler.CurrentTick(); // the recorded join copies
+	}
 	Register(id);
 	return id;
 }
@@ -751,7 +794,13 @@ bool BufferCache::TryBarReadback(const Buffer& buffer, std::span<const vk::Buffe
 	}
 	const auto address = buffer.CpuAddress();
 	// The join/initial copies into this buffer must have executed, not only the page's writes.
-	auto latest = std::max(m_bar_block_tick, buffer.ready_tick);
+	// KYTY_BAR_READY_GATE=0 drops that condition (A/B of its cost only: it re-opens the lost
+	// download of the stale-buffer workflow, so it must never be the play default).
+	static const bool ready_gate = [] {
+		const char* value = std::getenv("KYTY_BAR_READY_GATE");
+		return value == nullptr || !(value[0] == '0' && value[1] == '\0');
+	}();
+	auto latest = std::max(m_bar_block_tick, ready_gate ? buffer.ready_tick : 0);
 	for (const auto& copy: copies) {
 		const auto first = (address + copy.srcOffset) >> CACHING_PAGEBITS;
 		const auto last  = (address + copy.srcOffset + copy.size - 1) >> CACHING_PAGEBITS;

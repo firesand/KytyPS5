@@ -152,6 +152,8 @@ public:
 		uint64_t range_calls = 0, range_bytes = 0, range_pages = 0;
 		uint64_t download_calls = 0, download_wait_ns = 0, read_memory_calls = 0;
 		uint64_t bar_readbacks = 0;
+		uint64_t host_joins = 0; // replaced buffers copied on the host (complete)
+		uint64_t gpu_joins  = 0; // replaced buffers copied on the GPU (in flight)
 	};
 	[[nodiscard]] SyncStats TakeSyncStats() { return std::exchange(m_sync_stats, {}); }
 	void SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
@@ -185,7 +187,11 @@ private:
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
 	void TouchBuffer(const Buffer& buffer);
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
-	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
+	// Returns true when the overlap's content had to be copied on the GPU (recorded, not yet
+	// executed); false when it was copied on the host through the BAR mappings because every byte
+	// of it was already complete (no GPU write in flight, see HostJoinPossible).
+	bool JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
+	[[nodiscard]] bool HostJoinPossible(const Buffer& new_buffer, const Buffer& overlap);
 	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size);
 	void                   Register(BufferId id);
 	void Unregister(BufferId id);
