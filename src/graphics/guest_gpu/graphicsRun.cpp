@@ -705,14 +705,30 @@ bool GuestGpu::Process(Submission& submission) {
 			m_renderer.RunGarbageCollector();
 			cp.PrepareCpuFlip(submission.flip_request_id);
 			break;
-		case SubmissionType::SuspendPoint:
+		case SubmissionType::SuspendPoint: {
+			// AgcSuspendPoint is called once per frame by UE5's RHI submission thread and blocks
+			// until the previous point is answered. By default the answer waits for the GPU to
+			// COMPLETE everything before the point (priority operation), which serializes CPU
+			// recording of frame N+1 behind GPU execution of frame N (hot-2 thread snapshots).
+			// KYTY_SUSPEND_POINT_REACHED=1 (probe, A/B) answers as soon as the GPU thread has
+			// REACHED the point, i.e. recorded and submitted everything before it.
+			static const bool reached = [] {
+				const char* value = std::getenv("KYTY_SUSPEND_POINT_REACHED");
+				return value != nullptr && value[0] == '1' && value[1] == '\0';
+			}();
 			cp.EmitGlobalBarrier();
 			m_renderer.GetBufferCache().FlushWriteFaults(false);
-			m_renderer.GetCommandScheduler().DeferPriorityOperation(
-			    [ready = m_suspend_point_ready] { ready->release(); });
+			if (!reached) {
+				m_renderer.GetCommandScheduler().DeferPriorityOperation(
+				    [ready = m_suspend_point_ready] { ready->release(); });
+			}
 			cp.BufferFlush();
 			cp.Reset();
+			if (reached) {
+				m_suspend_point_ready->release();
+			}
 			break;
+		}
 	}
 
 	return complete;
