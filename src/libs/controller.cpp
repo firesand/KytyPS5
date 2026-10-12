@@ -427,6 +427,11 @@ void GameController::Connect(int id) {
 	m_connected_ids.push_back(id);
 
 	if (id != HOST_INPUT_CONTROLLER_ID) {
+		const auto  sdl_id   = static_cast<SDL_JoystickID>(id);
+		const char* pad_name = SDL_GetGamepadNameForID(sdl_id);
+		const char* joy_name = SDL_GetJoystickNameForID(sdl_id);
+		LOGF("Controller: pad %d connected (%s / %s)\n", id, pad_name != nullptr ? pad_name : "?",
+		     joy_name != nullptr ? joy_name : "?");
 		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(id));
 		    pad != nullptr) {
 			if (const auto& color = Config::GetControllerColor()) {
@@ -482,10 +487,17 @@ void GameController::CheckActive() {
 				if (id == HOST_INPUT_CONTROLLER_ID) {
 					continue;
 				}
-				const char* name = SDL_GetGamepadNameForID(static_cast<SDL_JoystickID>(id));
-				if (name != nullptr && std::strstr(name, prefer) != nullptr) {
+				// Match the mapping name ("X360 Controller") or the raw device name
+				// ("Microsoft X-Box 360 pad"), ignoring case.
+				const auto  sdl_id   = static_cast<SDL_JoystickID>(id);
+				const char* pad_name = SDL_GetGamepadNameForID(sdl_id);
+				const char* joy_name = SDL_GetJoystickNameForID(sdl_id);
+				const bool  matches  = (pad_name != nullptr && strcasestr(pad_name, prefer) != nullptr) ||
+				                      (joy_name != nullptr && strcasestr(joy_name, prefer) != nullptr);
+				if (matches) {
 					if (m_active_id != id) {
-						LOGF("Controller: preferring pad %d (%s) per KYTY_PAD_PREFER\n", id, name);
+						LOGF("Controller: preferring pad %d (%s / %s) per KYTY_PAD_PREFER\n", id,
+						     pad_name != nullptr ? pad_name : "?", joy_name != nullptr ? joy_name : "?");
 					}
 					new_active_id = id;
 					break;
