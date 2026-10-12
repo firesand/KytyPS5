@@ -2183,6 +2183,31 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	}
 }
 
+std::string TextureCache::DescribeImagesIn(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	const auto ids = FindImagesInRegion(address, size, true);
+	if (ids.empty()) {
+		return "none";
+	}
+	const auto  tick = m_scheduler.CurrentTick();
+	std::string text;
+	size_t      count = 0;
+	for (const auto id: ids) {
+		if (count == 2) {
+			text += fmt::format(" +{}img", ids.size() - count);
+			break;
+		}
+		const auto& image = m_slot_images[id];
+		text += fmt::format("{}img[0x{:x}+0x{:x} {}x{}x{} {} age={}]", count == 0 ? "" : " ",
+		                    image.track_addr, image.track_addr_end - image.track_addr,
+		                    image.info.extent.width, image.info.extent.height,
+		                    image.info.extent.depth, vk::to_string(image.info.pixel_format),
+		                    tick - image.tick_accessed_last);
+		++count;
+	}
+	return text;
+}
+
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;

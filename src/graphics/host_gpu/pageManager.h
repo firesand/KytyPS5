@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/regionDefinitions.h"
 
 #include <memory>
+#include <utility>
 
 namespace Libs::Graphics {
 
@@ -19,6 +20,8 @@ public:
 	KYTY_CLASS_NO_COPY(PageManager);
 
 	[[nodiscard]] uint64_t GetPageSize() const;
+	// Diagnostics: host protection changes since the last call (calls, bytes).
+	static std::pair<uint64_t, uint64_t> TakeProtectStats();
 
 	template <bool track>
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);

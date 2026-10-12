@@ -30,6 +30,11 @@
 #undef max
 #else
 #include <unistd.h>
+
+namespace {
+std::atomic<uint64_t> g_protect_calls {0};
+std::atomic<uint64_t> g_protect_bytes {0};
+} // namespace
 #endif
 
 namespace Libs::Graphics {
@@ -203,6 +208,8 @@ struct PageManager::Impl {
 	}
 
 	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept {
+		g_protect_calls.fetch_add(1, std::memory_order_relaxed);
+		g_protect_bytes.fetch_add(size, std::memory_order_relaxed);
 		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode)) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", mode=0x%08" PRIx32, vaddr,
 			      static_cast<uint32_t>(mode));
@@ -289,6 +296,11 @@ static_assert(std::atomic<void*>::is_always_lock_free);
 PageManager::PageManager(): m_impl(std::make_unique<Impl>()) {}
 
 PageManager::~PageManager() = default;
+
+std::pair<uint64_t, uint64_t> PageManager::TakeProtectStats() {
+	return {g_protect_calls.exchange(0, std::memory_order_relaxed),
+	        g_protect_bytes.exchange(0, std::memory_order_relaxed)};
+}
 
 uint64_t PageManager::GetPageSize() const {
 	return PAGE_SIZE;

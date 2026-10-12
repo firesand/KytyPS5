@@ -19,6 +19,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <string>
 
 namespace Libs::Graphics {
 
@@ -73,6 +74,8 @@ public:
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
 	void RunGarbageCollector();
+	// Diagnostics: images overlapping [address, address+size) as "img[...]" text, or "none".
+	[[nodiscard]] std::string DescribeImagesIn(uint64_t address, uint64_t size);
 
 private:
 	enum class TransferDirection { Upload, Download };

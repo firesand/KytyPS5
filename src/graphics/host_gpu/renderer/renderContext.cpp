@@ -82,7 +82,8 @@ struct FaultSampler {
 		entries[slot].store((vaddr & ~uint64_t {0xfff}) | (write ? 1u : 0u), std::memory_order_relaxed);
 	}
 	template <typename Describe>
-	void Dump(Describe&& describe, const BufferCache::SyncStats& sync) {
+	void Dump(Describe&& describe, const BufferCache::SyncStats& sync,
+	          std::pair<uint64_t, uint64_t> protects) {
 		if (!enabled) return;
 		static uint64_t last_total = 0;
 		static int      calls      = 0;
@@ -108,6 +109,7 @@ struct FaultSampler {
 		                    sync.obtain_calls, sync.obtain_pages, sync.obtain_bytes >> 10,
 		                    sync.range_calls, sync.range_pages, sync.range_bytes >> 10,
 		                    sync.download_calls, sync.download_wait_ns / 1000000, sync.read_memory_calls);
+		line += fmt::format(" | protect {} calls {} KiB", protects.first, protects.second >> 10);
 		LOGF("%s\n", line.c_str());
 		last_total = now;
 	}
@@ -229,8 +231,13 @@ void RenderContext::SyncCpuWrites() {
 }
 
 void RenderContext::RunGarbageCollector() {
-	g_fault_sampler.Dump([this](uint64_t vaddr) { return m_buffer_cache.DescribeBufferAt(vaddr); },
-	                     m_buffer_cache.TakeSyncStats());
+	g_fault_sampler.Dump(
+	    [this](uint64_t vaddr) {
+		    auto text = m_buffer_cache.DescribeBufferAt(vaddr);
+		    if (text == "none") text = m_texture_cache.DescribeImagesIn(vaddr, uint64_t {1} << 20);
+		    return text;
+	    },
+	    m_buffer_cache.TakeSyncStats(), PageManager::TakeProtectStats());
 	m_buffer_cache.FlushWriteFaults(false);
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
