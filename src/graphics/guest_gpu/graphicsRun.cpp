@@ -21,6 +21,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <atomic>
 #include <cstdio>
@@ -368,6 +369,15 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 }
 
 void CommandProcessor::PrepareHostRead(uint64_t vaddr, uint64_t size) {
+	// KYTY_CP_HOST_READ_PREPARE=0 restores the pre-9d3eaab behaviour (no write-fault flush before
+	// the CP's own guest reads) for bisecting the title-screen hang.
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_CP_HOST_READ_PREPARE");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (!enabled) {
+		return;
+	}
 	m_renderer.GetBufferCache().PrepareHostRead(vaddr, size);
 }
 
