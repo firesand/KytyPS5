@@ -19,6 +19,7 @@
 #include <atomic>
 #include <climits>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <random>
@@ -614,6 +615,16 @@ int KYTY_SYSV_ABI KernelFcntl(int d, int command, int arg) {
 // into the handler (audit 2026-10-12), and UE5's loader then waits for bytes that never come.
 // A memcpy faults normally, so the tracker sees every byte.
 static void ReadIntoGuest(Common::File& file, void* buf, uint32_t nbytes, uint32_t* bytes_read) {
+	// KYTY_SCRATCH_FILE_READS=0 reads straight into guest memory as before (A/B for the boot
+	// freeze first seen on 58c4a83).
+	static const bool scratch_reads = [] {
+		const char* env = std::getenv("KYTY_SCRATCH_FILE_READS");
+		return env == nullptr || env[0] != '0';
+	}();
+	if (!scratch_reads) {
+		file.Read(buf, nbytes, bytes_read);
+		return;
+	}
 	thread_local std::vector<uint8_t> scratch;
 	constexpr uint32_t                chunk_max = 1u << 20;
 	uint32_t                          total     = 0;
