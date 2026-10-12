@@ -548,9 +548,8 @@ void GuestGpu::ThreadRun(void* data) {
 					}
 					continue;
 				}
-				blocked_since = {};
-				auto& queue   = gpu->m_queues[static_cast<uint32_t>(selected_queue)];
-				submission    = std::move(queue.front());
+				auto& queue = gpu->m_queues[static_cast<uint32_t>(selected_queue)];
+				submission  = std::move(queue.front());
 				queue.pop_front();
 				gpu->m_submission_count--;
 				gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
@@ -579,6 +578,10 @@ void GuestGpu::ThreadRun(void* data) {
 
 		EXIT_IF(!has_submission);
 		const bool complete = gpu->Process(submission);
+		if (complete || submission.command_execution.MadeProgress() ||
+		    submission.constant_execution.MadeProgress()) {
+			blocked_since = {}; // the blocked-queue timer counts only retries without progress
+		}
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
@@ -723,6 +726,16 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	                                        : Pm4ProcessResult::Blocked;
 }
 
+// Type-3 packet with a known opcode, or a type-2 NOP filler. GPU-built command buffers use
+// nothing else; anything else at the start of a buffer means the host read stale bytes.
+static bool LooksLikePm4Header(uint32_t header) {
+	switch (header >> 30u) {
+		case 3u: return g_cp_op_func[(header >> 8u) & 0xffu] != nullptr;
+		case 2u: return true;
+		default: return false;
+	}
+}
+
 void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain) {
 	EXIT_IF(g_current_execution == nullptr);
 	EXIT_IF(!g_current_execution->m_next_buffer.empty());
@@ -731,6 +744,25 @@ void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands,
 	// so the host read below faults into a download instead of parsing stale CPU bytes
 	// ("unknown op" with float data at a predicated branch target, run ng-2).
 	PrepareHostRead(reinterpret_cast<uint64_t>(commands.data()), commands.size_bytes());
+	// The prepare above only flushes writes inside declared unbounded ranges. A buffer whose
+	// first dword is not a PM4 header is almost certainly stale CPU memory (ng-2 and ng-21 died
+	// on float data there): land every pending GPU write, let the tracker protect the pages and
+	// read again before parsing.
+	if (!commands.empty() && !LooksLikePm4Header(commands[0])) {
+		const auto first = commands[0];
+		GetScheduler().Current().EndRendering();
+		m_renderer.GetBufferCache().FlushWriteFaults(true);
+		GetScheduler().Wait(GetScheduler().CurrentTick());
+		m_renderer.GetBufferCache().OnCommandBoundary();
+		static std::atomic<uint32_t> reports {0};
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 50) {
+			LOGF("CommandProcessor: indirect buffer 0x%016" PRIx64 "/%zu started with 0x%08" PRIx32
+			     " (not a PM4 header): resynced GPU writes, now 0x%08" PRIx32 " (%s)\n",
+			     reinterpret_cast<uint64_t>(commands.data()), commands.size(), first,
+			     *reinterpret_cast<const volatile uint32_t*>(commands.data()),
+			     LooksLikePm4Header(commands[0]) ? "valid" : "still invalid");
+		}
+	}
 	g_current_execution->m_next_buffer = commands;
 	g_current_execution->m_chain       = chain;
 }

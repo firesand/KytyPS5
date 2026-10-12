@@ -120,9 +120,9 @@ struct FaultSampler {
 		                    sync.obtain_calls, sync.obtain_pages, sync.obtain_bytes >> 10,
 		                    sync.range_calls, sync.range_pages, sync.range_bytes >> 10,
 		                    sync.download_calls, sync.download_wait_ns / 1000000, sync.read_memory_calls);
-		line += fmt::format(" | protect {} calls {} KiB | hot hashed {} skipped {} demoted {}",
+		line += fmt::format(" | protect {} calls {} KiB | hot hashed {} skipped {} demoted {} rehash-miss {}",
 		                    protects.first, protects.second >> 10, hot.hashed, hot.skipped,
-		                    hot.demoted);
+		                    hot.demoted, hot.invalidated);
 		LOGF("%s\n", line.c_str());
 		last_total = now;
 	}

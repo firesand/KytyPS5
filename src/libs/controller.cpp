@@ -1216,7 +1216,7 @@ int KYTY_SYSV_ABI PadSetVibration(int handle, const PadVibrationParam* param) {
 		return PAD_ERROR_INVALID_ARG;
 	}
 
-	LOGF("\t large_motor = %d\n"
+	if (::Log::VerboseEnabled()) LOGF("\t large_motor = %d\n"
 	     "\t small_motor = %d\n",
 	     static_cast<int>(param->large_motor), static_cast<int>(param->small_motor));
 

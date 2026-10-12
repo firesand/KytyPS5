@@ -3004,7 +3004,10 @@ int KYTY_SYSV_ABI KernelAioWaitRequests(int32_t* ids, int32_t num, int32_t* stat
 			const auto current = kernel_aio_get_state(ids[i], notify);
 			states[i] = current;
 			finished += current != KERNEL_AIO_STATE_PROCESSING;
-			newly_complete |= current == KERNEL_AIO_STATE_COMPLETED || current == KERNEL_AIO_STATE_ABORTED;
+			// A request that an earlier poll already marked NOTIFIED is still complete: OR-mode
+			// waits must return for it (sceKernelAioWaitRequests has no "newly" notion).
+			const auto state = current & ~KERNEL_AIO_STATE_NOTIFIED;
+			newly_complete |= state == KERNEL_AIO_STATE_COMPLETED || state == KERNEL_AIO_STATE_ABORTED;
 		}
 		return finished == num || (mode == KERNEL_AIO_WAIT_OR && newly_complete);
 	};

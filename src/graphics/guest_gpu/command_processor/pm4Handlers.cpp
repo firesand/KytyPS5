@@ -1478,7 +1478,7 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 
 	cp.PrepareHostRead(reinterpret_cast<uint64_t>(compare_addr), sizeof(uint64_t));
 	const bool take_then = TestWaitRegMemValue(*compare_addr, reference, mask, function);
-	LOGF("\t branch: take=%u then=0x%016" PRIx64 "/%" PRIu32 " else=0x%016" PRIx64 "/%" PRIu32 "\n",
+	if (::Log::VerboseEnabled()) LOGF("\t branch: take=%u then=0x%016" PRIx64 "/%" PRIu32 " else=0x%016" PRIx64 "/%" PRIu32 "\n",
 	     take_then ? 1u : 0u, reinterpret_cast<uint64_t>(then_buffer), then_num_dw,
 	     reinterpret_cast<uint64_t>(else_buffer), else_num_dw);
 

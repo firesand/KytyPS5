@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <array>
+#include <vector>
 #include <mutex>
 #include <utility>
 
@@ -86,9 +87,10 @@ uint64_t HashTrackerPage(const void* page) noexcept;
 
 // Hot-page content tracking counters (GPU thread), reported by the fault histogram.
 struct HotPageStats {
-	uint64_t hashed  = 0;
-	uint64_t skipped = 0;
-	uint64_t demoted = 0;
+	uint64_t hashed      = 0;
+	uint64_t skipped     = 0;
+	uint64_t demoted     = 0;
+	uint64_t invalidated = 0; // hash no longer matched the page after the upload copied it
 };
 
 class RegionManager final {
@@ -257,6 +259,30 @@ public:
 	}
 	static HotPageStats TakeHotStats() { return std::exchange(s_hot_stats, {}); }
 
+	// The hash is taken before the upload copies the page (the copy happens in the caller's
+	// upload callback). A CPU write in between leaves a hash that does not describe the uploaded
+	// bytes, and a later write back to the hashed content would then be skipped. Re-hash after
+	// the copy and forget hashes that no longer match. Caller holds `lock`.
+	void VerifyUploadHashes() {
+		if (m_hash_pending.empty()) {
+			return;
+		}
+		if (m_page_hash != nullptr) {
+			for (const auto page: m_hash_pending) {
+				if (!m_hash_valid.Get(page)) {
+					continue;
+				}
+				const auto now = HashTrackerPage(
+				    reinterpret_cast<const void*>(m_cpu_addr + page * TRACKER_PAGE_SIZE));
+				if (now != (*m_page_hash)[page]) {
+					m_hash_valid.Unset(page);
+					s_hot_stats.invalidated++;
+				}
+			}
+		}
+		m_hash_pending.clear();
+	}
+
 	// Buffer created or destroyed over this range: its GPU copy is new, so no hash is current.
 	void InvalidatePageHashes(uint64_t vaddr, uint64_t size) {
 		const auto [start, end] = GetPageRange(vaddr, size);
@@ -295,6 +321,7 @@ private:
 			(*m_page_hash)[page] = hash;
 			m_hash_valid.Set(page);
 			m_unchanged[page] = 0;
+			m_hash_pending.push_back(static_cast<uint32_t>(page));
 		}
 		if (run_begin < last) {
 			func(m_cpu_addr + run_begin * TRACKER_PAGE_SIZE, (last - run_begin) * TRACKER_PAGE_SIZE);
@@ -333,6 +360,7 @@ private:
 	// Hot-page content tracking (GPU thread, under `lock`).
 	std::unique_ptr<std::array<uint64_t, TRACKER_REGION_PAGES>> m_page_hash;
 	RegionBits                                                  m_hash_valid;
+	std::vector<uint32_t>                                       m_hash_pending;
 	std::array<uint8_t, TRACKER_REGION_PAGES>                   m_unchanged {};
 	inline static HotPageStats                                  s_hot_stats {};
 	template <bool track, bool is_read>
