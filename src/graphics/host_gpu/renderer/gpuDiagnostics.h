@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_GPUDIAGNOSTICS_H_
 
 #include <array>
+#include <string>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -49,13 +50,44 @@ public:
 		std::memcpy(&value, &handle, sizeof(handle));
 		return value;
 	}
-	static void Record(const void* scheduler, uint64_t semaphore, uint64_t tick,
-	                   const GpuDiagnosticEvent& event) {
-		if (!Enabled()) return;
+	// Returns the event's sequence number (0 when diagnostics are off). Draw/dispatch sites pass
+	// it to CommandScheduler::Checkpoint as the VK_NV_device_diagnostic_checkpoints marker.
+	static uint64_t Record(const void* scheduler, uint64_t semaphore, uint64_t tick,
+	                       const GpuDiagnosticEvent& event) {
+		if (!Enabled()) return 0;
 		auto& state = State();
 		std::lock_guard lock(state.mutex);
 		const auto sequence = ++state.sequence;
 		state.ring[(sequence - 1) % Capacity] = {sequence, scheduler, semaphore, tick, event};
+		return sequence;
+	}
+	// One line for a checkpoint marker (= an event sequence) read back after a stall/device loss.
+	static std::string Describe(uint64_t sequence) {
+		if (!Enabled()) return "(diagnostics off)";
+		if (sequence == 0) return "(no marker)";
+		auto& state = State();
+		std::lock_guard lock(state.mutex);
+		const auto& item = state.ring[(sequence - 1) % Capacity];
+		if (item.sequence != sequence) {
+			return "seq=" + std::to_string(sequence) + " (no longer retained)";
+		}
+		const auto& event = item.event;
+		char text[256];
+		std::snprintf(text, sizeof(text), "seq=%" PRIu64 " tick=%" PRIu64 " kind=%s guest_submit=%" PRIu64
+		              " pipeline=0x%016" PRIx64, item.sequence, item.tick, event.kind,
+		              event.guest_submit, event.pipeline);
+		std::string line = text;
+		for (auto arg : event.args) {
+			std::snprintf(text, sizeof(text), " 0x%" PRIx64, arg);
+			line += text;
+		}
+		for (const auto& shader : event.shaders) {
+			if (shader.stage == 0) continue;
+			std::snprintf(text, sizeof(text), " shader(stage=%u,hash=0x%016" PRIx64 ",variant=0x%" PRIx64 ")",
+			              shader.stage, shader.hash, shader.variant);
+			line += text;
+		}
+		return line;
 	}
 	static void DumpStall(uint64_t semaphore, uint64_t target, uint64_t completed,
 	                      uint64_t next_tick) {

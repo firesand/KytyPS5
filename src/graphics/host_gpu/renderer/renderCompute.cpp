@@ -537,9 +537,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (program.info.uses_write_faults) {
 		m_context.GetBufferCache().MarkWriteFaultsDirty();
 	}
-	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	GpuDiagnosticEvent event;
 	if (GpuDiagnostics::Enabled()) {
-		GpuDiagnosticEvent event;
 		event.kind = "dispatch";
 		event.guest_submit = submit_id;
 		event.pipeline = GpuDiagnostics::HandleValue(pipeline.pipeline);
@@ -548,7 +547,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                  (uint64_t {input_info.threads_num[2]} << 32u)};
 		event.shaders[0] = {program.shader_hash, compute_program.id,
 		                    static_cast<uint32_t>(program.stage)};
-		m_context.GetCommandScheduler().RecordGpuOperation(event);
+		CommandScheduler::Checkpoint(vk_buffer, m_context.GetCommandScheduler().RecordGpuOperation(event));
+	}
+	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	if (GpuDiagnostics::Enabled()) {
 		if (persistent_group_probe) {
 			event.kind = "persistent-group-probe";
 			// args: requested x/y/z, emitted x/y/z. Record after the actual dispatch.
@@ -633,7 +635,6 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (program.info.uses_write_faults) {
 		m_context.GetBufferCache().MarkWriteFaultsDirty();
 	}
-	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	if (GpuDiagnostics::Enabled()) {
 		GpuDiagnosticEvent event;
 		event.kind = "dispatch-indirect";
@@ -644,8 +645,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		                  (uint64_t {input_info.threads_num[2]} << 32u)};
 		event.shaders[0] = {program.shader_hash, compute_program.id,
 		                    static_cast<uint32_t>(program.stage)};
-		m_context.GetCommandScheduler().RecordGpuOperation(event);
+		CommandScheduler::Checkpoint(vk_buffer, m_context.GetCommandScheduler().RecordGpuOperation(event));
 	}
+	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
 	m_context.GetCommandScheduler().DiagnosticOperationComplete();

@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/host_gpu/renderer/gpuDiagnostics.h"
 
 #include <array>
 #include <chrono>
@@ -199,6 +200,24 @@ void DumpAddressBindingsNear(uint64_t address) {
 	std::fflush(stdout);
 }
 
+void ReportQueueCheckpoints(vk::Queue queue) {
+	if (queue == nullptr || VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueueCheckpointDataNV == nullptr) {
+		return;
+	}
+	uint32_t count = 0;
+	queue.getCheckpointDataNV(&count, nullptr);
+	std::vector<vk::CheckpointDataNV> data(count);
+	queue.getCheckpointDataNV(&count, data.data());
+	std::printf("Vulkan NV checkpoints: %u%s\n", count,
+	            GpuDiagnostics::Enabled() ? "" : " (markers are only set with KYTY_GPU_DIAGNOSTICS=1)");
+	for (const auto& entry: data) {
+		const auto marker = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(entry.pCheckpointMarker));
+		std::printf("  checkpoint stage=%s marker=%" PRIu64 ": %s\n", vk::to_string(entry.stage).c_str(),
+		            marker, GpuDiagnostics::Describe(marker).c_str());
+	}
+	std::fflush(stdout);
+}
+
 bool ReportDeviceFault(vk::Device device, vk::Queue queue) {
 	if (device == nullptr || VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT == nullptr) {
 		std::printf("Vulkan device fault: VK_EXT_device_fault not available\n");
@@ -224,17 +243,8 @@ bool ReportDeviceFault(vk::Device device, vk::Queue queue) {
 		std::fflush(stdout);
 		return false;
 	}
-	if (queue != nullptr && VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueueCheckpointDataNV != nullptr) {
-		uint32_t count = 0;
-		queue.getCheckpointDataNV(&count, nullptr);
-		std::vector<vk::CheckpointDataNV> data(count);
-		queue.getCheckpointDataNV(&count, data.data());
-		std::printf("Vulkan NV checkpoints: %u\n", count);
-		for (const auto& entry: data) {
-			std::printf("  checkpoint stage=%s marker=%p\n", vk::to_string(entry.stage).c_str(),
-			            entry.pCheckpointMarker);
-		}
-		std::fflush(stdout);
+	if (queue != nullptr) {
+		ReportQueueCheckpoints(queue);
 	}
 	std::vector<vk::DeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
 	std::vector<vk::DeviceFaultVendorInfoEXT>  vendors(counts.vendorInfoCount);

@@ -1055,7 +1055,7 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 		event.args[2] = first;
 		event.args[3] = static_cast<uint32_t>(emit.vertex_offset);
 		event.args[4] = emit.first_instance;
-		scheduler.RecordGpuOperation(event);
+		CommandScheduler::Checkpoint(vk_buffer, scheduler.RecordGpuOperation(event));
 	};
 	switch (ucfg.GetPrimType()) {
 		case Prospero::PrimitiveType::kPointList:
@@ -1069,26 +1069,26 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 		case Prospero::PrimitiveType::kRectListLegacy:
 		case Prospero::PrimitiveType::kPatch:
 			if (draw.IsIndexed()) {
+				record(draw.index_count, 0);
 				vk_buffer.drawIndexed(draw.index_count, draw.instance_count, 0, emit.vertex_offset,
 				                      emit.first_instance);
-				record(draw.index_count, 0);
 			} else {
+				record(draw.index_count, emit.first_vertex);
 				vk_buffer.draw(draw.index_count, draw.instance_count, emit.first_vertex,
 				               emit.first_instance);
-				record(draw.index_count, emit.first_vertex);
 			}
 			break;
 		case Prospero::PrimitiveType::kQuadListLegacy:
 			EXIT_NOT_IMPLEMENTED((draw.index_count & 0x3u) != 0);
 			for (uint32_t i = 0; i < draw.index_count; i += 4) {
 				if (draw.IsIndexed()) {
+					record(4, i);
 					vk_buffer.drawIndexed(4, draw.instance_count, i, emit.vertex_offset,
 					                      emit.first_instance);
-					record(4, i);
 				} else {
+					record(4, i + emit.first_vertex);
 					vk_buffer.draw(4, draw.instance_count, i + emit.first_vertex,
 					               emit.first_instance);
-					record(4, i + emit.first_vertex);
 				}
 			}
 			break;
@@ -1306,7 +1306,6 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	}
 	if (mesh_active) {
-		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 		if (GpuDiagnostics::Enabled()) {
 			const auto& mesh = state.vertex_info[0].mesh;
 			if (diagnostic.shaders[0].hash == 0x67e610ccc37800edull) {
@@ -1324,8 +1323,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			}
 			diagnostic.args = {mesh_groups, draw.instance_count, 1, draw.index_count,
 			                   emit.first_instance, index_source.address};
-			m_context.GetCommandScheduler().RecordGpuOperation(diagnostic);
+			CommandScheduler::Checkpoint(vk_buffer,
+			                             m_context.GetCommandScheduler().RecordGpuOperation(diagnostic));
 		}
+		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit, m_context.GetCommandScheduler(), diagnostic);
 	}

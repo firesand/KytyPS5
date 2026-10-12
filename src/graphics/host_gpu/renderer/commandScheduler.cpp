@@ -404,7 +404,8 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		                  m_command.m_debug_submit_id, m_command.m_debug_arg0,
 		                  m_command.m_debug_arg1, m_command.m_debug_arg2, m_command.m_debug_arg3,
 		                  m_command.m_debug_arg4);
-		ReportDeviceFault(graphics.device);
+		Common::LockGuard lock(graphics.queue_mutex); // recursive: harmless if already held
+		ReportDeviceFault(graphics.device, graphics.queue);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 

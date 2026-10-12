@@ -41,7 +41,8 @@ void MasterSemaphore::Refresh() {
 	if (result != vk::Result::eSuccess) {
 		std::printf("MasterSemaphore::Refresh: vkGetSemaphoreCounterValue = %s\n",
 		            vk::to_string(result).c_str());
-		ReportDeviceFault(m_graphics.device);
+		Common::LockGuard lock(m_graphics.queue_mutex);
+		ReportDeviceFault(m_graphics.device, m_graphics.queue);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
@@ -92,7 +93,11 @@ void MasterSemaphore::Wait(uint64_t tick) {
 			std::printf("MasterSemaphore::Wait: timeout #%u waiting for %" PRIu64 ", counter=%" PRIu64
 			            " status=%s\n", n, tick, counter, vk::to_string(status).c_str());
 			if (status != vk::Result::eSuccess) {
-				ReportDeviceFault(m_graphics.device);
+				Common::LockGuard lock(m_graphics.queue_mutex);
+				ReportDeviceFault(m_graphics.device, m_graphics.queue);
+			} else if (n == 1) {
+				Common::LockGuard lock(m_graphics.queue_mutex);
+				ReportQueueCheckpoints(m_graphics.queue);
 			}
 			if (n == 1) {
 				// Is the queue alive? An empty submission with a fence either completes (the hung
@@ -257,6 +262,10 @@ void MasterSemaphore::ReportStall(const char* where, uint64_t tick, double waite
 	LOGF("GPU stall: semaphore counter=%" PRIu64 " status=%s\n", counter,
 	     vk::to_string(status).c_str());
 	SubmitLog::Dump(m_graphics.device, m_semaphore);
+	{
+		Common::LockGuard lock(m_graphics.queue_mutex);
+		ReportQueueCheckpoints(m_graphics.queue);
+	}
 	vk::FenceCreateInfo fence_info {};
 	vk::Fence           fence {};
 	if (m_graphics.device.createFence(&fence_info, nullptr, &fence) == vk::Result::eSuccess) {

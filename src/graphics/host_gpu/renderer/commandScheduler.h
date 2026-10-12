@@ -36,9 +36,18 @@ public:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
 	void                      Wait(uint64_t tick);
-	void RecordGpuOperation(const GpuDiagnosticEvent& event) {
-		GpuDiagnostics::Record(this, GpuDiagnostics::HandleValue(m_master.Handle()),
-		                       CurrentTick(), event);
+	uint64_t RecordGpuOperation(const GpuDiagnosticEvent& event) {
+		return GpuDiagnostics::Record(this, GpuDiagnostics::HandleValue(m_master.Handle()),
+		                              CurrentTick(), event);
+	}
+	// VK_NV_device_diagnostic_checkpoints marker = the event's sequence, recorded right before a
+	// draw/dispatch (diagnostics mode). After a stall or device loss the queue reports the last
+	// started and last completed markers, naming the hanging operation (ng-30: Xid 109 context
+	// switch timeout with only an instruction pointer to go on).
+	static void Checkpoint(vk::CommandBuffer command, uint64_t sequence) {
+		if (sequence != 0 && VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdSetCheckpointNV != nullptr) {
+			command.setCheckpointNV(reinterpret_cast<const void*>(static_cast<uintptr_t>(sequence)));
+		}
 	}
 	void DiagnosticOperationComplete() {
 		if (GpuDiagnostics::Serialize()) FlushAndWait();
