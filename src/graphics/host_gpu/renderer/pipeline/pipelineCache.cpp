@@ -259,13 +259,119 @@ struct PipelineCache::ProgramCache {
 			return revision != call_source->revision;
 		}
 
+		// Memo of the previous materialization: its inputs (user data, dispatch size, shader base)
+		// and every guest DWORD the SRT walk read. When all of them are unchanged the snapshot and
+		// the specialization are unchanged too, so the walk is skipped. The walk was the GPU
+		// thread's largest per-dispatch cost in Zero Company's Nanite scene. KYTY_SRT_MEMO=0 disables.
+		struct Memo {
+			struct Read {
+				uint64_t address;
+				uint32_t dwords;
+				uint32_t offset;
+			};
+			bool                  valid    = false;
+			bool                  recorded = false;
+			std::vector<uint32_t> user_data;
+			std::vector<uint32_t> workgroup_counts;
+			uint64_t              shader_base = 0;
+			std::vector<Read>     reads;
+			std::vector<uint32_t> words;
+			size_t                permutation = SIZE_MAX;
+		};
+		struct RecordingReader {
+			ShaderRecompiler::IR::SrtMemoryReader inner;
+			void*                                 inner_userdata;
+			Memo*                                 memo;
+			static bool Read(void* userdata, uint64_t address, std::span<uint32_t> values) {
+				auto* self = static_cast<RecordingReader*>(userdata);
+				if (!self->inner(self->inner_userdata, address, values)) {
+					return false;
+				}
+				self->memo->reads.push_back({address, static_cast<uint32_t>(values.size()),
+				                             static_cast<uint32_t>(self->memo->words.size())});
+				self->memo->words.insert(self->memo->words.end(), values.begin(), values.end());
+				return true;
+			}
+		};
+		static bool MemoEnabled() {
+			static const bool enabled = [] {
+				const char* value = std::getenv("KYTY_SRT_MEMO");
+				return value == nullptr || value[0] != '0';
+			}();
+			return enabled;
+		}
+		static void CountMemo(bool hit) {
+			static std::atomic<uint64_t> hits {0};
+			static std::atomic<uint64_t> misses {0};
+			const auto total = (hit ? hits : misses).fetch_add(1, std::memory_order_relaxed) + 1 +
+			                   (hit ? misses : hits).load(std::memory_order_relaxed);
+			if (total % 200000 == 0) {
+				LOGF("SrtMemo: hits=%" PRIu64 " misses=%" PRIu64 "\n", hits.load(), misses.load());
+			}
+		}
+		[[nodiscard]] bool MemoHit(const ShaderRecompiler::IR::SrtRuntime& runtime) const {
+			if (!memo.valid || !memo.recorded || runtime.shader_base != memo.shader_base ||
+			    runtime.read_specialization_memory == nullptr ||
+			    !std::ranges::equal(runtime.user_data, memo.user_data) ||
+			    !std::ranges::equal(runtime.workgroup_counts, memo.workgroup_counts)) {
+				return false;
+			}
+			thread_local std::vector<uint32_t> scratch;
+			for (const auto& read: memo.reads) {
+				scratch.resize(read.dwords);
+				if (!runtime.read_specialization_memory(runtime.userdata, read.address, scratch) ||
+				    std::memcmp(scratch.data(), memo.words.data() + read.offset,
+				                read.dwords * sizeof(uint32_t)) != 0) {
+					return false;
+				}
+			}
+			return true;
+		}
+		void RememberMemo(const ShaderRecompiler::IR::SrtRuntime& runtime, size_t index) {
+			if (!memo.recorded) {
+				return;
+			}
+			memo.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+			memo.workgroup_counts.assign(runtime.workgroup_counts.begin(),
+			                             runtime.workgroup_counts.end());
+			memo.shader_base = runtime.shader_base;
+			memo.permutation = index;
+			memo.valid       = true;
+		}
+		void ForgetMemo() {
+			memo.valid    = false;
+			memo.recorded = false;
+			memo.reads.clear();
+			memo.words.clear();
+		}
+
 		template <bool HasCalls>
 		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime,
 		                             uint32_t push_data_cursor) {
+			if (MemoEnabled() && memo.permutation < permutations.size() && MemoHit(runtime)) {
+				auto&       candidate = permutations[memo.permutation];
+				const auto& layout    = candidate.program.bindings;
+				if (layout.push_data_start_dword == ShaderRecompiler::IR::PushData::StartFor(
+				                                        push_data_cursor, layout.ShaderDataDwords()) &&
+				    (!HasCalls || std::ranges::equal(candidate.function_code, FunctionCode()))) {
+					CountMemo(true);
+					return &candidate;
+				}
+			}
+			CountMemo(false);
+			ForgetMemo();
+			RecordingReader recorder {runtime.read_specialization_memory, runtime.userdata, &memo};
+			auto            recording = runtime;
+			if (MemoEnabled() && runtime.read_specialization_memory != nullptr) {
+				recording.read_specialization_memory = &RecordingReader::Read;
+				recording.userdata                   = &recorder;
+				memo.recorded                        = true;
+			}
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    resource_plan, runtime, resources, specialization));
-			for (auto& candidate: permutations) {
-				const auto& layout = candidate.program.bindings;
+			    resource_plan, recording, resources, specialization));
+			for (size_t index = 0; index < permutations.size(); ++index) {
+				auto&       candidate = permutations[index];
+				const auto& layout    = candidate.program.bindings;
 				if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
 				        push_data_cursor, layout.ShaderDataDwords()) ||
 				    candidate.specialization != specialization) {
@@ -274,6 +380,7 @@ struct PipelineCache::ProgramCache {
 				if constexpr (HasCalls) {
 					if (!std::ranges::equal(candidate.function_code, FunctionCode())) continue;
 				}
+				RememberMemo(runtime, index);
 				return &candidate;
 			}
 			return nullptr;
@@ -284,6 +391,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<Permutation>                    permutations;
+		Memo                                        memo;
 	};
 
 	struct ProgramKeyHash {
@@ -444,6 +552,7 @@ struct PipelineCache::ProgramCache {
 			    entry->second.resource_plan, runtime, entry->second.resources,
 			    entry->second.specialization));
 		} else if (source_changed) {
+			entry->second.ForgetMemo();
 			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
 			if (const auto* permutation = entry->second.FindPermutation<true>(runtime, push_data_cursor)) {
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
@@ -454,6 +563,7 @@ struct PipelineCache::ProgramCache {
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
 		    entry->second.FunctionCode()));
+		entry->second.RememberMemo(runtime, entry->second.permutations.size() - 1);
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);

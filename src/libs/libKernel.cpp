@@ -1068,6 +1068,11 @@ void KernelDispatchPendingSignalForCurrentThread() {
 	if (current == nullptr) {
 		return;
 	}
+	// Sleep and yield paths poll this constantly; one relaxed load beats a fetch_and per signal
+	// (a Zero Company thread spent ~15 % of a core in the loop below).
+	if (!PthreadHasPendingSignals(current)) {
+		return;
+	}
 
 	for (int signum = 0; signum < static_cast<int>(std::size(g_exception_handlers)); signum++) {
 		if (!PthreadTakePendingSignal(current, signum)) {
