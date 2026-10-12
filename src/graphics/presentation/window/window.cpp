@@ -35,6 +35,7 @@
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_SIMD
 #include "stb_image.h"
+#include <cinttypes>
 
 // IWYU pragma: no_include <intrin.h>
 
@@ -741,8 +742,13 @@ void WindowContext::Run() {
 		if (elapsed >= title_interval_ms) {
 			const auto frames = loop.presented_frames.load(std::memory_order_relaxed);
 			if (frames != 0) {
-				UpdateTitle(frames, static_cast<double>(frames - title_frames) * 1000.0 /
-				                        static_cast<double>(elapsed));
+				const auto fps = static_cast<double>(frames - title_frames) * 1000.0 /
+				                 static_cast<double>(elapsed);
+				UpdateTitle(frames, fps);
+				// One line per title refresh keeps frame-rate history in the log now that the
+				// per-call flip status dumps are verbose-only (claude/flips.py reads it).
+				LOGF("Status: t=%.1f frames=%" PRIu64 " fps=%.1f\n",
+				     static_cast<double>(now) / 1000.0, static_cast<uint64_t>(frames), fps);
 			}
 			title_time   = now;
 			title_frames = frames;
