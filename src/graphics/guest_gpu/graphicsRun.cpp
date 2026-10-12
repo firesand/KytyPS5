@@ -416,6 +416,22 @@ void CommandProcessor::PrepareHostRead(uint64_t vaddr, uint64_t size) {
 	m_renderer.GetBufferCache().PrepareHostRead(vaddr, size);
 }
 
+void CommandProcessor::ResyncStaleGuestBytes(const char* what, uint64_t vaddr, uint64_t size) {
+	auto& cache = m_renderer.GetBufferCache();
+	GetScheduler().Current().EndRendering();
+	// A fresh write-fault pass over everything written so far, waited to completion including the
+	// priority operation that marks the pages; the caller's re-read then faults and downloads.
+	cache.MarkWriteFaultsDirty();
+	cache.FlushWriteFaults(true);
+	cache.OnCommandBoundary();
+	static std::atomic<uint32_t> reports {0};
+	if (reports.fetch_add(1, std::memory_order_relaxed) < 50) {
+		LOGF("CommandProcessor: %s at 0x%016" PRIx64 "/%" PRIu64
+		     " bytes looked stale: resynced GPU writes\n",
+		     what, vaddr, size);
+	}
+}
+
 void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cache_policy,
                                uint64_t dst_address_or_offset, uint8_t src_sel,
                                uint8_t  src_cache_policy,
@@ -755,12 +771,8 @@ void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands,
 	// read again before parsing.
 	if (!commands.empty() && !LooksLikePm4Header(commands[0])) {
 		const auto first = commands[0];
-		GetScheduler().Current().EndRendering();
-		// A fresh write-fault pass over everything written so far, waited to completion including
-		// the priority operation that marks the pages; the re-read below then faults and downloads.
-		m_renderer.GetBufferCache().MarkWriteFaultsDirty();
-		m_renderer.GetBufferCache().FlushWriteFaults(true);
-		m_renderer.GetBufferCache().OnCommandBoundary();
+		ResyncStaleGuestBytes("indirect buffer", reinterpret_cast<uint64_t>(commands.data()),
+		                      commands.size_bytes());
 		static std::atomic<uint32_t> reports {0};
 		if (reports.fetch_add(1, std::memory_order_relaxed) < 50) {
 			LOGF("CommandProcessor: indirect buffer 0x%016" PRIx64 "/%zu started with 0x%08" PRIx32
@@ -1050,6 +1062,12 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		}
 	}
 
+	// GPU-driven culling builds these records: publish pending unbounded writes before the host
+	// reads them (audit 2026-10-12: only count_addr was prepared; a stale instance count here
+	// becomes a runaway draw).
+	PrepareHostRead(m_draw_indirect_args_base_addr + data_offset,
+	                static_cast<uint64_t>(draw_count - 1) * stride_in_bytes + args_size);
+
 	for (uint32_t i = 0; i < draw_count; i++) {
 		const auto args_addr = m_draw_indirect_args_base_addr + data_offset +
 		                       static_cast<uint64_t>(i) * stride_in_bytes;
@@ -1131,6 +1149,8 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
 	if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
+		// Host-side read of GPU-built dispatch arguments (audit 2026-10-12).
+		PrepareHostRead(args_addr, sizeof(vk::DispatchIndirectCommand));
 		const auto* args = reinterpret_cast<const vk::DispatchIndirectCommand*>(args_addr);
 		DispatchDirect(args->x, args->y, args->z, mode);
 		return;

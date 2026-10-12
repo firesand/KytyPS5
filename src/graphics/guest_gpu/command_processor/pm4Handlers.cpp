@@ -1977,6 +1977,10 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect CX registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	// GPU-built register list: publish pending unbounded writes before the host reads it (see the
+	// SH twin; this handler tolerates unknown offsets, so stale pairs would apply silently).
+	cp.PrepareHostRead(reinterpret_cast<uint64_t>(indirect_buffer),
+	                   static_cast<uint64_t>(indirect_num_dw) * 2u * sizeof(uint32_t));
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		// Keep the encoded offset for packet control values, and use the normalized offset
 		// only for register dispatch.
@@ -2048,6 +2052,13 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		EXIT("indirect SH registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
+	const auto indirect_bytes   = static_cast<uint64_t>(indirect_num_dw) * 2u * sizeof(uint32_t);
+	// The register list is guest memory the GPU may have built (UE5 GPU-driven dispatches):
+	// publish pending unbounded writes before the host reads it. ng-31 died here parsing a
+	// stale float (0x49080ff2) as a register offset; a still-implausible pair triggers one full
+	// resync (as for stale indirect buffers) and a re-read before giving up.
+	cp.PrepareHostRead(indirect_address, indirect_bytes);
+	bool resynced = false;
 
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
@@ -2067,10 +2078,26 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 			continue;
 		}
 
+		if (cmd_offset >= Pm4::SH_NUM && !resynced) {
+			resynced = true;
+			cp.ResyncStaleGuestBytes("indirect SH registers", indirect_address, indirect_bytes);
+			raw_cmd_offset = *reinterpret_cast<const volatile uint32_t*>(indirect_buffer);
+			cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
+			value          = *reinterpret_cast<const volatile uint32_t*>(indirect_buffer + 1);
+			if (cmd_offset == Pm4::SH_NOP || raw_cmd_offset == 0xffffffffu) {
+				continue;
+			}
+		}
 		if (cmd_offset >= Pm4::SH_NUM) {
+			const auto* dump_regs = indirect_buffer - static_cast<size_t>(i) * 2u;
+			for (uint32_t j = 0; j < indirect_num_dw && j < 16; j++) {
+				LOGF("\t sh_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
+				     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);
+			}
 			EXIT("unsupported indirect SH register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
-			     "), value = 0x%08" PRIx32 "\n",
-			     cmd_offset, raw_cmd_offset, value);
+			     "), value = 0x%08" PRIx32 " at 0x%016" PRIx64 " [%" PRIu32 "/%" PRIu32
+			     "] after resync\n",
+			     cmd_offset, raw_cmd_offset, value, indirect_address, i, indirect_num_dw);
 		}
 
 		auto pfunc = g_hw_sh_indirect_func[cmd_offset];
@@ -2110,6 +2137,10 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect UC registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
+	const auto indirect_bytes   = static_cast<uint64_t>(indirect_num_dw) * 2u * sizeof(uint32_t);
+	cp.PrepareHostRead(indirect_address, indirect_bytes); // GPU-built list: see the SH twin
+	bool resynced = false;
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
@@ -2125,10 +2156,21 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 		if (cmd_offset == Pm4::UC_NOP) {
 			continue;
 		}
+		if (cmd_offset >= Pm4::UC_NUM && !resynced) {
+			resynced = true;
+			cp.ResyncStaleGuestBytes("indirect UC registers", indirect_address, indirect_bytes);
+			raw_cmd_offset = *reinterpret_cast<const volatile uint32_t*>(indirect_buffer);
+			cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
+			value          = *reinterpret_cast<const volatile uint32_t*>(indirect_buffer + 1);
+			if (cmd_offset == Pm4::UC_NOP) {
+				continue;
+			}
+		}
 		if (cmd_offset >= Pm4::UC_NUM) {
 			EXIT("unsupported indirect UC register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
-			     "), value = 0x%08" PRIx32 "\n",
-			     cmd_offset, raw_cmd_offset, value);
+			     "), value = 0x%08" PRIx32 " at 0x%016" PRIx64 " [%" PRIu32 "/%" PRIu32
+			     "] after resync\n",
+			     cmd_offset, raw_cmd_offset, value, indirect_address, i, indirect_num_dw);
 		}
 
 		auto pfunc = g_hw_uc_indirect_func[cmd_offset & (Pm4::UC_NUM - 1)];

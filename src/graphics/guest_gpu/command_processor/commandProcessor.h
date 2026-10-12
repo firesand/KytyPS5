@@ -132,6 +132,10 @@ public:
 	void WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes);
 	// Publishes pending unbounded-descriptor GPU writes before the host reads guest memory.
 	void PrepareHostRead(uint64_t vaddr, uint64_t size);
+	// A host read of GPU-built guest bytes came back implausible (not a PM4 header, a register
+	// offset out of range): land every unbounded GPU write recorded so far and let the tracker
+	// protect the pages; the caller reads the bytes again afterwards.
+	void ResyncStaleGuestBytes(const char* what, uint64_t vaddr, uint64_t size);
 	void DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cache_policy,
 	             uint64_t dst_address_or_offset, uint8_t src_sel, uint8_t src_cache_policy,
 	             uint64_t src_address_or_offset_or_immediate, uint32_t num_bytes,
