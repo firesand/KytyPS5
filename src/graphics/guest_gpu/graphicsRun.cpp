@@ -1159,12 +1159,14 @@ void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_
 // pass marked them, i.e. stale CPU bytes (audit 2026-10-12; UE5 loaders wait on such results).
 // While such writes are pending the store is deferred behind the write-fault pass (priority
 // order) and performed on the GPU thread, so a protected page takes the tracker's merge path.
-// KYTY_EOP_LABEL_DEFER=0 restores the immediate store.
+// KYTY_EOP_LABEL_DEFER=1 enables the deferred store; it is off by default: the first version
+// (58c4a83) cost most of the frame rate and the second (498d034) froze the boot and died on a
+// null host write at t=104 s (ng-27), so it needs more work before it can be the default.
 template <typename T>
 void CommandProcessor::WriteEopLabel(T* dst, T value) {
 	static const bool defer = [] {
 		const char* env = std::getenv("KYTY_EOP_LABEL_DEFER");
-		return env == nullptr || env[0] != '0';
+		return env != nullptr && env[0] == '1';
 	}();
 	auto& cache = m_renderer.GetBufferCache();
 	if (!defer || !cache.HasPendingUnboundedWrites()) {
