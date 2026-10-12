@@ -30,6 +30,8 @@ public:
 	void               Shutdown();
 	[[nodiscard]] bool IsStopping();
 	void               SendCommand(Common::UniqueFunction<void>&& command);
+	// Wake the GPU thread out of its 100 ms blocked-queue wait (a label it polls was written).
+	void               Wake();
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
 
 	// Submitted command memory is borrowed and must remain valid until GPU execution completes.

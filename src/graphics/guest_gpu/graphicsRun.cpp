@@ -123,6 +123,11 @@ void GuestGpu::ProcessCommands() {
 	}
 }
 
+void GuestGpu::Wake() {
+	Common::LockGuard lock(m_queue_mutex);
+	m_work_available.Signal();
+}
+
 void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 	EXIT_IF(!command);
 	if (IsGpuThread()) {
@@ -1169,7 +1174,18 @@ void CommandProcessor::WriteEopLabel(T* dst, T value) {
 	cache.FlushWriteFaults(false);
 	auto* gpu = g_gpu_state;
 	EXIT_IF(gpu == nullptr);
-	GetScheduler().DeferPriorityOperation([gpu, dst, value] {
+	GetScheduler().DeferPriorityOperation([gpu, &cache, dst, value] {
+		// Priority thread, after the tick completed and the write-fault marks ran. A label page
+		// the GPU does not own is written directly (and marked CPU-modified for later uploads);
+		// a GPU-dirty page goes through the GPU thread so the store takes the merge path. Either
+		// way wake the GPU thread: a WAIT_REG_MEM on this label retries only every 100 ms.
+		const auto address = reinterpret_cast<uint64_t>(dst);
+		if (!cache.IsRegionGpuModified(address, sizeof(T))) {
+			LibKernel::Memory::WriteBacking(address, &value, sizeof(T));
+			cache.InvalidateMemory(address, sizeof(T));
+			gpu->Wake();
+			return;
+		}
 		gpu->SendCommand([dst, value] { std::memcpy(dst, &value, sizeof(value)); });
 	});
 }
