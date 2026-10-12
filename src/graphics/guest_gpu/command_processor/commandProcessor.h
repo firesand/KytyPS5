@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <vector>
 
@@ -173,7 +174,11 @@ private:
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution);
 	template <typename T>
-	void WriteEopLabel(T* dst, T value);
+	// Returns true when the store was deferred (KYTY_EOP_LABEL_DEFER=1 with unbounded writes
+	// pending); after_store then runs right after the store, on whichever thread performs it,
+	// so an end-of-pipe interrupt can follow the label instead of racing it.
+	bool WriteEopLabel(T* dst, T value, std::function<void()> after_store = {});
+	std::function<void()> EopInterrupt(bool with_interrupt, uint32_t context_id);
 	void SuspendPm4();
 	void SuspendPm4(const char* kind, uint64_t addr = 0, uint64_t ref = 0, uint64_t mask = 0,
 	                uint32_t func = 0, uint32_t size = 0);

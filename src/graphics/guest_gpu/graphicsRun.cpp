@@ -1220,8 +1220,18 @@ void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_
 // writes through the backing mapping and only marks the tracker; v3 first used the buffer cache's
 // IsRegionGpuModified, whose PrepareHostRead touches GPU-thread-only maps (ng-33 crash), so the
 // query is now tracker-only (IsLabelRegionGpuModified).
+// The interrupt step for a deferred label store (see WriteEopLabel); empty without an interrupt.
+std::function<void()> CommandProcessor::EopInterrupt(bool with_interrupt, uint32_t context_id) {
+	if (!with_interrupt) {
+		return {};
+	}
+	return [this, event_id = m_interrupt_event_id, context_id] {
+		m_renderer.TriggerInterrupt(event_id, context_id);
+	};
+}
+
 template <typename T>
-void CommandProcessor::WriteEopLabel(T* dst, T value) {
+bool CommandProcessor::WriteEopLabel(T* dst, T value, std::function<void()> after_store) {
 	static const bool defer = [] {
 		const char* env = std::getenv("KYTY_EOP_LABEL_DEFER");
 		return env != nullptr && env[0] == '1';
@@ -1229,12 +1239,14 @@ void CommandProcessor::WriteEopLabel(T* dst, T value) {
 	auto& cache = m_renderer.GetBufferCache();
 	if (!defer || !cache.HasPendingUnboundedWrites()) {
 		std::memcpy(dst, &value, sizeof(value));
-		return;
+		return false; // the caller schedules the interrupt as before
 	}
 	cache.FlushWriteFaults(false);
 	auto* gpu = g_gpu_state;
 	EXIT_IF(gpu == nullptr);
-	GetScheduler().DeferPriorityOperation([gpu, &cache, dst, value] {
+	// The interrupt (after_store) is delivered by the same step that performs the store, so it
+	// can no longer overtake a store handed to the GPU thread (review 2026-10-12).
+	GetScheduler().DeferPriorityOperation([gpu, &cache, dst, value, after_store = std::move(after_store)] {
 		// Priority thread, after the tick completed and the write-fault marks ran. A label page
 		// the GPU does not own is written directly (and marked CPU-modified for later uploads);
 		// a GPU-dirty page goes through the GPU thread so the store takes the merge path. Either
@@ -1243,11 +1255,20 @@ void CommandProcessor::WriteEopLabel(T* dst, T value) {
 		if (!cache.IsLabelRegionGpuModified(address, sizeof(T)) &&
 		    LibKernel::Memory::TryWriteBacking(address, &value, sizeof(T))) {
 			cache.MarkLabelWritten(address, sizeof(T)); // tracker only: no readback off the GPU thread
+			if (after_store) {
+				after_store();
+			}
 			gpu->Wake();
 			return;
 		}
-		gpu->SendCommand([dst, value] { std::memcpy(dst, &value, sizeof(value)); });
+		gpu->SendCommand([dst, value, after_store] {
+			std::memcpy(dst, &value, sizeof(value));
+			if (after_store) {
+				after_store();
+			}
+		});
 	});
+	return true;
 }
 
 template <typename T>
@@ -1302,9 +1323,9 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 	auto write32 = [&](bool with_writeback) {
 		auto* dst  = static_cast<uint32_t*>(dst_gpu_addr);
 		auto  data = static_cast<uint32_t>(value);
-		WriteEopLabel(dst, data);
+		const bool deferred = WriteEopLabel(dst, data, EopInterrupt(with_interrupt, interrupt_context_id));
 
-		if (with_interrupt) {
+		if (with_interrupt && !deferred) {
 			if (with_writeback) {
 				Sync::WriteAtEndOfPipeWithInterruptWriteBack32(m_submit_id, command, dst,
 				                                               data, m_interrupt_event_id,
@@ -1356,9 +1377,10 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 				}
 				auto write64 = [&](bool with_writeback) {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
-					WriteEopLabel(dst, value);
+					const bool deferred =
+					    WriteEopLabel(dst, value, EopInterrupt(with_interrupt, interrupt_context_id));
 
-					if (with_interrupt) {
+					if (with_interrupt && !deferred) {
 						if (with_writeback) {
 							Sync::WriteAtEndOfPipeWithInterruptWriteBack64(
 							    m_submit_id, command, dst, value, m_interrupt_event_id,
