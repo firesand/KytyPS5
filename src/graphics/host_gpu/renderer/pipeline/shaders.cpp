@@ -614,8 +614,25 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	const auto gfx_vs_hash = vs_input_info.stage.program->shader_hash;
 	const auto gfx_ps_hash = ps_active && ps_input_info != nullptr && ps_input_info->stage
 	                             ? ps_input_info->stage.program->shader_hash : 0ull;
-	LOGF("PipelineTrace: vkCreateGraphicsPipelines begin vs=0x%016" PRIx64 " ps=0x%016" PRIx64 "\n",
-	     gfx_vs_hash, gfx_ps_hash);
+	{
+		// One line per pipeline with its targets and blend state, so a log alone can tell which
+		// passes are additive (bokeh scatter, particles) or write partial masks.
+		std::string targets;
+		for (uint32_t i = 0; i < rendering.color_count; i++) {
+			const auto& blend = color_blend_attachment[i];
+			targets += fmt::format(" mrt{}={}:m{:x}", i, vk::to_string(rendering.color_formats[i]),
+			                       static_cast<uint32_t>(static_params.color_mask[i]));
+			if (blend.blendEnable != 0u) {
+				targets += fmt::format(":{}*src{}{}*dst", vk::to_string(blend.srcColorBlendFactor),
+				                       vk::to_string(blend.colorBlendOp),
+				                       vk::to_string(blend.dstColorBlendFactor));
+			}
+		}
+		LOGF("PipelineTrace: vkCreateGraphicsPipelines begin vs=0x%016" PRIx64 " ps=0x%016" PRIx64
+		     " topology=%u depth=%d samples=%u%s\n",
+		     gfx_vs_hash, gfx_ps_hash, static_cast<uint32_t>(static_params.topology),
+		     with_depth ? 1 : 0, static_cast<uint32_t>(static_params.samples), targets.c_str());
+	}
 	Log::Flush();
 	const auto gfx_compile_start = std::chrono::steady_clock::now();
 	result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,

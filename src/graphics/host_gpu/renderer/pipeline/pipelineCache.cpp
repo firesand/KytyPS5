@@ -133,9 +133,20 @@ void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
 	file.Write(spirv.data(), spirv.size() * sizeof(uint32_t));
 }
 
+// KYTY_DUMP_SHADER_BINARIES=1 writes every newly translated guest shader binary under
+// <shader log folder>/original/ without the IR dumps or the GPU diagnostics ring.
+bool DumpShaderBinariesEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DUMP_SHADER_BINARIES");
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
+	}();
+	return enabled;
+}
+
 void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
                         std::span<const uint32_t> code) {
-	if (!Config::GraphicsDebugDumpEnabled() && !GpuDiagnostics::DumpShaders()) {
+	if (!Config::GraphicsDebugDumpEnabled() && !GpuDiagnostics::DumpShaders() &&
+	    !DumpShaderBinariesEnabled()) {
 		return;
 	}
 	EXIT_IF(code.empty());
@@ -683,6 +694,8 @@ void PipelineCache::EmergencySave() {
 	// alongside pipeline creation on the GPU thread (pipeline caches are internally synchronized).
 	auto* cache = s_live.exchange(nullptr, std::memory_order_acq_rel);
 	if (cache != nullptr && cache->m_unsaved_pipelines != 0) {
+		PipelineCacheLog("Vulkan pipeline cache: emergency save ({} new pipelines)",
+		                 cache->m_unsaved_pipelines);
 		cache->Save(false);
 	}
 }
