@@ -83,7 +83,17 @@ public:
 			r.m_id = audio_id;
 			return r;
 		}
-		[[nodiscard]] int GetId() const { return m_id; }
+		// Output handles carry the port's generation (bits 16..30) so a handle that outlived a
+		// close/reopen of its slot is rejected instead of addressing the new port.
+		static Id Create(int slot, uint32_t generation) {
+			Id r;
+			r.m_id = slot | static_cast<int>((generation & 0x7fffu) << 16u);
+			return r;
+		}
+		[[nodiscard]] int GetId() const { return m_id < 0 ? m_id : (m_id & 0xffff); }
+		[[nodiscard]] uint32_t Generation() const {
+			return m_id < 0 ? 0u : (static_cast<uint32_t>(m_id) >> 16u) & 0x7fffu;
+		}
 
 		int m_id = -1;
 	};
@@ -129,7 +139,9 @@ private:
 
 		SDL_AudioStream*                      stream  = nullptr;
 		Controller::DualSenseHaptics::Stream* haptics = nullptr;
-		uint32_t busy = 0; // AudioOutOutputs calls in flight; AudioOutClose waits for zero
+		uint32_t busy       = 0; // AudioOutOutputs calls in flight (pins); see AudioOutClose
+		uint32_t generation = 0; // bumped on every open; part of the handle
+		bool     closing    = false; // closed while pinned: the last release destroys it
 	};
 
 	struct PortIn {
@@ -145,6 +157,9 @@ private:
 	};
 
 	PortIn* GetAudioInPort(Id handle); // Caller holds m_mutex.
+	// Caller holds m_mutex. Null for a free, closing or re-generated slot.
+	PortOut* FindOutPort(Id handle);
+	void     DestroyOutPort(PortOut* port); // Caller holds m_mutex; busy must be 0.
 
 	Common::Mutex   m_mutex;
 	Common::CondVar m_port_released; // signalled when a PortOut::busy count drops
@@ -469,56 +484,78 @@ Audio::Id Audio::AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, For
 				    Controller::DualSenseHaptics::Open(freq, type == AUDIO_OUT_PORT_TYPE_PADSPK);
 			}
 
-			return Id::Create(id);
+			port.generation = port.generation % 0x7ffeu + 1u; // never 0, never wraps to 0
+			return Id::Create(id, port.generation);
 		}
 	}
 
 	return Id::Invalid();
 }
 
+Audio::PortOut* Audio::FindOutPort(Id handle) {
+	const auto slot = handle.GetId();
+	if (slot < 0 || slot >= OUT_PORTS_MAX) {
+		return nullptr;
+	}
+	auto& port = m_out_ports[slot];
+	if (!port.used || port.closing || port.generation != handle.Generation()) {
+		return nullptr;
+	}
+	return &port;
+}
+
+void Audio::DestroyOutPort(PortOut* port) {
+	EXIT_IF(port->busy != 0);
+	CloseSdlDevice(port);
+	const auto generation = port->generation;
+	*port            = {};
+	port->generation = generation;
+}
+
 bool Audio::AudioOutClose(Id handle) {
 	Common::LockGuard lock(m_mutex);
 
-	if (AudioOutValid(handle)) {
-		auto& port = m_out_ports[handle.GetId()];
-
-		// AudioOut2 no longer holds its state lock across the output (df6e3e0), so an output call
-		// may still be queueing into this port: wait for it instead of destroying the SDL stream
-		// under it or letting the slot be reused with another format (review 2026-10-12).
-		for (int waited = 0; port.busy != 0 && waited < 2000; waited++) {
-			m_port_released.WaitFor(&m_mutex, 1000);
-		}
-		if (port.busy != 0) {
-			LOGF("AudioOut: closing port %d while an output call is still in flight\n", handle.GetId());
-		}
-		CloseSdlDevice(&port);
-		port = {};
-
-		return true;
+	auto* port = FindOutPort(handle);
+	if (port == nullptr) {
+		return false;
 	}
-
-	return false;
+	// AudioOut2 no longer holds its state lock across the output (df6e3e0), so an output call may
+	// still be queueing into this port. From here no new reference can be taken (FindOutPort
+	// rejects closing ports and the slot stays `used`, so AudioOutOpen cannot hand it out); the
+	// stream is destroyed only once every pin is released, by us after a short wait or by the
+	// last AudioOutOutputs release (review 2026-10-13: a timeout must not destroy a port in use).
+	// Single destruction owner: whoever observes busy == 0 with closing set destroys the port,
+	// under m_mutex, without ever releasing it in between. Waiting here would drop the mutex,
+	// during which the last release could destroy this instance and an open could reuse the
+	// slot; a close waking up afterwards would then destroy the replacement (Codex 2026-10-13).
+	port->closing = true;
+	if (port->busy == 0) {
+		DestroyOutPort(port);
+	} else {
+		LOGF("AudioOut: port %d has %u output call(s) in flight; the last release destroys it\n",
+		     handle.GetId(), port->busy);
+	}
+	return true;
 }
 
 bool Audio::AudioOutValid(Id handle) {
 	Common::LockGuard lock(m_mutex);
 
-	return (handle.GetId() >= 0 && handle.GetId() < OUT_PORTS_MAX &&
-	        m_out_ports[handle.GetId()].used);
+	return FindOutPort(handle) != nullptr;
 }
 
 bool Audio::AudioOutHasDevice(Id handle) {
 	Common::LockGuard lock(m_mutex);
 
-	return (handle.GetId() >= 0 && handle.GetId() < OUT_PORTS_MAX &&
-	        m_out_ports[handle.GetId()].used && m_out_ports[handle.GetId()].stream != nullptr);
+	auto* port = FindOutPort(handle);
+	return port != nullptr && port->stream != nullptr;
 }
 
 bool Audio::AudioOutGetStatus(Id handle, int* type, int* channels_num) {
 	Common::LockGuard lock(m_mutex);
 
-	if (AudioOutValid(handle)) {
-		auto& port = m_out_ports[handle.GetId()];
+	if (auto* port_ptr = FindOutPort(handle); port_ptr != nullptr) {
+		auto& port = *port_ptr;
 
 		*type         = port.type;
 		*channels_num = port.channels_num;
@@ -532,8 +569,8 @@ bool Audio::AudioOutGetStatus(Id handle, int* type, int* channels_num) {
 bool Audio::AudioOutSetVolume(Id handle, uint32_t bitflag, const int* volume) {
 	Common::LockGuard lock(m_mutex);
 
-	if (AudioOutValid(handle)) {
-		auto& port = m_out_ports[handle.GetId()];
+	if (auto* port_ptr = FindOutPort(handle); port_ptr != nullptr) {
+		auto& port = *port_ptr;
 
 		for (int i = 0; i < port.channels_num; i++, bitflag >>= 1u) {
 			auto bit = bitflag & 0x1u;
@@ -553,36 +590,41 @@ bool Audio::AudioOutSetVolume(Id handle, uint32_t bitflag, const int* volume) {
 
 uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking) {
 	EXIT_NOT_IMPLEMENTED(num == 0 || num > OUT_PORTS_MAX);
+	std::array<PortOut*, OUT_PORTS_MAX> ports {};
 	{
-		// Pin every port for the whole call (see AudioOutClose). A handle closed in between is
-		// skipped as a whole batch rather than read through a reused slot.
+		// Pin every port for the whole call (see AudioOutClose). A handle that was closed, or
+		// whose slot was reopened for another port, in between is rejected by the generation
+		// check and the whole batch is skipped rather than written through a reused slot.
 		Common::LockGuard lock(m_mutex);
 		for (uint32_t i = 0; i < num; i++) {
-			const auto id = params[i].handle.GetId();
-			if (id < 0 || id >= OUT_PORTS_MAX || !m_out_ports[id].used) {
+			ports[i] = FindOutPort(params[i].handle);
+			if (ports[i] == nullptr) {
 				for (uint32_t j = 0; j < i; j++) {
-					m_out_ports[params[j].handle.GetId()].busy--;
+					ports[j]->busy--;
 				}
 				return 0;
 			}
-			m_out_ports[id].busy++;
+			ports[i]->busy++;
 		}
 	}
 	const auto release = [&] {
 		Common::LockGuard lock(m_mutex);
 		for (uint32_t i = 0; i < num; i++) {
-			m_out_ports[params[i].handle.GetId()].busy--;
+			auto* port = ports[i];
+			if (--port->busy == 0 && port->closing) {
+				DestroyOutPort(port); // closed while we were queueing into it
+			}
 		}
 		m_port_released.SignalAll();
 	};
 
-	const auto&                     first_port = m_out_ports[params[0].handle.GetId()];
+	const auto&                     first_port = *ports[0];
 	std::array<bool, OUT_PORTS_MAX> paced {};
 	bool                            any_device = false;
 	uint64_t                        deadline   = 0;
 
 	for (uint32_t i = 0; i < num; i++) {
-		auto& port = m_out_ports[params[i].handle.GetId()];
+		auto& port = *ports[i];
 		const float gain =
 		    port.type == AUDIO_OUT_PORT_TYPE_PADSPK
 		        ? Controller::GetSettingScale(Controller::Setting::SpeakerVolume)
@@ -630,7 +672,7 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 	// priming; silent/vibration-only batches use the same sample clock as SDL output.
 	const auto now = LibKernel::KernelGetProcessTime();
 	for (uint32_t i = 0; i < num; i++) {
-		auto& port = m_out_ports[params[i].handle.GetId()];
+		auto& port = *ports[i];
 		if (blocking && (paced[i] || !any_device)) {
 			deadline = std::max(deadline, port.clock.Advance(now, port.samples_num, port.freq));
 		} else {

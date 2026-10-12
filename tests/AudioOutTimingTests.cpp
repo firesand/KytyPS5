@@ -392,7 +392,8 @@ void TestZeroOutputFrequency() {
 	      "public output open accepted zero frequency");
 	Check(!f.audio.AudioOutOpen(10, 256, 0, Audio::Format::FloatStereo).IsValid(),
 	      "internal output open accepted zero frequency");
-	Check(f.Open().ToInt() == 1, "rejected output port occupied a handle");
+	// Public handles carry the port generation in bits 16..30; the slot is the low half.
+	Check((f.Open().ToInt() & 0xffff) == 1, "rejected output port occupied a handle");
 }
 
 template <typename T>
