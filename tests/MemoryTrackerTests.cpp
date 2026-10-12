@@ -1224,14 +1224,20 @@ void TestHotPageSnapshotHash() {
         });
   };
   auto fill = [&](uint8_t value) { std::memset(memory, value, page); };
+  // The real CPU write-fault path (what the host fault handler runs), not MarkRegionAsCpuModified:
+  // that helper also invalidates the page hashes and would mask a missing demotion invalidation.
+  auto fault = [&] { tracker.InvalidateRegion(address, page, [] {}); };
   auto gpu_is = [&](uint8_t value) {
     return std::all_of(gpu.begin(), gpu.end(), [value](uint8_t b) { return b == value; });
   };
 
-  // Promote the page: KYTY_HOT_PAGE_FAULTS (default 8) CPU-dirty transitions.
+  // Track the page first (what buffer creation does), then promote it through the fault path:
+  // KYTY_HOT_PAGE_FAULTS (default 8) CPU-dirty transitions.
   fill(0xA1);
+  tracker.MarkRegionAsCpuModified(address, page);
+  sync();
   for (int i = 0; i < 8; i++) {
-    tracker.MarkRegionAsCpuModified(address, page);
+    fault();
     sync();
   }
   Check(gpu_is(0xA1), "hot promotion uploads did not deliver the page");
@@ -1261,19 +1267,19 @@ void TestHotPageSnapshotHash() {
   sync();
   sync();
   Check(emitted.empty() && gpu_is(0xA1), "unchanged syncs before demotion uploaded");
-  tracker.MarkRegionAsCpuModified(address, page);
+  fault();
   fill(0xB2);
   sync(); // the demotion sync: the page leaves the hot set and is uploaded as a plain range
   Check(emitted.size() == 1 && emitted[0].snapshot == nullptr && gpu_is(0xB2),
         "demoted page was not uploaded as a plain (unhashed) range");
   for (int i = 0; i < 7; i++) {
-    tracker.MarkRegionAsCpuModified(address, page);
+    fault();
     sync();
     Check(gpu_is(0xB2), "plain re-upload of the demoted page failed");
   }
   // The 8th transition re-promotes the page; its content is the old hashed A again. Without the
   // demotion invalidation the stale H(A) would match and the upload would be skipped (GPU = B).
-  tracker.MarkRegionAsCpuModified(address, page);
+  fault();
   fill(0xA1);
   sync();
   Check(emitted.size() == 1 && emitted[0].snapshot != nullptr && gpu_is(0xA1),
