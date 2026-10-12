@@ -315,10 +315,13 @@ struct PipelineCache::ProgramCache {
 			}
 		};
 		static constexpr size_t MemoWordLimit = 16384; // do not memoize walks that read > 64 KiB
+		// Off by default: Zero Company's dispatches change user data almost every time (hit rate
+		// 5.6 % in hist-10), so the recording cost outweighed the saved walks. KYTY_SRT_MEMO=1
+		// enables it until the key is narrowed to the registers the plan actually reads.
 		static bool MemoEnabled() {
 			static const bool enabled = [] {
 				const char* value = std::getenv("KYTY_SRT_MEMO");
-				return value == nullptr || value[0] != '0';
+				return value != nullptr && value[0] == '1';
 			}();
 			return enabled;
 		}
