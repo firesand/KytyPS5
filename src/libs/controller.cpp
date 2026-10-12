@@ -17,6 +17,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -454,6 +455,14 @@ void GameController::Disconnect(int id) {
 	CheckActive();
 }
 
+static const char* PreferredPadName() {
+	static const char* const value = [] {
+		const char* env = std::getenv("KYTY_PAD_PREFER");
+		return (env != nullptr && env[0] != '\0') ? env : nullptr;
+	}();
+	return value;
+}
+
 void GameController::CheckActive() {
 	int  new_active_id = -1;
 	bool new_connected = false;
@@ -464,6 +473,23 @@ void GameController::CheckActive() {
 			if (id != HOST_INPUT_CONTROLLER_ID) {
 				new_active_id = id;
 				break;
+			}
+		}
+		// KYTY_PAD_PREFER=<substring>: use the gamepad whose SDL name contains it instead of the
+		// first one (e.g. a virtual pad that drives scripted sessions next to a real controller).
+		if (const char* prefer = PreferredPadName(); prefer != nullptr) {
+			for (const auto id: m_connected_ids) {
+				if (id == HOST_INPUT_CONTROLLER_ID) {
+					continue;
+				}
+				const char* name = SDL_GetGamepadNameForID(static_cast<SDL_JoystickID>(id));
+				if (name != nullptr && std::strstr(name, prefer) != nullptr) {
+					if (m_active_id != id) {
+						LOGF("Controller: preferring pad %d (%s) per KYTY_PAD_PREFER\n", id, name);
+					}
+					new_active_id = id;
+					break;
+				}
 			}
 		}
 		new_connected = true;
