@@ -36,6 +36,7 @@
 #include <cinttypes>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <unordered_set>
 #include <bit>
 #include <cmath>
@@ -489,6 +490,25 @@ static void ReportRenderAreaClamp(const char* kind, uint64_t guest_address, vk::
 	     actual.width, actual.height, n);
 }
 
+// Effective render resolution probe: every ~2 s log the largest colour-target extent bound on
+// slot 0 and the largest overall, with draw counts. The settings file alone cannot show what the
+// game rendered at (it rewrote bUseDynamicResolution during the 720p runs; review 2026-10-13).
+static void NoteRenderTargetExtent(uint32_t width, uint32_t height, uint32_t slot) {
+	static uint32_t max_w = 0, max_h = 0, max0_w = 0, max0_h = 0, draws = 0;
+	static std::unordered_set<uint64_t> distinct;
+	static auto last = std::chrono::steady_clock::now();
+	draws++;
+	if (static_cast<uint64_t>(width) * height > static_cast<uint64_t>(max_w) * max_h) { max_w = width; max_h = height; }
+	if (slot == 0 && static_cast<uint64_t>(width) * height > static_cast<uint64_t>(max0_w) * max0_h) { max0_w = width; max0_h = height; }
+	if (distinct.size() < 64) distinct.insert((static_cast<uint64_t>(width) << 32u) | height);
+	const auto now = std::chrono::steady_clock::now();
+	if (now - last < std::chrono::seconds(2)) return;
+	std::string sizes;
+	for (const auto v: distinct) { char t[24]; std::snprintf(t, sizeof(t), " %ux%u", static_cast<uint32_t>(v >> 32u), static_cast<uint32_t>(v)); sizes += t; }
+	LOGF("RenderTargets: largest %ux%u slot0 %ux%u draws=%u distinct=%zu:%s\n", max_w, max_h, max0_w, max0_h, draws, distinct.size(), sizes.c_str());
+	max_w = max_h = max0_w = max0_h = draws = 0; distinct.clear(); last = now;
+}
+
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
                                                  uint32_t color_count, RenderDepthInfo& depth,
                                                  vk::ImageAspectFlags& feedback_aspects,
@@ -531,6 +551,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		state.width             = std::min({state.width, extent.width, actual.width});
 		state.height            = std::min({state.height, extent.height, actual.height});
 		state.num_layers        = std::min(state.num_layers, view.layer_count);
+		NoteRenderTargetExtent(extent.width, extent.height, target.target_slot);
 		state.num_color_attachments = std::max(state.num_color_attachments, target.target_slot + 1);
 		auto& attachment            = state.color_attachments[target.target_slot];
 		attachment.image_view   = image_view;

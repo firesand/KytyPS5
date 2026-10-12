@@ -2020,6 +2020,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 			}
 		}
 	}
+	buffer.last_gpu_write_tick = m_scheduler.CurrentTick(); // the image->buffer copy recorded below
 	m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, std::move(transfer));
 	return true;
 }

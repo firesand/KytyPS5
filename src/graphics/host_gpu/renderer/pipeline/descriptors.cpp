@@ -34,6 +34,7 @@
 #include <cinttypes>
 #include <cstdlib>
 #include <atomic>
+#include <unordered_set>
 #include <bit>
 #include <fmt/format.h>
 #include <limits>
@@ -567,8 +568,11 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		if (storage) {
 			// A storage image bound through a null T# swallows the shader's writes (1x1 null
 			// image): loud, once per descriptor slot (rendering-defect workflow 2026-10-13, F0).
-			static std::atomic<uint32_t> reported {0};
-			if (reported.fetch_add(1, std::memory_order_relaxed) < 32) {
+			// Once per (shader, slot), not a global cap: the first 32 were all consumed at boot
+			// and the intro scene went unreported (review 2026-10-13).
+			static std::unordered_set<uint64_t> reported; // GPU thread only
+			const auto key = s_resolving_shader ^ (static_cast<uint64_t>(resource.descriptor_index) << 56u);
+			if (reported.size() < 512 && reported.insert(key).second) {
 				LOGF("NullStorageImage: shader=0x%016" PRIx64 " descriptor_index=%u written=%d read=%d "
 				     "atomic=%d\n",
 				     s_resolving_shader, resource.descriptor_index, resource.written ? 1 : 0,
