@@ -89,20 +89,31 @@ struct FaultSampler {
 		static int      calls      = 0;
 		if (++calls % 64 != 0) return;
 		const auto now = total.load(std::memory_order_relaxed);
-		std::unordered_map<uint64_t, uint32_t> buckets;
+		std::unordered_map<uint64_t, uint32_t> pages;
 		uint32_t sampled = 0;
 		for (auto& entry: entries) {
 			const auto value = entry.exchange(0, std::memory_order_relaxed);
 			if (value == 0) continue;
 			++sampled;
-			++buckets[(value >> 20u) << 20u];
+			++pages[value & ~uint64_t {0xfff}];
 		}
-		std::vector<std::pair<uint64_t, uint32_t>> top(buckets.begin(), buckets.end());
-		std::sort(top.begin(), top.end(), [](auto& a, auto& b) { return a.second > b.second; });
-		std::string line = fmt::format("FaultHistogram: total={} (+{}) reads={} sampled={} top MiB:",
-		                               now, now - last_total, reads.load(), sampled);
+		// Aggregate per MiB but describe each MiB's hottest page (the describer is page-based).
+		std::unordered_map<uint64_t, std::pair<uint32_t, std::pair<uint64_t, uint32_t>>> buckets;
+		for (const auto& [page, count]: pages) {
+			auto& bucket = buckets[(page >> 20u) << 20u];
+			bucket.first += count;
+			if (count > bucket.second.second) bucket.second = {page, count};
+		}
+		std::vector<std::pair<uint64_t, std::pair<uint32_t, std::pair<uint64_t, uint32_t>>>> top(
+		    buckets.begin(), buckets.end());
+		std::sort(top.begin(), top.end(),
+		          [](auto& a, auto& b) { return a.second.first > b.second.first; });
+		std::string line = fmt::format("FaultHistogram: total={} (+{}) reads={} sampled={} pages={} top MiB:",
+		                               now, now - last_total, reads.load(), sampled, pages.size());
 		for (size_t i = 0; i < top.size() && i < 8; ++i) {
-			line += fmt::format(" 0x{:x}:{} {}", top[i].first, top[i].second, describe(top[i].first));
+			const auto [page, page_count] = top[i].second.second;
+			line += fmt::format(" 0x{:x}:{} p0x{:x}:{} {}", top[i].first, top[i].second.first, page,
+			                    page_count, describe(page));
 		}
 		line += fmt::format(" | syncs: obtain {} calls {} pages {} KiB, range {} calls {} pages {} KiB"
 		                    " | downloads {} ({} ms waited), ReadMemory {}",
@@ -126,7 +137,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {
-		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+		m_buffer_cache.InvalidateWriteFault(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);

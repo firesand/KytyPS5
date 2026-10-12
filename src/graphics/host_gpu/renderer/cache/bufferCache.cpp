@@ -300,6 +300,14 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 }
 
+void BufferCache::InvalidateWriteFault(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		EXIT("BufferCache: invalid write-fault range\n");
+	}
+	m_memory_tracker.InvalidateWriteFault(
+	    vaddr, size, [this, vaddr, size] { ReadMemory(vaddr, size, true); });
+}
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	m_sync_stats.read_memory_calls++; // counted on the calling thread; approximate
 	// KYTY_PROBE_READBACK_LOG=1: one line per synchronous readback request (first 4000, then 1/100).
@@ -913,13 +921,20 @@ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 }
 
 std::string BufferCache::DescribeBufferAt(uint64_t vaddr) {
+	const auto  page  = vaddr & ~uint64_t {0xfff};
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
-	if (owner == nullptr || !*owner || IsBufferInvalid(*owner)) {
-		return "none";
+	std::string text;
+	if (owner == nullptr || !*owner) {
+		text = "none";
+	} else {
+		const auto& buffer = m_slot_buffers[*owner];
+		text = fmt::format("{}buf[0x{:x}+0x{:x} score={}]", IsBufferInvalid(*owner) ? "invalid-" : "",
+		                   buffer.CpuAddress(), buffer.Size(), buffer.StreamScore());
 	}
-	const auto& buffer = m_slot_buffers[*owner];
-	return fmt::format("buf[0x{:x}+0x{:x} score={}]", buffer.CpuAddress(), buffer.Size(),
-	                   buffer.StreamScore());
+	// Tracker state of the faulting page helps tell stale protection from live traffic.
+	if (m_memory_tracker.IsRegionCpuModified(page, 0x1000)) text += " cpu-dirty";
+	if (m_memory_tracker.IsRegionGpuModified(page, 0x1000)) text += " gpu-dirty";
+	return text;
 }
 
 } // namespace Libs::Graphics

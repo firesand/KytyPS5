@@ -13,6 +13,7 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+#include <cstdlib>
 
 namespace Libs::Graphics {
 
@@ -55,6 +56,41 @@ public:
 		}
 	}
 	void MarkBdaSyncPending(uint64_t vaddr, uint64_t size);
+	// KYTY_FAULT_AHEAD_PAGES (default 16, 0 disables): pages a CPU write fault unprotects ahead.
+	static size_t FaultAheadPages() {
+		static const size_t pages = [] {
+			const char* value = std::getenv("KYTY_FAULT_AHEAD_PAGES");
+			return value != nullptr ? static_cast<size_t>(std::atoi(value)) : size_t {16};
+		}();
+		return pages;
+	}
+	// CPU write fault: like InvalidateRegion, but widens the unprotected range forward over
+	// clean pages (RegionManager::ExtendWriteFault) so sequential fills fault once per window.
+	template <typename Flush>
+	void InvalidateWriteFault(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
+		static_assert(std::is_invocable_v<Flush&>);
+		const auto ahead = FaultAheadPages();
+		if (ahead <= 1) {
+			InvalidateRegion(vaddr, size, std::forward<Flush>(on_flush));
+			return;
+		}
+		CheckNotInUploadCallback();
+		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			const bool should_flush = [&] {
+				std::scoped_lock lock(manager->lock);
+				if (manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
+					return true;
+				}
+				const auto address  = manager->GetCpuAddr() + offset;
+				const auto extended = manager->ExtendWriteFault(address, bytes, ahead);
+				manager->ChangeState<DirtySource::Cpu, true>(address, extended);
+				return false;
+			}();
+			if (should_flush) {
+				on_flush();
+			}
+		});
+	}
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {

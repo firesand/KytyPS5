@@ -30,6 +30,7 @@
 #elif defined(__linux__)
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <algorithm>
 #endif
 
 namespace Libs::Graphics {
@@ -114,6 +115,19 @@ public:
 		return threshold;
 	}
 	[[nodiscard]] bool HasHotPages() const { return m_has_hot.load(std::memory_order_relaxed); }
+
+	// Write-fault window: extends [vaddr, vaddr + size) forward over pages that are neither
+	// CPU- nor GPU-dirty, up to `ahead` pages from the faulting page, so one fault unprotects the
+	// run a sequential CPU fill is about to touch (Zero Company fills 16 MiB buffers page by page:
+	// 4096 faults, locks and mprotects each). Returns the extended size. Caller holds the lock.
+	[[nodiscard]] uint64_t ExtendWriteFault(uint64_t vaddr, uint64_t size, size_t ahead) const {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		auto limit = std::min<size_t>(TRACKER_REGION_PAGES, start + ahead);
+		limit      = std::min<size_t>(limit, m_cpu_dirty.FirstRangeFrom(end).first);
+		limit      = std::min<size_t>(limit, m_gpu_dirty.FirstRangeFrom(end).first);
+		const auto new_end = std::max(end, limit);
+		return new_end * TRACKER_PAGE_SIZE - (vaddr - m_cpu_addr);
+	}
 
 	template <DirtySource source, bool enable>
 	void ChangeState(uint64_t vaddr, uint64_t size) {
