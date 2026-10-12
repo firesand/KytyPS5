@@ -68,6 +68,14 @@ public:
 	void MarkLabelWritten(uint64_t vaddr, uint64_t size) {
 		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 	}
+	// Companion query for the same path. BufferCache::IsRegionGpuModified first runs
+	// PrepareHostRead (write-fault flush, pending-GPU-modified drain into the RangeSet maps): GPU
+	// thread only. Calling it from the priority thread corrupted m_gpu_modified_ranges (ng-33,
+	// std::_Rb_tree_rebalance_for_erase on a null node). The tracker itself locks per region and
+	// the write-fault pass marks it before any later priority operation runs, so it is enough.
+	[[nodiscard]] bool IsLabelRegionGpuModified(uint64_t vaddr, uint64_t size) {
+		return m_memory_tracker.IsRegionGpuModified(vaddr, size);
+	}
 
 	// Write-fault entry: InvalidateMemory with the fault-ahead window (see MemoryTracker).
 

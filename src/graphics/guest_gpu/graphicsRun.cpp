@@ -1162,7 +1162,9 @@ void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_
 // KYTY_EOP_LABEL_DEFER=1 enables the deferred store (off by default until validated): v1 (58c4a83)
 // hopped through the GPU thread's command queue and lost most of the frame rate; v2 (498d034)
 // called BufferCache::InvalidateMemory from the priority thread (readback path) and crashed; v3
-// writes through the backing mapping and only marks the tracker.
+// writes through the backing mapping and only marks the tracker; v3 first used the buffer cache's
+// IsRegionGpuModified, whose PrepareHostRead touches GPU-thread-only maps (ng-33 crash), so the
+// query is now tracker-only (IsLabelRegionGpuModified).
 template <typename T>
 void CommandProcessor::WriteEopLabel(T* dst, T value) {
 	static const bool defer = [] {
@@ -1183,7 +1185,7 @@ void CommandProcessor::WriteEopLabel(T* dst, T value) {
 		// a GPU-dirty page goes through the GPU thread so the store takes the merge path. Either
 		// way wake the GPU thread: a WAIT_REG_MEM on this label retries only every 100 ms.
 		const auto address = reinterpret_cast<uint64_t>(dst);
-		if (!cache.IsRegionGpuModified(address, sizeof(T)) &&
+		if (!cache.IsLabelRegionGpuModified(address, sizeof(T)) &&
 		    LibKernel::Memory::TryWriteBacking(address, &value, sizeof(T))) {
 			cache.MarkLabelWritten(address, sizeof(T)); // tracker only: no readback off the GPU thread
 			gpu->Wake();
