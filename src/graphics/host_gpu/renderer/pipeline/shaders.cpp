@@ -80,7 +80,14 @@ void LogPipelineStatistics(GraphicContext& graphics, vk::Pipeline pipeline, uint
 			switch (stat.format) {
 				case vk::PipelineExecutableStatisticFormatKHR::eBool32: value = stat.value.b32 ? "true" : "false"; break;
 				case vk::PipelineExecutableStatisticFormatKHR::eInt64: value = fmt::format("{}", stat.value.i64); break;
-				case vk::PipelineExecutableStatisticFormatKHR::eUint64: value = fmt::format("{}", stat.value.u64); break;
+				case vk::PipelineExecutableStatisticFormatKHR::eUint64:
+					value = fmt::format("{}", stat.value.u64);
+					// NVIDIA 615.78: "Local Memory Size" comes back as 2^36 + bytes (ng-32: every
+					// pipeline >= 68719476736); show the byte count too so the field stays readable.
+					if (stat.value.u64 >= (uint64_t {1} << 36) && stat.value.u64 < (uint64_t {1} << 37)) {
+						value += fmt::format("(2^36+{})", stat.value.u64 - (uint64_t {1} << 36));
+					}
+					break;
 				case vk::PipelineExecutableStatisticFormatKHR::eFloat64: value = fmt::format("{}", stat.value.f64); break;
 			}
 			line += fmt::format(" {}={}", stat.name.data(), value);
