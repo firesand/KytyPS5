@@ -5,6 +5,7 @@
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -30,6 +31,7 @@ struct Stream {
 uint64_t                             now       = 1000000;
 uint32_t                             oversleep = 0, processing = 0;
 std::vector<uint32_t>                sleeps;
+std::function<void()> on_sleep; // see TimingThread::SleepMicro
 std::vector<std::unique_ptr<Stream>> streams;
 bool                                 fail_open = false, fail_put = false, stalled = false;
 bool                                 pad_connected = false, pad_bluetooth = false;
@@ -113,6 +115,11 @@ public:
 	static void SleepMicro(uint32_t micros) {
 		sleeps.push_back(micros);
 		now += micros + oversleep;
+		if (on_sleep) { // one-shot: lets a test act "concurrently" while an output call is pacing
+			auto hook = std::move(on_sleep);
+			on_sleep  = nullptr;
+			hook();
+		}
 	}
 };
 } // namespace Common
@@ -459,6 +466,47 @@ void TestChannelGains() {
 }
 } // namespace
 
+// Review 2026-10-13: a close while an output call is pacing into the port must not destroy the
+// stream under it; the last release destroys it. The fake sleep hook runs the close from inside
+// the output's pacing wait (the same window a concurrent AudioOut2 close would hit).
+void TestCloseDuringOutputDefersDestruction() {
+	Fixture f;
+	const auto id = f.Open();
+	f.Prime(id);
+	Check(streams.size() == 1, "priming did not leave one open stream");
+	bool closed = false;
+	size_t streams_at_close = 0;
+	on_sleep = [&] {
+		closed           = f.audio.AudioOutClose(id);
+		streams_at_close = streams.size();
+	};
+	f.Output(id); // paced output: sleeps, the hook closes the port mid-call
+	Check(closed, "close during an in-flight output was rejected");
+	Check(streams_at_close == 1, "close destroyed the stream while an output call was in flight");
+	Check(streams.empty(), "the last release did not destroy the closed port");
+	Check(!f.audio.AudioOutValid(id), "closed handle still valid");
+	Audio::OutputParam param {id, f.pcm.data()};
+	Check(f.audio.AudioOutOutputs(&param, 1, true) == 0, "output through a closed handle was accepted");
+	Check(streams.empty(), "output through a closed handle opened or touched a stream");
+}
+
+// A handle that outlived a close/reopen of its slot must not address the new port.
+void TestStaleHandleAfterReopen() {
+	Fixture f;
+	const auto first = f.Open();
+	Check(f.audio.AudioOutClose(first), "close failed");
+	const auto second = f.Open();
+	Check((second.ToInt() & 0xffff) == (first.ToInt() & 0xffff), "reopen did not reuse the slot");
+	Check((second.ToInt() >> 16) != (first.ToInt() >> 16), "reused slot kept the old generation");
+	Check(!f.audio.AudioOutValid(first) && f.audio.AudioOutValid(second),
+	      "stale handle validity after reopen is wrong");
+	Audio::OutputParam param {first, f.pcm.data()};
+	Check(f.audio.AudioOutOutputs(&param, 1, true) == 0, "stale handle output was accepted");
+	Check(streams.size() == 1 && streams.back()->pcm.empty(),
+	      "stale handle output reached the new port's stream");
+	f.audio.AudioOutClose(second);
+}
+
 int main() {
 	TestPrimingAndSteadyCadence();
 	TestUnderrunAndStalledQueueRecovery();
@@ -471,6 +519,8 @@ int main() {
 	TestInvalidBatchSize();
 	TestZeroOutputFrequency();
 	TestChannelGains();
+	TestCloseDuringOutputDefersDestruction();
+	TestStaleHandleAfterReopen();
 	Check(streams.empty(), "output stream leaked");
 	std::puts("AudioOutTimingTests: all cases passed");
 }
