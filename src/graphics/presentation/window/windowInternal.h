@@ -8,6 +8,9 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <atomic>
+#include <utility>
+#include <chrono>
+#include <mutex>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -28,6 +31,24 @@ struct WindowLoopState {
 	bool             need_exit = false;
 	std::atomic_bool paused    = false;
 	std::atomic<uint64_t> presented_frames {0};
+	// Present-to-present intervals (ms) since the last Status line, for frame-time percentiles
+	// (1-second averages hide hitches; reviews asked for p95 / worst frame).
+	std::mutex                              frame_times_mutex;
+	std::vector<float>                      frame_times_ms;
+	std::chrono::steady_clock::time_point   last_present {};
+	void RecordPresent() {
+		const auto now = std::chrono::steady_clock::now();
+		std::lock_guard lock(frame_times_mutex);
+		if (last_present.time_since_epoch().count() != 0 && frame_times_ms.size() < 4096) {
+			frame_times_ms.push_back(
+			    std::chrono::duration<float, std::milli>(now - last_present).count());
+		}
+		last_present = now;
+	}
+	std::vector<float> TakeFrameTimes() {
+		std::lock_guard lock(frame_times_mutex);
+		return std::exchange(frame_times_ms, {});
+	}
 };
 
 struct WindowContext {

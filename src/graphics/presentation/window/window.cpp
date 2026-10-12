@@ -20,6 +20,7 @@
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include <algorithm>
 #include "kytyGitVersion.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
@@ -747,8 +748,20 @@ void WindowContext::Run() {
 				UpdateTitle(frames, fps);
 				// One line per title refresh keeps frame-rate history in the log now that the
 				// per-call flip status dumps are verbose-only (claude/flips.py reads it).
-				LOGF("Status: t=%.1f frames=%" PRIu64 " fps=%.1f\n",
-				     static_cast<double>(now) / 1000.0, static_cast<uint64_t>(frames), fps);
+				auto times = loop.TakeFrameTimes();
+				if (times.empty()) {
+					LOGF("Status: t=%.1f frames=%" PRIu64 " fps=%.1f\n",
+					     static_cast<double>(now) / 1000.0, static_cast<uint64_t>(frames), fps);
+				} else {
+					std::sort(times.begin(), times.end());
+					const auto at = [&](double q) {
+						return times[std::min(times.size() - 1, static_cast<size_t>(q * times.size()))];
+					};
+					LOGF("Status: t=%.1f frames=%" PRIu64 " fps=%.1f ft_ms p50=%.1f p95=%.1f max=%.1f\n",
+					     static_cast<double>(now) / 1000.0, static_cast<uint64_t>(frames), fps,
+					     static_cast<double>(at(0.5)), static_cast<double>(at(0.95)),
+					     static_cast<double>(times.back()));
+				}
 			}
 			title_time   = now;
 			title_frames = frames;

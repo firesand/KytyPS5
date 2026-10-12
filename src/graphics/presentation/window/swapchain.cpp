@@ -999,6 +999,7 @@ void Presenter::Impl::Present() {
 
 		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
 		window.loop.presented_frames.fetch_add(1, std::memory_order_relaxed);
+		window.loop.RecordPresent();
 		return;
 	}
 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");
