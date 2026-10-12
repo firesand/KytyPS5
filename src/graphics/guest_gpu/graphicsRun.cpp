@@ -779,6 +779,31 @@ static bool LooksLikePm4Header(uint32_t header) {
 	}
 }
 
+// Whole-buffer check: every packet is a known type-3 packet or a type-2 filler, the lengths
+// chain exactly to the end, and at least two real packets exist. A single header can be matched
+// by a negative float (0xc0100000 = -2.25 reads as a NOP), a whole stream cannot (review).
+static bool LooksLikePm4Stream(std::span<const uint32_t> words) {
+	size_t   i       = 0;
+	uint32_t packets = 0;
+	while (i < words.size()) {
+		const auto header = words[i];
+		if ((header >> 30u) == 2u) {
+			i++;
+			continue;
+		}
+		if (!LooksLikePm4Header(header)) {
+			return false;
+		}
+		const auto length = static_cast<size_t>(KYTY_PM4_LEN(header));
+		if (length == 0 || i + length > words.size()) {
+			return false;
+		}
+		i += length;
+		packets++;
+	}
+	return packets >= 2;
+}
+
 void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain) {
 	EXIT_IF(g_current_execution == nullptr);
 	EXIT_IF(!g_current_execution->m_next_buffer.empty());
@@ -849,15 +874,36 @@ void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands,
 				LOGF("CommandProcessor: stale indirect buffer: device copy = %08x %08x %08x %08x %08x %08x %08x %08x\n",
 				     device[0], device[1], device[2], device[3], device[4], device[5], device[6], device[7]);
 				if (LooksLikePm4Header(device[0]) && device[0] != commands[0]) {
-					// The GPU-built command stream is in VRAM and the host copy is stale: restore
-					// the host bytes from the device copy and continue. Loud on purpose: this is
-					// a mitigation for a lost download, not the fix for its cause.
+					// Restore the host bytes from the device copy only when the WHOLE device copy
+					// parses as a PM4 stream, the host did not write the page after the lost
+					// download (not CPU-dirty) and the GPU is idle (FlushAndWait above). Loud on
+					// purpose: a mitigation for a lost download, not the fix for its cause.
 					std::vector<uint32_t> restored(commands.size());
-					if (cache.PeekDeviceCopy(address, restored.data(), commands.size_bytes())) {
+					const bool have_copy =
+					    cache.PeekDeviceCopy(address, restored.data(), commands.size_bytes());
+					const bool cpu_dirty = cache.IsRegionCpuModified(address, commands.size_bytes());
+					const bool stream    = have_copy && LooksLikePm4Stream(restored);
+					// Experimental (KYTY_STALE_IB_RECOVER=1): a valid-looking stream in VRAM proves
+					// neither allocation identity nor freshness (an old stream stays valid after the
+					// GPU moved on), so by default this only reports; the run then fails as before.
+					static const bool recover = [] {
+						const char* value = std::getenv("KYTY_STALE_IB_RECOVER");
+						return value != nullptr && value[0] == '1' && value[1] == '\0';
+					}();
+					if (!recover) {
+						LOGF("CommandProcessor: stale indirect buffer: device copy %s (pm4-stream=%d "
+						     "cpu-dirty=%d); recovery is opt-in (KYTY_STALE_IB_RECOVER=1)\n",
+						     have_copy ? "captured" : "unavailable", stream ? 1 : 0, cpu_dirty ? 1 : 0);
+					} else if (have_copy && stream && !cpu_dirty) {
 						LibKernel::Memory::WriteBacking(address, restored.data(), commands.size_bytes());
 						LOGF("CommandProcessor: stale indirect buffer 0x%016" PRIx64 "/%zu RECOVERED from "
-						     "the device copy (lost download: BAR readback before the owner was ready?)\n",
+						     "the device copy (complete PM4 stream, page not CPU-dirty; lost download: BAR "
+						     "readback before the owner was ready?)\n",
 						     address, commands.size());
+					} else {
+						LOGF("CommandProcessor: stale indirect buffer: device copy NOT used (copy=%d "
+						     "pm4-stream=%d cpu-dirty=%d)\n",
+						     have_copy ? 1 : 0, stream ? 1 : 0, cpu_dirty ? 1 : 0);
 					}
 				}
 			} else {
