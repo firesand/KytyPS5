@@ -6,6 +6,7 @@
 #include <string>
 #include <atomic>
 #include <unordered_map>
+#include <utility>
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -87,7 +88,30 @@ struct FaultSampler {
 		if (!enabled) return;
 		static uint64_t last_total = 0;
 		static int      calls      = 0;
+		// The callers hand over counters taken since the previous call; add them up so the line
+		// printed every 64th call covers the whole interval (Codex review: 63/64 were dropped).
+		static BufferCache::SyncStats         sync_sum {};
+		static std::pair<uint64_t, uint64_t>  protect_sum {};
+		static HotPageStats                   hot_sum {};
+		sync_sum.obtain_calls += sync.obtain_calls;
+		sync_sum.obtain_bytes += sync.obtain_bytes;
+		sync_sum.obtain_pages += sync.obtain_pages;
+		sync_sum.range_calls += sync.range_calls;
+		sync_sum.range_bytes += sync.range_bytes;
+		sync_sum.range_pages += sync.range_pages;
+		sync_sum.download_calls += sync.download_calls;
+		sync_sum.download_wait_ns += sync.download_wait_ns;
+		sync_sum.read_memory_calls += sync.read_memory_calls;
+		protect_sum.first += protects.first;
+		protect_sum.second += protects.second;
+		hot_sum.hashed += hot.hashed;
+		hot_sum.skipped += hot.skipped;
+		hot_sum.demoted += hot.demoted;
+		hot_sum.invalidated += hot.invalidated;
 		if (++calls % 64 != 0) return;
+		const auto sync_all = std::exchange(sync_sum, {});
+		const auto protects_all = std::exchange(protect_sum, {});
+		const auto hot_all = std::exchange(hot_sum, {});
 		const auto now = total.load(std::memory_order_relaxed);
 		std::unordered_map<uint64_t, uint32_t> pages;
 		uint32_t sampled = 0;
@@ -115,14 +139,15 @@ struct FaultSampler {
 			line += fmt::format(" 0x{:x}:{} p0x{:x}:{} {}", top[i].first, top[i].second.first, page,
 			                    page_count, describe(page));
 		}
-		line += fmt::format(" | syncs: obtain {} calls {} pages {} KiB, range {} calls {} pages {} KiB"
+		line += fmt::format(" | syncs: obtain {} calls {} ranges {} KiB, range {} calls {} ranges {} KiB"
 		                    " | downloads {} ({} ms waited), ReadMemory {}",
-		                    sync.obtain_calls, sync.obtain_pages, sync.obtain_bytes >> 10,
-		                    sync.range_calls, sync.range_pages, sync.range_bytes >> 10,
-		                    sync.download_calls, sync.download_wait_ns / 1000000, sync.read_memory_calls);
+		                    sync_all.obtain_calls, sync_all.obtain_pages, sync_all.obtain_bytes >> 10,
+		                    sync_all.range_calls, sync_all.range_pages, sync_all.range_bytes >> 10,
+		                    sync_all.download_calls, sync_all.download_wait_ns / 1000000,
+		                    sync_all.read_memory_calls);
 		line += fmt::format(" | protect {} calls {} KiB | hot hashed {} skipped {} demoted {} rehash-miss {}",
-		                    protects.first, protects.second >> 10, hot.hashed, hot.skipped,
-		                    hot.demoted, hot.invalidated);
+		                    protects_all.first, protects_all.second >> 10, hot_all.hashed,
+		                    hot_all.skipped, hot_all.demoted, hot_all.invalidated);
 		LOGF("%s\n", line.c_str());
 		last_total = now;
 	}
