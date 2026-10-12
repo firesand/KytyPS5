@@ -44,6 +44,7 @@
 #include <mach/mach_vm.h>
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 #include <sys/uio.h>
+#include <dlfcn.h>
 #include <unistd.h>
 #endif
 #endif
@@ -712,6 +713,32 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 			std::printf("\n");
 		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+		// Module-relative addresses: the play binary is stripped and gdb cannot attach to the dying
+		// process, so pc and the return addresses on the stack are reported as <object>+<offset>
+		// (symbolize offline with addr2line/objdump on that object). ng-33's fault took a byte
+		// search over every mapped library to place pc in libstdc++.
+		const auto describe = [](uint64_t address, const char* what) {
+			Dl_info dl {};
+			if (dladdr(reinterpret_cast<void*>(address), &dl) == 0 || dl.dli_fname == nullptr) {
+				return false;
+			}
+			std::printf("%s %016" PRIx64 " = %s+0x%" PRIx64 "%s%s\n", what, address, dl.dli_fname,
+			            address - reinterpret_cast<uint64_t>(dl.dli_fbase),
+			            dl.dli_sname != nullptr ? " " : "", dl.dli_sname != nullptr ? dl.dli_sname : "");
+			return true;
+		};
+		describe(info->exception_address, "pc:");
+		if (IsReadableRange(info->rsp, 64 * sizeof(uint64_t))) {
+			const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
+			int         shown = 0;
+			for (int i = 0; i < 64 && shown < 12; i++) {
+				if (stack[i] >= 0x1000 && describe(stack[i], "stack:")) {
+					shown++;
+				}
+			}
+		}
+#endif
 		std::fflush(stdout);
 	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
