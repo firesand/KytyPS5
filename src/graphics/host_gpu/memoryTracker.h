@@ -33,6 +33,10 @@ public:
 	[[nodiscard]] bool TryMarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
+	// A buffer was created or destroyed over the range: hot-page hashes no longer describe its
+	// GPU copy. Called from the GPU thread.
+	void InvalidatePageHashes(uint64_t vaddr, uint64_t size);
+	static HotPageStats TakeHotStats() { return RegionManager::TakeHotStats(); }
 	// Regions whose CPU-dirty state changed since the last call (or that were flagged through
 	// MarkBdaSyncPending): func(region_address, region_size). GPU thread.
 	template <typename Func>
@@ -147,9 +151,8 @@ public:
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
 		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			manager->lock.lock();
-			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
-			                                                      bytes, range_func,
-			                                                      /*keep_hot=*/!is_written);
+			manager->ForEachModifiedRange<DirtySource::Cpu, true, /*filter_hot=*/true>(
+			    manager->GetCpuAddr() + offset, bytes, range_func, /*keep_hot=*/!is_written);
 			if (!is_written) {
 				manager->lock.unlock();
 			}

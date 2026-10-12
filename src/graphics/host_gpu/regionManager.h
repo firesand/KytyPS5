@@ -31,6 +31,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <algorithm>
+#include <memory>
 #endif
 
 namespace Libs::Graphics {
@@ -79,6 +80,16 @@ private:
 };
 
 static_assert(std::atomic_uint32_t::is_always_lock_free);
+
+// XXH3 of one tracker page (defined in memoryTracker.cpp so this header stays light).
+uint64_t HashTrackerPage(const void* page) noexcept;
+
+// Hot-page content tracking counters (GPU thread), reported by the fault histogram.
+struct HotPageStats {
+	uint64_t hashed  = 0;
+	uint64_t skipped = 0;
+	uint64_t demoted = 0;
+};
 
 class RegionManager final {
 public:
@@ -152,6 +163,7 @@ public:
 			if (RegionBits(m_cpu_dirty, start, end).Any()) {
 				EXIT("GPU dirty state conflicts with CPU dirty state\n");
 			}
+			m_hash_valid.UnsetRange(start, end); // the GPU copy no longer matches any CPU hash
 		}
 		auto& bits = GetBits<source>();
 		if constexpr (enable) {
@@ -169,7 +181,9 @@ public:
 		}
 	}
 
-	template <DirtySource source, bool clear, typename Func>
+	// filter_hot (upload path only): hot pages whose bytes are unchanged since their last upload
+	// are left out of the emitted ranges; see EmitUploadRun.
+	template <DirtySource source, bool clear, bool filter_hot = false, typename Func>
 	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func, bool keep_hot = true) {
 		const auto [start, end] = GetPageRange(vaddr, size);
 		auto&      bits         = GetBits<source>();
@@ -181,11 +195,26 @@ public:
 			bits.UnsetRange(start, end);
 			if constexpr (source == DirtySource::Cpu) {
 				if (keep_hot && HasHotPages()) {
-					// Hot pages stay dirty (and writable) so the next sync uploads them again.
+					// Hot pages stay dirty (and writable) so the next sync uploads them again,
+					// unless their content stayed identical for HotDemoteSyncs syncs: those leave
+					// the hot set, stay clean here and get re-protected below.
+					const auto demote = HotDemoteSyncs();
 					for (const auto [first, last]: RegionBits(m_hot, start, end)) {
 						for (auto page = first; page < last; ++page) {
-							if (mask.Get(page)) bits.Set(page);
+							if (!mask.Get(page)) continue;
+							if (demote != 0 && m_unchanged[page] >= demote) {
+								m_hot.Unset(page);
+								m_fault_counts[page] = 0;
+								m_unchanged[page]    = 0;
+								s_hot_stats.demoted++;
+								continue;
+							}
+							bits.Set(page);
 						}
+					}
+					if (m_hot.None() && m_has_hot.exchange(false, std::memory_order_acq_rel) &&
+					    m_hot_region_count != nullptr) {
+						m_hot_region_count->fetch_sub(1, std::memory_order_acq_rel);
 					}
 				} else if (!keep_hot && HasHotPages()) {
 					// The GPU takes ownership (written binding): the pages leave the hot set.
@@ -200,9 +229,78 @@ public:
 			}
 		}
 		for (const auto [first, last]: mask) {
-			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
+			if constexpr (filter_hot && source == DirtySource::Cpu) {
+				EmitUploadRun(first, last, func);
+			} else {
+				func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
+			}
 		}
 	}
+
+	// KYTY_HOT_PAGE_HASH=0 disables the content check; KYTY_HOT_DEMOTE_SYNCS (default 4, 0 never)
+	// is how many consecutive unchanged syncs make a hot page leave the hot set.
+	static bool HotHashEnabled() {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_HOT_PAGE_HASH");
+			return value == nullptr || value[0] != '0';
+		}();
+		return enabled;
+	}
+	static uint8_t HotDemoteSyncs() {
+		static const uint8_t syncs = [] {
+			const char* value = std::getenv("KYTY_HOT_DEMOTE_SYNCS");
+			const int   parsed = value != nullptr ? std::atoi(value) : 4;
+			return static_cast<uint8_t>(std::clamp(parsed, 0, 255));
+		}();
+		return syncs;
+	}
+	static HotPageStats TakeHotStats() { return std::exchange(s_hot_stats, {}); }
+
+	// Buffer created or destroyed over this range: its GPU copy is new, so no hash is current.
+	void InvalidatePageHashes(uint64_t vaddr, uint64_t size) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		m_hash_valid.UnsetRange(start, end);
+	}
+
+private:
+	// Emits the upload ranges of one dirty run, skipping hot pages whose XXH3 equals the hash
+	// taken at their previous upload. Caller holds `lock`; hot pages are writable, so reading
+	// them cannot fault.
+	template <typename Func>
+	void EmitUploadRun(size_t first, size_t last, Func&& func) {
+		if (!HotHashEnabled() || !HasHotPages()) {
+			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
+			return;
+		}
+		size_t run_begin = first;
+		for (size_t page = first; page < last; ++page) {
+			if (!m_hot.Get(page)) continue;
+			const auto hash =
+			    HashTrackerPage(reinterpret_cast<const void*>(m_cpu_addr + page * TRACKER_PAGE_SIZE));
+			s_hot_stats.hashed++;
+			if (m_hash_valid.Get(page) && m_page_hash != nullptr && (*m_page_hash)[page] == hash) {
+				if (m_unchanged[page] < 255) ++m_unchanged[page];
+				s_hot_stats.skipped++;
+				if (run_begin < page) {
+					func(m_cpu_addr + run_begin * TRACKER_PAGE_SIZE,
+					     (page - run_begin) * TRACKER_PAGE_SIZE);
+				}
+				run_begin = page + 1;
+				continue;
+			}
+			if (m_page_hash == nullptr) {
+				m_page_hash = std::make_unique<std::array<uint64_t, TRACKER_REGION_PAGES>>();
+			}
+			(*m_page_hash)[page] = hash;
+			m_hash_valid.Set(page);
+			m_unchanged[page] = 0;
+		}
+		if (run_begin < last) {
+			func(m_cpu_addr + run_begin * TRACKER_PAGE_SIZE, (last - run_begin) * TRACKER_PAGE_SIZE);
+		}
+	}
+
+public:
 
 	TrackingSpinLock lock;
 
@@ -231,6 +329,11 @@ private:
 	std::atomic<bool>      m_has_hot {false};
 	RegionBits             m_hot;
 	std::array<uint8_t, TRACKER_REGION_PAGES> m_fault_counts {};
+	// Hot-page content tracking (GPU thread, under `lock`).
+	std::unique_ptr<std::array<uint64_t, TRACKER_REGION_PAGES>> m_page_hash;
+	RegionBits                                                  m_hash_valid;
+	std::array<uint8_t, TRACKER_REGION_PAGES>                   m_unchanged {};
+	inline static HotPageStats                                  s_hot_stats {};
 	template <bool track, bool is_read>
 	void UpdateProtection() {
 		const auto protection = is_read ? ~m_gpu_dirty : m_cpu_dirty;
