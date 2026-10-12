@@ -278,21 +278,43 @@ struct PipelineCache::ProgramCache {
 			std::vector<uint32_t> words;
 			size_t                permutation = SIZE_MAX;
 		};
+		// Records every guest read the walk performs. Scalar reads (read_memory) fall back to the
+		// walker's own direct copy when the caller supplied no reader, exactly like SrtWalker does;
+		// without this hook those reads were invisible and the memo returned stale snapshots.
 		struct RecordingReader {
-			ShaderRecompiler::IR::SrtMemoryReader inner;
+			ShaderRecompiler::IR::SrtMemoryReader inner_specialization;
+			ShaderRecompiler::IR::SrtMemoryReader inner_memory;
 			void*                                 inner_userdata;
 			Memo*                                 memo;
-			static bool Read(void* userdata, uint64_t address, std::span<uint32_t> values) {
+			void Record(uint64_t address, std::span<const uint32_t> values) {
+				memo->reads.push_back({address, static_cast<uint32_t>(values.size()),
+				                       static_cast<uint32_t>(memo->words.size())});
+				memo->words.insert(memo->words.end(), values.begin(), values.end());
+			}
+			static bool ReadSpecialization(void* userdata, uint64_t address,
+			                               std::span<uint32_t> values) {
 				auto* self = static_cast<RecordingReader*>(userdata);
-				if (!self->inner(self->inner_userdata, address, values)) {
+				if (!self->inner_specialization(self->inner_userdata, address, values)) {
 					return false;
 				}
-				self->memo->reads.push_back({address, static_cast<uint32_t>(values.size()),
-				                             static_cast<uint32_t>(self->memo->words.size())});
-				self->memo->words.insert(self->memo->words.end(), values.begin(), values.end());
+				self->Record(address, values);
+				return true;
+			}
+			static bool ReadMemory(void* userdata, uint64_t address, std::span<uint32_t> values) {
+				auto* self = static_cast<RecordingReader*>(userdata);
+				if (self->inner_memory != nullptr) {
+					if (!self->inner_memory(self->inner_userdata, address, values)) {
+						return false;
+					}
+				} else {
+					std::memcpy(values.data(), reinterpret_cast<const void*>(address),
+					            values.size_bytes());
+				}
+				self->Record(address, values);
 				return true;
 			}
 		};
+		static constexpr size_t MemoWordLimit = 16384; // do not memoize walks that read > 64 KiB
 		static bool MemoEnabled() {
 			static const bool enabled = [] {
 				const char* value = std::getenv("KYTY_SRT_MEMO");
@@ -301,12 +323,11 @@ struct PipelineCache::ProgramCache {
 			return enabled;
 		}
 		static void CountMemo(bool hit) {
-			static std::atomic<uint64_t> hits {0};
-			static std::atomic<uint64_t> misses {0};
-			const auto total = (hit ? hits : misses).fetch_add(1, std::memory_order_relaxed) + 1 +
-			                   (hit ? misses : hits).load(std::memory_order_relaxed);
-			if (total % 200000 == 0) {
-				LOGF("SrtMemo: hits=%" PRIu64 " misses=%" PRIu64 "\n", hits.load(), misses.load());
+			static uint64_t hits   = 0; // GPU thread only
+			static uint64_t misses = 0;
+			(hit ? hits : misses)++;
+			if ((hits + misses) % 100000 == 0) {
+				LOGF("SrtMemo: hits=%" PRIu64 " misses=%" PRIu64 "\n", hits, misses);
 			}
 		}
 		[[nodiscard]] bool MemoHit(const ShaderRecompiler::IR::SrtRuntime& runtime) const {
@@ -316,10 +337,13 @@ struct PipelineCache::ProgramCache {
 			    !std::ranges::equal(runtime.workgroup_counts, memo.workgroup_counts)) {
 				return false;
 			}
+			// Replays through the GPU-aware backing read: unmapped memory fails (miss), GPU-dirty
+			// memory is downloaded first, matching what the walk itself would observe.
 			thread_local std::vector<uint32_t> scratch;
 			for (const auto& read: memo.reads) {
 				scratch.resize(read.dwords);
-				if (!runtime.read_specialization_memory(runtime.userdata, read.address, scratch) ||
+				if (!LibKernel::Memory::TryReadBufferBacking(read.address, scratch.data(),
+				                                             read.dwords * sizeof(uint32_t)) ||
 				    std::memcmp(scratch.data(), memo.words.data() + read.offset,
 				                read.dwords * sizeof(uint32_t)) != 0) {
 					return false;
@@ -360,15 +384,20 @@ struct PipelineCache::ProgramCache {
 			}
 			CountMemo(false);
 			ForgetMemo();
-			RecordingReader recorder {runtime.read_specialization_memory, runtime.userdata, &memo};
+			RecordingReader recorder {runtime.read_specialization_memory, runtime.read_memory,
+			                          runtime.userdata, &memo};
 			auto            recording = runtime;
 			if (MemoEnabled() && runtime.read_specialization_memory != nullptr) {
-				recording.read_specialization_memory = &RecordingReader::Read;
+				recording.read_specialization_memory = &RecordingReader::ReadSpecialization;
+				recording.read_memory                = &RecordingReader::ReadMemory;
 				recording.userdata                   = &recorder;
 				memo.recorded                        = true;
 			}
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    resource_plan, recording, resources, specialization));
+			if (memo.words.size() > MemoWordLimit) {
+				ForgetMemo();
+			}
 			for (size_t index = 0; index < permutations.size(); ++index) {
 				auto&       candidate = permutations[index];
 				const auto& layout    = candidate.program.bindings;
