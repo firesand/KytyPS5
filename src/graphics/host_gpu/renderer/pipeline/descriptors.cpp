@@ -560,6 +560,16 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 
 	auto& texture_cache = m_context.GetTextureCache();
 	if (descriptor.IsNull()) {
+		if (storage) {
+			// A storage image bound through a null T# swallows the shader's writes (1x1 null
+			// image): loud, once per descriptor slot (rendering-defect workflow 2026-10-13, F0).
+			static std::atomic<uint32_t> reported {0};
+			if (reported.fetch_add(1, std::memory_order_relaxed) < 32) {
+				LOGF("NullStorageImage: descriptor_index=%u written=%d read=%d atomic=%d\n",
+				     resource.descriptor_index, resource.written ? 1 : 0, resource.read ? 1 : 0,
+				     resource.atomic ? 1 : 0);
+			}
+		}
 		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
 		                                                    : TextureCache::BindingType::Texture);
 		const auto id   = texture_cache.FindImage(desc);

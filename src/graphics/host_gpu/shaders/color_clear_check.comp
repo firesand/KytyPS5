@@ -43,7 +43,9 @@ void main() {
     }
     barrier();
     const uint index = code >> 5u;
-    const bool valid = index < 8u && (pc.valid_mask & (1u << index)) != 0u;
+    // Only exact codes (low five bits clear) are fast-clear codes; the CPU path requires the
+    // same, so a uniform 0x01..0x1f byte must not be treated as "cleared to 0" (F2).
+    const bool valid = index < 8u && (code & 0x1fu) == 0u && (pc.valid_mask & (1u << index)) != 0u;
     const bool cleared = mismatch == 0u && valid;
     if (gl_LocalInvocationID.x < 8u) {
         flags[slice * 8u + gl_LocalInvocationID.x] =

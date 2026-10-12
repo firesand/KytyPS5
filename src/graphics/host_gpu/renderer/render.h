@@ -186,6 +186,11 @@ private:
 	                              bool ignore_target_mask = false, bool exact_format = false);
 	void ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target);
 	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
+	// Fast-clear-eliminate / DCC- and FMask-decompress "draws" (CB_COLOR_CONTROL modes 2/5/6) carry
+	// no color of their own. Returns true when the draw was consumed. KYTY_FCE_MATERIALIZE=1 also
+	// applies the tracked color clear of CB0 at that point (see renderDraw.cpp).
+	[[nodiscard]] bool ConsumeMetadataColorOperation(CommandBuffer& buffer,
+	                                                 uint32_t       render_target_slice_offset);
 	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer,
 	                                          const DrawCallInfo& draw,
 	                                          uint32_t            render_target_slice_offset,

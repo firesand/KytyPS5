@@ -36,6 +36,7 @@
 #include <cinttypes>
 #include <array>
 #include <atomic>
+#include <unordered_set>
 #include <bit>
 #include <cmath>
 #include <cstdio>
@@ -650,17 +651,50 @@ enum class CbColorMode : uint8_t {
 	DccDecompress      = 6,
 };
 
-static bool ConsumeMetadataColorOperation(const CommandBuffer& buffer) {
+bool RenderExecutor::ConsumeMetadataColorOperation(CommandBuffer& buffer,
+                                                    uint32_t       render_target_slice_offset) {
 	const auto& ctx  = buffer.GetRegisters();
 	const auto  mode = ctx.GetColorControl().mode;
 	// These special modes run color-buffer metadata or decompression operations. The shader is a
 	// vehicle for that operation, and its exported color must not be applied as a normal draw.
 	// Kyty stores expanded Vulkan images rather than compressed guest surfaces, so no equivalent
-	// hardware pass is emitted. Tracked DCC clear state is materialized on attachment bind;
-	// future CMask/FMask support can consume its state through the same TextureCache path.
-	return mode == static_cast<uint8_t>(CbColorMode::EliminateFastClear) ||
-	       mode == static_cast<uint8_t>(CbColorMode::FmaskDecompress) ||
-	       mode == static_cast<uint8_t>(CbColorMode::DccDecompress);
+	// hardware pass is emitted. Tracked DCC clear state is materialized on attachment bind.
+	const bool consumed = mode == static_cast<uint8_t>(CbColorMode::EliminateFastClear) ||
+	                      mode == static_cast<uint8_t>(CbColorMode::FmaskDecompress) ||
+	                      mode == static_cast<uint8_t>(CbColorMode::DccDecompress);
+	if (!consumed) {
+		return false;
+	}
+	// Rendering-defect workflow 2026-10-13: a surface cleared by a register fast clear, written next
+	// by compute (storage binds carry no clear state) and only then bound as a raster attachment
+	// gets the deferred clear applied OVER the compute output (black Nanite meshes suspected). Real
+	// hardware expands the clear here, in the eliminate/decompress pass. Always log the pass once
+	// per (CB0 base, mode); with KYTY_FCE_MATERIALIZE=1 also resolve CB0 as a render target now,
+	// which runs MaterializeColorClear with this target's own clear word, then drop the draw.
+	const auto& rt0 = ctx.GetRenderTarget(0);
+	{
+		static std::unordered_set<uint64_t> reported; // GPU thread only
+		const auto key = (static_cast<uint64_t>(rt0.base.addr) << 8u) | mode;
+		if (reported.size() < 256 && reported.insert(key).second) {
+			LOGF("MetadataColorOp: mode=%u cb0 base=0x%08x dcc=%u cmask_fast_clear=%u clear_word0=0x%08x "
+			     "slice_offset=%u\n",
+			     static_cast<unsigned>(mode), static_cast<uint32_t>(rt0.base.addr),
+			     static_cast<unsigned>(rt0.info.dcc_compression_enable),
+			     static_cast<unsigned>(rt0.info.cmask_fast_clear_enable),
+			     static_cast<uint32_t>(rt0.clear_word0.word0), render_target_slice_offset);
+		}
+	}
+	static const bool materialize = [] {
+		const char* value = std::getenv("KYTY_FCE_MATERIALIZE");
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
+	}();
+	if (materialize && mode != static_cast<uint8_t>(CbColorMode::FmaskDecompress) &&
+	    rt0.base.addr != 0) {
+		RenderColorInfo target {};
+		ResolveRenderColorTarget(buffer, target, render_target_slice_offset, 0,
+		                         /*ignore_target_mask=*/true, /*exact_format=*/false);
+	}
+	return true;
 }
 
 struct DrawEmitInfo {
@@ -1373,8 +1407,8 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
-	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
+	if (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
+	    DepthStencilCopy(buffer) || ResolveColorTargets(buffer, args.render_target_slice_offset)) {
 		ResetBindings();
 		return;
 	}
@@ -1491,8 +1525,8 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		return;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
-	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
+	if (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
+	    DepthStencilCopy(buffer) || ResolveColorTargets(buffer, args.render_target_slice_offset)) {
 		ResetBindings();
 		return;
 	}
