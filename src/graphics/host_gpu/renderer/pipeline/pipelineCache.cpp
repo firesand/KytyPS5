@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <atomic>
 #include <cctype>
 #include <cstdio>
@@ -271,6 +272,8 @@ struct PipelineCache::ProgramCache {
 			};
 			bool                  valid    = false;
 			bool                  recorded = false;
+			uint64_t              used_user_data        = 0; // registers the walk evaluated
+			bool                  used_workgroup_counts = false;
 			std::vector<uint32_t> user_data;
 			std::vector<uint32_t> workgroup_counts;
 			uint64_t              shader_base = 0;
@@ -325,20 +328,38 @@ struct PipelineCache::ProgramCache {
 			}();
 			return enabled;
 		}
-		static void CountMemo(bool hit) {
-			static uint64_t hits   = 0; // GPU thread only
-			static uint64_t misses = 0;
-			(hit ? hits : misses)++;
-			if ((hits + misses) % 100000 == 0) {
-				LOGF("SrtMemo: hits=%" PRIu64 " misses=%" PRIu64 "\n", hits, misses);
+		enum class MemoMiss { None, Hit, Empty, Base, UserData, Workgroups, Read, PushData };
+		static void CountMemo(MemoMiss outcome) {
+			static std::array<uint64_t, 8> counts {}; // GPU thread only
+			counts[static_cast<size_t>(outcome)]++;
+			uint64_t total = 0;
+			for (const auto count: counts) total += count;
+			if (total % 100000 == 0) {
+				LOGF("SrtMemo: hits=%" PRIu64 " empty=%" PRIu64 " base=%" PRIu64 " userdata=%" PRIu64
+				     " workgroups=%" PRIu64 " read=%" PRIu64 " pushdata=%" PRIu64 "\n",
+				     counts[1], counts[2], counts[3], counts[4], counts[5], counts[6], counts[7]);
 			}
 		}
-		[[nodiscard]] bool MemoHit(const ShaderRecompiler::IR::SrtRuntime& runtime) const {
-			if (!memo.valid || !memo.recorded || runtime.shader_base != memo.shader_base ||
-			    runtime.read_specialization_memory == nullptr ||
-			    !std::ranges::equal(runtime.user_data, memo.user_data) ||
+		[[nodiscard]] MemoMiss MemoCheck(const ShaderRecompiler::IR::SrtRuntime& runtime) const {
+			if (!memo.valid || !memo.recorded || runtime.read_specialization_memory == nullptr) {
+				return MemoMiss::Empty;
+			}
+			if (runtime.shader_base != memo.shader_base) {
+				return MemoMiss::Base;
+			}
+			// Only the registers the walk evaluated matter; the rest are shader constants.
+			if (runtime.user_data.size() != memo.user_data.size()) {
+				return MemoMiss::UserData;
+			}
+			for (auto mask = memo.used_user_data; mask != 0; mask &= mask - 1) {
+				const auto index = static_cast<size_t>(std::countr_zero(mask));
+				if (index >= runtime.user_data.size() || runtime.user_data[index] != memo.user_data[index]) {
+					return MemoMiss::UserData;
+				}
+			}
+			if (memo.used_workgroup_counts &&
 			    !std::ranges::equal(runtime.workgroup_counts, memo.workgroup_counts)) {
-				return false;
+				return MemoMiss::Workgroups;
 			}
 			// Replays through the GPU-aware backing read: unmapped memory fails (miss), GPU-dirty
 			// memory is downloaded first, matching what the walk itself would observe.
@@ -349,10 +370,10 @@ struct PipelineCache::ProgramCache {
 				                                             read.dwords * sizeof(uint32_t)) ||
 				    std::memcmp(scratch.data(), memo.words.data() + read.offset,
 				                read.dwords * sizeof(uint32_t)) != 0) {
-					return false;
+					return MemoMiss::Read;
 				}
 			}
-			return true;
+			return MemoMiss::Hit;
 		}
 		void RememberMemo(const ShaderRecompiler::IR::SrtRuntime& runtime, size_t index) {
 			if (!memo.recorded) {
@@ -366,8 +387,10 @@ struct PipelineCache::ProgramCache {
 			memo.valid       = true;
 		}
 		void ForgetMemo() {
-			memo.valid    = false;
-			memo.recorded = false;
+			memo.valid                 = false;
+			memo.recorded              = false;
+			memo.used_user_data        = 0;
+			memo.used_workgroup_counts = false;
 			memo.reads.clear();
 			memo.words.clear();
 		}
@@ -375,17 +398,23 @@ struct PipelineCache::ProgramCache {
 		template <bool HasCalls>
 		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime,
 		                             uint32_t push_data_cursor) {
-			if (MemoEnabled() && memo.permutation < permutations.size() && MemoHit(runtime)) {
-				auto&       candidate = permutations[memo.permutation];
-				const auto& layout    = candidate.program.bindings;
-				if (layout.push_data_start_dword == ShaderRecompiler::IR::PushData::StartFor(
-				                                        push_data_cursor, layout.ShaderDataDwords()) &&
-				    (!HasCalls || std::ranges::equal(candidate.function_code, FunctionCode()))) {
-					CountMemo(true);
-					return &candidate;
+			if (MemoEnabled()) {
+				auto outcome = memo.permutation < permutations.size() ? MemoCheck(runtime)
+				                                                      : MemoMiss::Empty;
+				if (outcome == MemoMiss::Hit) {
+					auto&       candidate = permutations[memo.permutation];
+					const auto& layout    = candidate.program.bindings;
+					if (layout.push_data_start_dword ==
+					        ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
+					                                                 layout.ShaderDataDwords()) &&
+					    (!HasCalls || std::ranges::equal(candidate.function_code, FunctionCode()))) {
+						CountMemo(MemoMiss::Hit);
+						return &candidate;
+					}
+					outcome = MemoMiss::PushData;
 				}
+				CountMemo(outcome);
 			}
-			CountMemo(false);
 			ForgetMemo();
 			RecordingReader recorder {runtime.read_specialization_memory, runtime.read_memory,
 			                          runtime.userdata, &memo};
@@ -394,6 +423,8 @@ struct PipelineCache::ProgramCache {
 				recording.read_specialization_memory = &RecordingReader::ReadSpecialization;
 				recording.read_memory                = &RecordingReader::ReadMemory;
 				recording.userdata                   = &recorder;
+				recording.used_user_data             = &memo.used_user_data;
+				recording.used_workgroup_counts      = &memo.used_workgroup_counts;
 				memo.recorded                        = true;
 			}
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(

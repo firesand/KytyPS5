@@ -325,6 +325,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			if (indirect.workgroup_axis != UINT32_MAX) {
 				if (indirect.workgroup_axis >= runtime.workgroup_counts.size()) return false;
 				key_count = runtime.workgroup_counts[indirect.workgroup_axis];
+				if (runtime.used_workgroup_counts != nullptr) *runtime.used_workgroup_counts = true;
 				if (key_count == 0u) return false;
 			} else {
 				if (table_value.dword_count != 2u || !clean.Evaluate(indirect.key_count, key_count))

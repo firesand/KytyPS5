@@ -18,6 +18,11 @@ struct SrtRuntime {
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
 	std::span<const uint32_t> workgroup_counts;
+	// Optional observation outputs: bit i set when user_data[i] was evaluated (i < 64), and the
+	// flag set when workgroup_counts contributed. Lets a caller memoize a walk on exactly the
+	// inputs it depended on.
+	uint64_t*                 used_user_data        = nullptr;
+	bool*                     used_workgroup_counts = nullptr;
 };
 
 class SrtReadCapture {

@@ -583,6 +583,9 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				return false;
 			}
 			result = m_runtime.user_data[reg - m_program.user_data_base];
+			if (m_runtime.used_user_data != nullptr && reg - m_program.user_data_base < 64u) {
+				*m_runtime.used_user_data |= uint64_t {1} << (reg - m_program.user_data_base);
+			}
 			return true;
 		}
 		case ValueOpcode::GetShaderBase: result = m_runtime.shader_base; return true;

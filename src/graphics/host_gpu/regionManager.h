@@ -237,8 +237,9 @@ public:
 		}
 	}
 
-	// KYTY_HOT_PAGE_HASH=0 disables the content check; KYTY_HOT_DEMOTE_SYNCS (default 4, 0 never)
-	// is how many consecutive unchanged syncs make a hot page leave the hot set.
+	// KYTY_HOT_PAGE_HASH=0 disables the content check; KYTY_HOT_DEMOTE_SYNCS (default 32, 0 never)
+	// is how many consecutive unchanged syncs make a hot page leave the hot set. Zero Company's
+	// menu scene: 4 → 6.0 fps, 32 → 9.9 fps, never → 9.1 fps (baseline 5.2).
 	static bool HotHashEnabled() {
 		static const bool enabled = [] {
 			const char* value = std::getenv("KYTY_HOT_PAGE_HASH");
@@ -249,7 +250,7 @@ public:
 	static uint8_t HotDemoteSyncs() {
 		static const uint8_t syncs = [] {
 			const char* value = std::getenv("KYTY_HOT_DEMOTE_SYNCS");
-			const int   parsed = value != nullptr ? std::atoi(value) : 4;
+			const int   parsed = value != nullptr ? std::atoi(value) : 32;
 			return static_cast<uint8_t>(std::clamp(parsed, 0, 255));
 		}();
 		return syncs;
