@@ -16,6 +16,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cinttypes>
 #include <cstring>
 #include <memory>
@@ -816,12 +817,23 @@ void BufferCache::MarkWriteFaultOverflow() {
 
 void BufferCache::FlushWriteFaults(bool wait) {
 	if (m_write_faults_dirty && m_scheduler.Active()) {
+		// KYTY_WRITE_FAULT_TICK_AFTER=0 restores the pre-58c4a83 order (tick before the pass) for
+		// the boot-freeze A/B.
+		static const bool tick_after = [] {
+			const char* env = std::getenv("KYTY_WRITE_FAULT_TICK_AFTER");
+			return env == nullptr || env[0] != '0';
+		}();
 		m_write_faults_dirty = false;
+		if (!tick_after) {
+			m_write_fault_tick = m_scheduler.CurrentTick();
+		}
 		m_fault_manager.ProcessWriteFaultBuffer();
 		// Taken after Process(): reusing a slot can submit the open buffer, which moves the
 		// compress pass and its mark operation to the next tick (audit 2026-10-12: a host read
 		// then waited one tick too early and parsed pages before they were protected).
-		m_write_fault_tick = m_scheduler.CurrentTick();
+		if (tick_after) {
+			m_write_fault_tick = m_scheduler.CurrentTick();
+		}
 	}
 	if (!wait || m_write_fault_tick == 0) {
 		return;
