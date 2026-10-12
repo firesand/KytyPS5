@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <iterator>
 #include <vector>
 
 namespace Libs::Audio {
@@ -404,28 +405,50 @@ static void audioout2_mix_object(AudioOut2ContextState&         context,
 }
 
 static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool blocking) {
-	// The backend consumes the buffers synchronously, but can block while pacing SDL's queue.
-	// Keep both PCM storage and port handles alive until it returns.
-	Common::LockGuard lock(g_audioout2_state_mutex);
-	auto*             context = audioout2_find_context_locked(ctx);
-	if (context == nullptr) {
-		return;
+	// The backend paces SDL's queue and sleeps, up to 200 ms per call when the host device is not
+	// draining. Holding g_audioout2_state_mutex across it starved every other audio call: UE5's
+	// foreground worker sat in AudioOut2PortSetAttributes for minutes while the async loader
+	// waited for it (boot stalls and "Loading is stuck", 2026-10-12). Copy what the backend needs
+	// under the lock and release it before the blocking output.
+	struct Pending {
+		int                  handle = 0;
+		std::vector<uint8_t> pcm;
+		std::vector<float>   gains;
+	};
+	std::vector<Pending> pending;
+	std::vector<float>   object_mix;
+	int                  object_handle = 0;
+	{
+		Common::LockGuard lock(g_audioout2_state_mutex);
+		auto*             context = audioout2_find_context_locked(ctx);
+		if (context == nullptr) {
+			return;
+		}
+		context->object_mix.clear();
+		pending.reserve(AudioInternal::OUT_PORTS_MAX);
+		for (const auto& state: g_audioout2_ports) {
+			if (!state.used || state.context != ctx || state.pcm_data.empty()) {
+				continue;
+			}
+			if (audioout2_port_type_is_object(state.port_type)) {
+				audioout2_mix_object(*context, state);
+			} else if (state.audio_handle > 0 && pending.size() < AudioInternal::OUT_PORTS_MAX) {
+				pending.push_back({state.audio_handle, state.pcm_data,
+				                   std::vector<float>(std::begin(state.gains), std::end(state.gains))});
+			}
+		}
+		if (!context->object_mix.empty() && pending.size() < AudioInternal::OUT_PORTS_MAX) {
+			object_mix    = context->object_mix;
+			object_handle = context->object_audio_handle;
+		}
 	}
-	context->object_mix.clear();
 	std::vector<AudioInternal::OutputParam> params;
-	params.reserve(AudioInternal::OUT_PORTS_MAX);
-	for (const auto& state: g_audioout2_ports) {
-		if (!state.used || state.context != ctx || state.pcm_data.empty()) {
-			continue;
-		}
-		if (audioout2_port_type_is_object(state.port_type)) {
-			audioout2_mix_object(*context, state);
-		} else if (state.audio_handle > 0 && params.size() < AudioInternal::OUT_PORTS_MAX) {
-			params.push_back({state.audio_handle, state.pcm_data.data(), state.gains.data()});
-		}
+	params.reserve(pending.size() + 1);
+	for (const auto& entry: pending) {
+		params.push_back({entry.handle, entry.pcm.data(), entry.gains.data()});
 	}
-	if (!context->object_mix.empty() && params.size() < AudioInternal::OUT_PORTS_MAX) {
-		params.push_back({context->object_audio_handle, context->object_mix.data()});
+	if (!object_mix.empty()) {
+		params.push_back({object_handle, object_mix.data()});
 	}
 	if (!params.empty()) {
 		(void)AudioInternal::AudioOutOutputs(params.data(), static_cast<uint32_t>(params.size()),
