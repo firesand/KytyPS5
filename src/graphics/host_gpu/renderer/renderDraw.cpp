@@ -33,6 +33,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -469,6 +470,24 @@ struct DrawCallInfo {
 	[[nodiscard]] const char* Name() const { return IsIndexed() ? "DrawIndex" : "DrawIndexAuto"; }
 };
 
+// The render area must stay inside every attachment at its bound mip; an overrun is undefined and
+// NVIDIA raises Xid 13 (PROP "WIDTH CT Violation"). Clamp and say which target asked for more.
+static void ReportRenderAreaClamp(const char* kind, uint64_t guest_address, vk::Extent2D wanted,
+                                  vk::Extent2D actual, const Image& image, uint32_t level,
+                                  vk::Format view_format) {
+	static std::atomic<uint32_t> reports = 0;
+	const auto n = reports.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (n > 20 && n % 1000 != 0) {
+		return;
+	}
+	LOGF("RenderArea: %s target guest=0x%016" PRIx64 " wants %ux%u but the cache image "
+	     "(data=0x%016" PRIx64 " %ux%u %s, level %u viewed as %s) offers %ux%u: clamped (#%u)\n",
+	     kind, guest_address, wanted.width, wanted.height, image.info.data.address,
+	     image.info.extent.width, image.info.extent.height,
+	     vk::to_string(image.backing.format).c_str(), level, vk::to_string(view_format).c_str(),
+	     actual.width, actual.height, n);
+}
+
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
                                                  uint32_t color_count, RenderDepthInfo& depth,
                                                  vk::ImageAspectFlags& feedback_aspects,
@@ -503,8 +522,13 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		                                     view.layer_count},
 		              buffer.Handle());
 		const auto extent       = target.Extent();
-		state.width             = std::min(state.width, extent.width);
-		state.height            = std::min(state.height, extent.height);
+		const auto actual       = TextureCache::ViewExtent(image, view.base_level, view.format);
+		if (actual.width < extent.width || actual.height < extent.height) {
+			ReportRenderAreaClamp("color", target.desc.info.data.address, extent, actual, image,
+			                      view.base_level, view.format);
+		}
+		state.width             = std::min({state.width, extent.width, actual.width});
+		state.height            = std::min({state.height, extent.height, actual.height});
 		state.num_layers        = std::min(state.num_layers, view.layer_count);
 		state.num_color_attachments = std::max(state.num_color_attachments, target.target_slot + 1);
 		auto& attachment            = state.color_attachments[target.target_slot];
@@ -565,8 +589,15 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
 		              buffer.Handle());
-		state.width               = std::min(state.width, depth.desc.info.extent.width);
-		state.height              = std::min(state.height, depth.desc.info.extent.height);
+		const auto depth_actual   = TextureCache::ViewExtent(image, view.base_level, view.format);
+		if (depth_actual.width < depth.desc.info.extent.width ||
+		    depth_actual.height < depth.desc.info.extent.height) {
+			ReportRenderAreaClamp("depth", depth.desc.info.data.address,
+			                      {depth.desc.info.extent.width, depth.desc.info.extent.height},
+			                      depth_actual, image, view.base_level, view.format);
+		}
+		state.width               = std::min({state.width, depth.desc.info.extent.width, depth_actual.width});
+		state.height              = std::min({state.height, depth.desc.info.extent.height, depth_actual.height});
 		state.num_layers          = std::min(state.num_layers, view.layer_count);
 		const auto aspects        = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
 		auto&      attachment     = state.depth_stencil_attachment;

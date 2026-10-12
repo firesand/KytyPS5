@@ -34,6 +34,18 @@
 
 namespace Libs::Graphics {
 
+vk::Extent2D TextureCache::ViewExtent(const Image& image, uint32_t level, vk::Format view_format) {
+	const auto mip_width  = std::max(image.info.extent.width >> level, 1u);
+	const auto mip_height = std::max(image.info.extent.height >> level, 1u);
+	const auto source     = vk::blockExtent(image.backing.format);
+	const auto target     = vk::blockExtent(view_format);
+	if (source[0] == target[0] && source[1] == target[1]) {
+		return {mip_width, mip_height};
+	}
+	return {(mip_width + source[0] - 1) / source[0] * target[0],
+	        (mip_height + source[1] - 1) / source[1] * target[1]};
+}
+
 #include "zeroCompanyImageLifecycle.inl"
 
 namespace {
@@ -1298,8 +1310,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		request.slice_bytes = static_cast<uint32_t>(slice_size);
 		request.slice_count = count;
 		request.attachment  = image.FindView(attachment_view);
-		request.extent      = {std::max(image.info.extent.width >> view.base_level, 1u),
-		                       std::max(image.info.extent.height >> view.base_level, 1u)};
+		request.extent      = ViewExtent(image, view.base_level, view.format);
 		m_color_clear_resolver->Resolve(command, request);
 		CommitGpuWrite(image);
 		ZeroCompanyImageLifecycle::Record(m_scheduler, "materialize-color-clear-gpu", id, image,
@@ -1818,9 +1829,9 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 		attachment.storeOp     = vk::AttachmentStoreOp::eStore;
 		attachment.clearValue  = clear;
 		vk::RenderingInfo rendering {};
-		rendering.renderArea.extent = {
-		    std::max(image.info.extent.width >> range.baseMipLevel, 1u),
-		    std::max(image.info.extent.height >> range.baseMipLevel, 1u)};
+		// In the view's texel units: an uncompressed view of a block image is blocks wide, and a
+		// render area in image texels drew past it (NVIDIA Xid 13 "WIDTH CT Violation").
+		rendering.renderArea.extent    = ViewExtent(image, range.baseMipLevel, format);
 		rendering.layerCount           = range.layerCount;
 		rendering.colorAttachmentCount = 1;
 		rendering.pColorAttachments    = &attachment;

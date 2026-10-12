@@ -46,6 +46,11 @@ public:
 	~TextureCache();
 	KYTY_CLASS_NO_COPY(TextureCache);
 
+	// Extent of a view of `image` at `level`, in the texel units of `view_format`. A block-compressed
+	// image viewed through an uncompressed format (VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT) is
+	// one view texel per block, so a render area taken from the image's texel extent overruns it.
+	[[nodiscard]] static vk::Extent2D ViewExtent(const Image& image, uint32_t level,
+	                                              vk::Format view_format);
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
