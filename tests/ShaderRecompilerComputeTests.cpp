@@ -6762,15 +6762,23 @@ public:
         texture_cache.InvalidateMemoryFromGPU(write_address, sizeof(uint32_t));
         (void)texture_cache.FindTexture(buffer_alias_image, buffer_alias_desc);
         const bool exact_base = write_offset == 0;
-        const uint32_t read_texels = exact_base ? 1 : 3;
-        Require(name, exact_base ? "exact-base buffer write refresh"
-                                 : "overlapping buffer preserves untouched texels",
-                ReadCachedTexel(name, context, buffer_alias_image, {},
-                                {read_texels, 1, 1}) ==
-                    std::vector<u32>(read_texels, exact_base ? buffer_alias_write_value
-                                                           : buffer_alias_image_value),
-                exact_base ? "exact-base buffer write did not refresh the native image"
-                           : "overlapping buffer write replaced untouched GPU image texels");
+        // Review 2026-10-13: check all four texels in both cases. The written texel must take
+        // the buffer value and the other three must keep the GPU-painted value; a refresh that
+        // re-uploads the whole image from guest memory (zeros here) fails the untouched texels.
+        std::vector<u32> expected(4, buffer_alias_image_value);
+        expected[write_offset / sizeof(uint32_t)] = buffer_alias_write_value;
+        const auto actual =
+            ReadCachedTexel(name, context, buffer_alias_image, {}, {4, 1, 1});
+        Require(name,
+                exact_base ? "exact-base buffer write refreshes only the written texel"
+                           : "overlapping buffer write preserves untouched texels",
+                actual == expected,
+                fmt::format("buffer write at offset {} gave texels {:#x} {:#x} {:#x} {:#x}, "
+                            "expected {:#x} {:#x} {:#x} {:#x}",
+                            write_offset, actual.size() > 0 ? actual[0] : 0u,
+                            actual.size() > 1 ? actual[1] : 0u, actual.size() > 2 ? actual[2] : 0u,
+                            actual.size() > 3 ? actual[3] : 0u, expected[0], expected[1],
+                            expected[2], expected[3]));
       }
 
       constexpr uint64_t exact_buffer_offset = 0x90000;
