@@ -10395,6 +10395,200 @@ public:
     std::printf("[gpu]     %-32s ok (14 direct 1D workgroups, delayed WG0)\n", name);
   }
 
+  // Production PM4 -> RenderExecutor -> PrepareBufferImageWrites path.
+  // No direct InvalidateMemoryFromGPU call appears in this regression.
+  void CheckConservativeImageWrite(bool full_cover) {
+    const char *name = full_cover ? "ConservativeFullCoverSparseWrite"
+                                  : "ConservativeInteriorThenBaseWrite";
+    constexpr uintptr_t base = 0x0000000204a00000ull;
+    constexpr uint64_t image_size = 0x40000; // 256x256 R32Uint, no row padding.
+    constexpr uint64_t interior = 0x10000;
+    constexpr u32 image_value = 0x13579bdfu;
+    constexpr u32 stale_value = 0xa5a5a5a5u;
+    constexpr u32 shader_value = 7u;
+    constexpr u32 base_value = 11u;
+    const uint64_t descriptor_base = full_cover ? base : base + interior;
+    const uint64_t descriptor_size = full_cover ? image_size : 0x20000;
+    const u32 store_offset = full_cover ? 4u : 0u;
+    const uint64_t write_address = descriptor_base + store_offset;
+    const uint64_t write_index = (write_address - base) / sizeof(u32);
+    Require(name, "large bounded descriptor", descriptor_size > 64 * 1024 &&
+                descriptor_base >= base && descriptor_base + descriptor_size <= base + image_size,
+            "fixture did not exceed the Conservative overlap threshold inside one image");
+    const auto *merge = std::getenv("KYTY_MERGE_PARTIAL_WRITES");
+    const auto *keep = std::getenv("KYTY_PROBE_KEEP_GPU_IMAGES");
+    Require(name, "production preservation policy", (!merge || merge[0] != '0') &&
+                (!keep || keep[0] == '0'),
+            "run with default partial preservation and no keep-GPU-images probe");
+
+    // A raw STORE_DWORD through a descriptor that bounds many possible writes.
+    // Its only actual write is one DWORD. No formatted read can seed the image.
+    std::vector<u32> code{
+        EncodeVop1(0x01u, 1, InlineU32(shader_value)),
+        EncodeMubuf0(0x1cu, store_offset, false, false), EncodeMubuf1(1, 0, 0)};
+    AppendEnd(&code);
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "direct allocation", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), image_size, 0x10000,
+        0, &physical) == 0, "conservative-write allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping", LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, image_size, 0x3, 0x10, physical, 0x10000) == 0 &&
+        mapped == reinterpret_cast<void *>(base), "conservative-write mapping failed");
+    std::memset(mapped, 0xa5, image_size);
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, image_size);
+      auto &scheduler = context.GetCommandScheduler();
+      auto &cache = context.GetBufferCache();
+      auto &textures = context.GetTextureCache();
+      // Establish the whole native buffer BEFORE the newer GPU image write.
+      // This removes owner joins and CPU backing refreshes as explanations.
+      auto [initial, initial_offset] = cache.ObtainBuffer(base, image_size, true, false);
+      Require(name, "whole native buffer", initial != nullptr &&
+                  initial->IsInBounds(base, image_size), "missing whole-image native buffer");
+      initial->Fill(initial_offset, image_size, stale_value);
+      const auto owner = BufferCacheTestAccess::PageOwner(cache, base);
+      const auto native_buffer = initial->Handle();
+      auto desc = MakeLinearDesc(base, image_size, vk::Format::eR32Uint,
+          Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+          {256, 256, 1}, 1, sizeof(u32), 1);
+      const auto image = textures.FindImage(desc);
+      vk::ClearValue painted{};
+      painted.color.uint32 = std::array{image_value, 0u, 0u, 0u};
+      TextureCacheTestAccess::ClearImage(textures, scheduler.Current(), image,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
+      Require(name, "GPU-owned authoritative image", textures.GetImage(image).SafeToDownload() &&
+                  textures.GetImage(image).IsGpuModified() &&
+                  !textures.GetImage(image).IsBufferModified(),
+              "fixture image was not newer than its deliberately stale buffer");
+      const auto aliases = TextureCacheTestAccess::FindImages(textures, base, image_size, true);
+      size_t registered_aliases = 0;
+      for (const auto id : aliases)
+        registered_aliases += textures.GetImage(id).registered &&
+                              textures.GetImage(id).Overlaps(base, image_size);
+      Require(name, "single image only", registered_aliases == 1,
+              "an image-alias ordering policy could confound this regression");
+
+      // Read only the already-existing native Buffer. Do not use ReadMemory,
+      // ObtainBuffer, FindTexture, or any helper that can refresh image ownership.
+      const auto snapshot_native = [&] {
+        const auto current = BufferCacheTestAccess::PageOwner(cache, base);
+        Require(name, "stable native owner", current == owner &&
+                    cache.GetBuffer(current).Handle() == native_buffer &&
+                    cache.GetBuffer(current).IsInBounds(base, image_size),
+                "fixture unexpectedly changed native owner during preservation");
+        auto &buffer = cache.GetBuffer(current);
+        Libs::Graphics::Buffer readback(m_runtime_context, scheduler, MemoryUsage::Download,
+            0, vk::BufferUsageFlagBits::eTransferDst, image_size);
+        readback.CopyFrom(scheduler.Current(), buffer, buffer.Offset(base), 0, image_size,
+            vk::AccessFlagBits::eMemoryWrite, vk::AccessFlagBits::eMemoryWrite,
+            vk::AccessFlagBits::eMemoryRead, vk::AccessFlagBits::eHostRead);
+        scheduler.FlushAndWait();
+        readback.Invalidate(0, image_size);
+        Require(name, "native readback mapping", readback.Mapped().size() >= image_size,
+                "native snapshot is not host-visible");
+        std::vector<u32> result(image_size / sizeof(u32));
+        std::memcpy(result.data(), readback.Mapped().data(), image_size);
+        return result;
+      };
+      const auto original = snapshot_native();
+      Require(name, "stale native baseline", std::all_of(original.begin(), original.end(),
+                  [&](u32 word) { return word == stale_value; }),
+              "the stale native buffer was seeded before the production sparse write");
+      const auto painted_probe = ReadCachedTexel(name, context, image);
+      Require(name, "native image clear executed", painted_probe == std::vector<u32>{image_value},
+              "the newer native image value was not verified before dispatch");
+
+      auto &shaders = processor.GetShCtx();
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                           .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                           .wave_size = 64, .user_sgpr = 4});
+      ShaderBufferResource sharp{};
+      sharp.UpdateAddress48(descriptor_base);
+      sharp.fields[2] = static_cast<u32>(descriptor_size); // zero stride: byte count
+      sharp.fields[3] = DstSel(4, 5, 6, 7) |
+          (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+      Require(name, "bounded byte descriptor, not a clear shortcut", sharp.Stride() == 0 &&
+                  sharp.GetSize() == descriptor_size && !textures.IsMeta(descriptor_base),
+              "descriptor changed size or could bypass the native sparse dispatch");
+      for (u32 word = 0; word < 4; ++word)
+        shaders.SetCsUserSgpr(word, sharp.fields[word], HW::UserSgprType::Unknown);
+      ShaderComputeInputInfo input{};
+      (void)context.GetPipelineCache().GetComputeProgram(
+          shaders.GetCs(), processor.GetCtx().GetShaderRegisters(), input);
+      Require(name, "real bounded raw shader writer", input.stage.program &&
+                  input.stage.program->info.buffers.size() == 1 &&
+                  input.stage.program->info.buffers[0].written &&
+                  !input.stage.program->info.buffers[0].read &&
+                  !input.stage.program->info.buffers[0].formatted &&
+                  !input.stage.program->info.buffers[0].unbounded &&
+                  input.stage.program->info.buffers[0].descriptor_index == 0,
+              "the shader did not compile to the intended bounded Conservative writer");
+      const std::array<u32, 5> commands{
+          KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, 0), 1, 1, 1, 0x41u};
+      Pm4Execution execution;
+      Require(name, "production sparse dispatch", processor.Process(execution, commands) ==
+                  Pm4ProcessResult::Complete,
+              "the production PM4/RenderExecutor sparse store was not dispatched");
+      const auto before_second_write = snapshot_native();
+      Require(name, "sparse write exists before the second write",
+              before_second_write[write_index] == shader_value,
+              "the native shader never wrote its target DWORD; cannot attribute a later loss");
+      if (full_cover) {
+        for (size_t index = 0; index < before_second_write.size(); ++index) {
+          const auto expected = index == write_index ? shader_value : image_value;
+          Require(name, "full-cover bounds do not mean every byte was overwritten",
+                  before_second_write[index] == expected,
+                  "before second write, native DWORD " + std::to_string(index) +
+                      " expected " + Hex(expected) + ", got " + Hex(before_second_write[index]));
+        }
+      }
+      // Exact production DMA path. On the old interior policy the image was
+      // never invalidated by the preceding large SSBO, so this seeds old pixels
+      // over the independently verified shader result before writing DWORD 0.
+      cache.FillBuffer(base, sizeof(u32), base_value, false);
+      const auto after_second_write = snapshot_native();
+      Require(name, "earlier sparse write survives exact base write",
+              after_second_write[write_index] == shader_value,
+              "a later partial-image preservation overwrote the earlier native shader DWORD: " +
+                  Hex(before_second_write[write_index]) + " -> " +
+                  Hex(after_second_write[write_index]));
+      std::vector<u32> expected(image_size / sizeof(u32), image_value);
+      expected[0] = base_value;
+      expected[write_index] = shader_value;
+      for (size_t index = 0; index < expected.size(); ++index)
+        Require(name, "combined native buffer contents", after_second_write[index] == expected[index],
+                "native DWORD " + std::to_string(index) + " expected " + Hex(expected[index]) +
+                    ", got " + Hex(after_second_write[index]));
+      u32 backing = 0;
+      Require(name, "guest backing remains stale", LibKernel::Memory::TryReadBacking(
+                  write_address, &backing, sizeof(backing)) && backing == stale_value,
+              "a CPU publication or helper refresh could have satisfied native assertions");
+      (void)textures.FindTexture(image, desc);
+      const auto pixels = ReadCachedTexel(name, context, image, {}, {256, 256, 1});
+      Require(name, "refreshed native image contains both writes", pixels == expected,
+              "buffer-to-image refresh lost an updated DWORD or untouched GPU image pixels");
+      context.UnmapMemory(base, image_size);
+      scheduler.Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing", LibKernel::Memory::KernelMunmap(base, image_size) == 0,
+            "conservative-write mapping release failed");
+    Require(name, "release direct backing", LibKernel::Memory::KernelReleaseDirectMemory(
+        physical, image_size) == 0, "conservative-write allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   // Run with Vulkan validation enabled: the unfixed path attempts to append the
   // complement copy to a command buffer that its tiler has already submitted.
   void CheckPartialMergeCommandRollover() {
@@ -44706,6 +44900,16 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     CheckOrderedCountClassification(vulkan);
     vulkan.CheckOrderedCountDispatch();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--conservative-interior-write-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckConservativeImageWrite(false);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--conservative-full-cover-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckConservativeImageWrite(true);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--partial-merge-command-only") == 0) {
