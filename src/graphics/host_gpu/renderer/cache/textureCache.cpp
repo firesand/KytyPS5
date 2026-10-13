@@ -2343,21 +2343,19 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, bool
 		return;
 	}
 	std::scoped_lock lock {m_lock};
-	// Exact DMA writes must invalidate interior overlaps at every size. A shader descriptor
-	// only bounds possible writes, so retain its existing selection policy here; treating a
-	// whole-heap binding as an exact write would discard unwritten native image contents.
+	// Both exact DMA and conservative shader writes can start inside an image at any size.
+	// The threshold chooses the lookup strategy, not whether an overlap is invalidated.
 	constexpr uint64_t SmallWrite = 64 * 1024;
 	static const bool  merge      = [] {
 		const char* value = std::getenv("KYTY_MERGE_PARTIAL_WRITES");
 		return value == nullptr || value[0] != '0'; // default on; =0 restores the lossy refresh
 	}();
-	const bool overlap = merge &&
-	    (size <= SmallWrite || coverage == GpuWriteCoverage::Exact);
+	const bool overlap = merge;
 	// Oldest image first, so when several aliases share the bytes the most recently used one seeds
 	// the buffer last and wins. This is not a per-byte authority proof among image aliases.
 	std::vector<std::pair<uint64_t, ImageId>> ordered;
 	if (overlap && size > SmallWrite) {
-		// Bounded by cached image slots, not by the number of guest pages in a large DMA range.
+		// Bounded by cached image slots, not by the number of guest pages in a large write range.
 		m_slot_images.ForEach([&](ImageId id, const Image& image) {
 			if (image.registered && image.Overlaps(address, size)) {
 				ordered.emplace_back(image.tick_accessed_last, id);
@@ -2410,7 +2408,10 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, bool
 				LOGF("ImageGpuInvalidatedByBuffer: hits=%u write_size=0x%" PRIx64 " %s\n", count,
 				     size, DescribeImageInfo(info).c_str());
 			}
-			if (partial && merge) {
+			// A descriptor bounds possible writes; even a full-image binding may write only
+			// one DWORD. Seed its untouched pixels before the shader executes. Only exact
+			// full overwrites can discard the old image without preservation.
+			if (merge && (partial || coverage == GpuWriteCoverage::Conservative)) {
 				static uint64_t merged = 0;
 				static uint64_t failed = 0;
 				if (PreserveGpuPixels(id, image, excluded)) {
