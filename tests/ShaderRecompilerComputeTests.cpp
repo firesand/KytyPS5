@@ -355,6 +355,10 @@ struct TextureCacheTestAccess {
     return cache.m_download_images.contains(id);
   }
 
+  static bool HasGpuColorClearResolver(const TextureCache &cache) {
+    return cache.m_color_clear_resolver != nullptr;
+  }
+
   static size_t NullImageCount(const TextureCache &cache) {
     return cache.m_null_images.size();
   }
@@ -11082,8 +11086,12 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
-  void CheckRenderExecutorColorMetadataClear() {
+  void CheckRenderExecutorColorMetadataClear(bool require_gpu_resolver = false) {
     constexpr const char *name = "RenderExecutorColorMetadataClear";
+    if (require_gpu_resolver) {
+      Require(name, "conditional rendering capability", m_conditional_rendering_supported,
+              "the dedicated DCC regression requires VK_EXT_conditional_rendering");
+    }
     struct PackedCase {
       vk::Format format;
       uint32_t word;
@@ -11308,6 +11316,12 @@ public:
         Require(name, "metadata before descriptor",
                 !texture_cache.IsMeta(dcc_address),
                 "the native fill guessed an unbound metadata allocation's type");
+        if (require_gpu_resolver) {
+          Require(name, "native metadata producer",
+                  context.GetBufferCache().IsRegionGpuModified(dcc_address, metadata_size) &&
+                      !TextureCacheTestAccess::HasGpuColorClearResolver(texture_cache),
+                  "the fixture must discover fresh GPU-written metadata before resolving it");
+        }
 
         RenderColorInfo color{};
         RenderExecutorTestAccess::ResolveRenderColorTarget(
@@ -11315,6 +11329,15 @@ public:
         RenderDepthInfo no_depth{};
         const auto rendering = RenderExecutorTestAccess::AcquireRenderTargets(
             executor, scheduler.Current(), &color, 1, no_depth);
+        if (require_gpu_resolver) {
+          // This resolver is constructed only inside the GPU metadata path. A successful
+          // texel check alone also passes through the CPU fallback and misses its LOAD hazard.
+          Require(name, "GPU conditional clear path",
+                  TextureCacheTestAccess::HasGpuColorClearResolver(texture_cache),
+                  "DCC clear used the CPU fallback instead of the GPU LOAD/conditional clear");
+          std::printf("[gpu]     DccConditionalLoadPath            exercised fill=0x%08x\n",
+                      fill_case.fill);
+        }
         if (fill_case.reuse_unorm) {
           Require(name, "FLOAT clear reuses UNORM image",
                   color.image_id == preexisting_id &&
@@ -18795,6 +18818,7 @@ public:
 
 private:
   bool m_rasterization_supported = true;
+  bool m_conditional_rendering_supported = false;
   u32   m_skipped_cases          = 0;
 
   RenderContext &Renderer() {
@@ -18975,10 +18999,28 @@ private:
     available_provoking_vertex.pNext = &available_feedback_dynamic;
     vk::PhysicalDeviceImageViewMinLodFeaturesEXT available_min_lod{};
     available_min_lod.pNext = &available_provoking_vertex;
+    vk::PhysicalDeviceConditionalRenderingFeaturesEXT available_conditional{};
+    available_conditional.pNext = &available_min_lod;
     vk::PhysicalDeviceFeatures2 available_features2{};
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
-    available_features2.pNext = &available_min_lod;
+    available_features2.pNext = &available_conditional;
     m_physical_device.getFeatures2(&available_features2);
+    u32 extension_count = 0;
+    RequireVk("VulkanHarness", "conditional rendering capability",
+              m_physical_device.enumerateDeviceExtensionProperties(
+                  nullptr, &extension_count, nullptr),
+              "vkEnumerateDeviceExtensionProperties");
+    std::vector<vk::ExtensionProperties> available_extensions(extension_count);
+    RequireVk("VulkanHarness", "conditional rendering capability",
+              m_physical_device.enumerateDeviceExtensionProperties(
+                  nullptr, &extension_count, available_extensions.data()),
+              "vkEnumerateDeviceExtensionProperties");
+    m_conditional_rendering_supported = available_conditional.conditionalRendering &&
+        std::any_of(available_extensions.begin(), available_extensions.end(),
+            [](const auto &extension) {
+              return std::strcmp(extension.extensionName.data(),
+                                 VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME) == 0;
+            });
     Require("VulkanHarness", "dispatch",
             available_features.shaderStorageImageWriteWithoutFormat == true,
             "shaderStorageImageWriteWithoutFormat is not supported");
@@ -19090,7 +19132,12 @@ private:
     min_lod.pNext = m_rasterization_supported
                         ? static_cast<void *>(&provoking_vertex)
                         : static_cast<void *>(&derivatives);
-    device_info.pNext = &min_lod;
+    vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional{};
+    conditional.conditionalRendering = m_conditional_rendering_supported;
+    conditional.pNext = &min_lod;
+    device_info.pNext = m_conditional_rendering_supported
+                           ? static_cast<void *>(&conditional)
+                           : static_cast<void *>(&min_lod);
     vk::PhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = true;
     device_features.shaderImageGatherExtended = true;
@@ -19108,6 +19155,9 @@ private:
         VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
         VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
         VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME};
+    if (m_conditional_rendering_supported) {
+      device_extensions.push_back(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+    }
     if (m_rasterization_supported) {
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
@@ -44638,7 +44688,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--dcc-clear-only") == 0) {
     VulkanHarness vulkan;
-    vulkan.CheckRenderExecutorColorMetadataClear();
+    vulkan.CheckRenderExecutorColorMetadataClear(/*require_gpu_resolver=*/true);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--compute-meta-clear-only") == 0) {
