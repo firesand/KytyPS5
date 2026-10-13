@@ -699,10 +699,13 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	// VkImage directly and keep it GPU-owned, like the compute-fill shortcut does, instead of
 	// invalidating it: the old path re-uploaded the whole surface from guest memory at the next bind
 	// (ng-59: 5000 uploads of the 2180x1228 scene colour in 150 s, each over GPU pixels). The buffer
-	// copy still receives the value for CPU readers. KYTY_DMA_FILL_IMAGE_CLEAR=0 restores the old path.
+	// copy still receives the value for CPU readers. OPT-IN (KYTY_DMA_FILL_IMAGE_CLEAR=1): the shortcut
+	// clears only the exact-size image and leaves other images overlapping the range (e.g. a smaller
+	// stencil allocation at the same base) stale (Codex review 2026-10-13), and ng-62 showed it does not
+	// reduce the uploads over GPU-owned images; alias coherence must be handled before it can default on.
 	static const bool clear_images = [] {
 		const char* value = std::getenv("KYTY_DMA_FILL_IMAGE_CLEAR");
-		return value == nullptr || value[0] != '0';
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
 	}();
 	if (clear_images && m_texture_cache.ClearImageFromBuffer(m_scheduler.Current(), vaddr, size, value)) {
 		auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
