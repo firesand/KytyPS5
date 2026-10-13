@@ -65,8 +65,9 @@ public:
 	}
 	void MarkGpuWritten(ImageId id);
 
+	// decline_if_aliased: refuse when any other registered image overlaps the range (FillBuffer).
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
-	                                        uint32_t packed_clear);
+	                                        uint32_t packed_clear, bool decline_if_aliased = false);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
@@ -155,6 +156,7 @@ private:
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
 	[[nodiscard]] ImageDownload BuildDownload(const Image& image) const;
 	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
+	bool PreserveGpuPixelsAroundWrite(Image& image, uint64_t write_address, uint64_t write_size);
 	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
 	                       uint64_t destination_size, ImageDownload transfer);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);

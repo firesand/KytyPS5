@@ -707,7 +707,8 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		const char* value = std::getenv("KYTY_DMA_FILL_IMAGE_CLEAR");
 		return value != nullptr && value[0] == '1' && value[1] == '\0';
 	}();
-	if (clear_images && m_texture_cache.ClearImageFromBuffer(m_scheduler.Current(), vaddr, size, value)) {
+	if (clear_images && m_texture_cache.ClearImageFromBuffer(m_scheduler.Current(), vaddr, size, value,
+	                                                         /*decline_if_aliased=*/true)) {
 		auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
 		dst->Fill(dst_offset, size, value);
 		return;
