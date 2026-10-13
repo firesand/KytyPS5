@@ -10318,6 +10318,156 @@ public:
     std::printf("[gpu]     %-32s ok (14 direct 1D workgroups, delayed WG0)\n", name);
   }
 
+  void CheckPartialMergePreparedOwners(bool indirect) {
+    const char *name = indirect ? "PartialMergeIndirectOwner" : "PartialMergePreparedOwners";
+    constexpr uintptr_t base = 0x0000000204780000ull;
+    constexpr uint64_t allocation_size = 0x10000;
+    constexpr uint64_t first_address = base + 0x100;
+    constexpr uint64_t last_address = base + 3 * BufferCache::CACHING_PAGESIZE + 0x100;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                allocation_size, 0, &direct_offset) == 0,
+            "partial-merge owner fixture allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "partial-merge owner fixture mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    std::vector<u32> consumer{
+        EncodeVop1(0x01u, 1, InlineU32(7)),
+        EncodeMubuf0(0x1cu, 0, false, false), EncodeMubuf1(1, 0, 0)};
+    AppendEnd(&consumer);
+    ShaderMapUserData(reinterpret_cast<uint64_t>(consumer.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<uint32_t>(consumer.size() * sizeof(u32))});
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto &scheduler = context.GetCommandScheduler();
+      auto &cache = context.GetBufferCache();
+      auto &textures = context.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      context.MapMemory(base, allocation_size);
+      // Create the image before buffers, so its initial upload cannot already join them.
+      auto desc = MakeLinearDesc(base, allocation_size, vk::Format::eR32Uint,
+          Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+          {128, 128, 1}, 1, 4, 1);
+      const auto image = textures.FindImage(desc);
+      vk::ClearValue painted{};
+      painted.color.uint32 = std::array{1u, 0u, 0u, 0u};
+      TextureCacheTestAccess::ClearImage(textures, scheduler.Current(), image,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
+      // Independent native buffer bytes deliberately differ from the authoritative image.
+      // The first read must use a cache buffer, not the CPU-dirty small-read stream path.
+      auto [initial, initial_offset] = cache.ObtainBuffer(first_address, 12, true, false);
+      initial->Fill(initial_offset, 4, 0);
+      initial->Fill(initial_offset + 4, 8, 1);
+      const auto first_owner = BufferCacheTestAccess::PageOwner(cache, first_address);
+      const auto last_owner = cache.FindBuffer(last_address, 4);
+      Require(name, "separate owners before preservation",
+              first_owner && last_owner && first_owner != last_owner &&
+                  textures.GetImage(image).SafeToDownload(),
+              "fixture did not retain two distinct buffers and a GPU-owned spanning image");
+      const auto descriptor = [&](uint64_t address) {
+        ShaderBufferResource value{};
+        value.UpdateAddress48(address);
+        value.fields[2] = 4;
+        value.fields[3] = DstSel(4, 5, 6, 7) |
+            (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+        return value;
+      };
+      if (!indirect) {
+        const auto program = [](ShaderType stage, bool written) {
+          ShaderRecompiler::IR::CompiledShaderInfo value{};
+          value.stage = stage;
+          ShaderRecompiler::IR::BufferResource resource{};
+          resource.read = !written;
+          resource.written = written;
+          resource.descriptor_index = 0;
+          value.info.buffers.push_back(resource);
+          value.bindings.descriptor_counts[0] = 1;
+          value.bindings.descriptor_mask = 1;
+          value.bindings.push_data_start_dword = 0;
+          return value;
+        };
+        const auto vertex_program = program(ShaderType::Vertex, false);
+        const auto pixel_program = program(ShaderType::Pixel, true);
+        ShaderRecompiler::IR::ResourceSnapshot vertex_snapshot, pixel_snapshot;
+        const auto add_descriptor = [&](auto &snapshot, uint64_t address) {
+          const auto sharp = descriptor(address);
+          auto &value = snapshot.buffers.emplace_back();
+          std::copy_n(sharp.fields, 4, value.dwords.begin());
+          value.dword_count = 4;
+        };
+        add_descriptor(vertex_snapshot, first_address);
+        add_descriptor(pixel_snapshot, last_address);
+        ShaderStageRuntime vertex_runtime{&vertex_program, &vertex_snapshot};
+        ShaderStageRuntime pixel_runtime{&pixel_program, &pixel_snapshot};
+        PreparedBindings vertex, pixel;
+        executor.PrepareBindings(vertex_runtime, vertex);
+        executor.PrepareBindings(pixel_runtime, pixel);
+        std::array<PreparedBindings *, 2> stages{&vertex, &pixel};
+        // This is the production all-stage preparation path. The old implementation
+        // joins owners while preparing pixel, after vertex already captured its handle.
+        RenderExecutorTestAccess::PrepareGraphicsBindings(executor, stages, {});
+        const auto owner = BufferCacheTestAccess::PageOwner(cache, first_address);
+        Require(name, "preservation actually joined both owners",
+                owner && owner != first_owner && owner != last_owner &&
+                    owner == BufferCacheTestAccess::PageOwner(cache, last_address),
+                "the regression did not exercise a preservation-induced join");
+        const auto &final_buffer = cache.GetBuffer(owner);
+        Require(name, "all stages retain the surviving native buffer",
+                vertex.buffers[0].buffer == final_buffer.Handle() &&
+                    pixel.buffers[0].buffer == final_buffer.Handle() &&
+                    vertex.buffers[0].offset == final_buffer.Offset(first_address) &&
+                    pixel.buffers[0].offset == final_buffer.Offset(last_address),
+                "a later image preservation left an earlier stage's native descriptor stale");
+      } else {
+        auto &shaders = processor.GetShCtx();
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(consumer.data()),
+                             .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = 64, .user_sgpr = 4});
+        const auto sharp = descriptor(last_address);
+        for (u32 word = 0; word < 4; ++word)
+          shaders.SetCsUserSgpr(word, sharp.fields[word], HW::UserSgprType::Unknown);
+        // Both possible argument payloads are safe: old native={0,1,1}, preserved={1,1,1}.
+        // The old renderer retains its pre-join indirect buffer and issues zero workgroups.
+        processor.DispatchIndirect(first_address, 0x41u);
+        const auto owner = BufferCacheTestAccess::PageOwner(cache, first_address);
+        Require(name, "indirect preservation actually joined both owners",
+                owner && owner != first_owner && owner != last_owner &&
+                    owner == BufferCacheTestAccess::PageOwner(cache, last_address),
+                "the indirect regression did not exercise a preservation-induced join");
+        cache.ReadMemory(last_address, 4);
+        u32 actual = 0;
+        Require(name, "indirect uses the surviving native argument owner",
+                LibKernel::Memory::TryReadBacking(last_address, &actual, sizeof(actual)) &&
+                    actual == 7u,
+                "the one-workgroup consumer did not write 7 after image preservation; got " +
+                    Hex(actual));
+      }
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "partial-merge owner mapping release failed");
+    Require(name, "release direct backing",
+            LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "partial-merge owner allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckNativeIndirectDispatch() {
     constexpr const char *name = "NativeIndirectDispatch";
     constexpr uintptr_t base = 0x0000000204600000ull;
@@ -44327,6 +44477,16 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     CheckOrderedCountClassification(vulkan);
     vulkan.CheckOrderedCountDispatch();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--partial-merge-binding-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckPartialMergePreparedOwners(false);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--partial-merge-indirect-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckPartialMergePreparedOwners(true);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--native-indirect-only") == 0) {
