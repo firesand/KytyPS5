@@ -7,6 +7,8 @@
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -17,10 +19,24 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cinttypes>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
+#include <string>
+#include <thread>
 #include <vector>
 #include <vulkan/vk_platform.h>
+
+// libPngEnc.cpp builds its stb copy with internal linkage; this unit gets its own private copy too.
+#define STB_IMAGE_WRITE_STATIC
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 
 // IWYU pragma: no_include <intrin.h>
 
@@ -868,6 +884,175 @@ Presenter::Presenter(WindowContext& window): m_impl(std::make_unique<Impl>(windo
 
 Presenter::~Presenter() = default;
 
+// ---- In-process frame capture (KYTY_CAPTURE_DIR=<dir>) -------------------------------------------
+// Compositor screenshots need the emulator window focused, unobscured and the session unlocked; with
+// the user at the desktop that is rarely true (2026-10-13: a capture even grabbed their browser).
+// Touching <dir>/request (optionally containing a file stem on its first line) makes the next
+// prepared guest frame copy itself into a host buffer; once that GPU tick completes, the pixels are
+// written as <dir>/<stem>.png on a helper thread. Nothing happens without the variable.
+namespace {
+
+struct FrameCapture {
+	std::unique_ptr<Buffer> staging;
+	uint64_t                tick = 0;
+	vk::Extent2D            extent {};
+	vk::Format              format = vk::Format::eUndefined;
+	std::string             path;
+};
+
+const char* CaptureDirectory() {
+	static const char* dir = [] {
+		const char* value = std::getenv("KYTY_CAPTURE_DIR");
+		return value != nullptr && value[0] != '\0' ? value : nullptr;
+	}();
+	return dir;
+}
+
+bool CaptureFormatSupported(vk::Format format) {
+	switch (format) {
+		case vk::Format::eR8G8B8A8Unorm:
+		case vk::Format::eR8G8B8A8Srgb:
+		case vk::Format::eB8G8R8A8Unorm:
+		case vk::Format::eB8G8R8A8Srgb:
+		case vk::Format::eA2B10G10R10UnormPack32:
+		case vk::Format::eA2R10G10B10UnormPack32: return true;
+		default: return false;
+	}
+}
+
+std::deque<FrameCapture> g_captures; // touched by the thread that prepares frames only
+
+void WriteCapturePng(std::string path, vk::Extent2D extent, vk::Format format,
+                     std::vector<uint8_t> pixels) {
+	const size_t         count = size_t {extent.width} * extent.height;
+	std::vector<uint8_t> rgba(count * 4);
+	for (size_t i = 0; i < count; ++i) {
+		const uint8_t* p = pixels.data() + i * 4;
+		uint8_t*       q = rgba.data() + i * 4;
+		switch (format) {
+			case vk::Format::eB8G8R8A8Unorm:
+			case vk::Format::eB8G8R8A8Srgb:
+				q[0] = p[2];
+				q[1] = p[1];
+				q[2] = p[0];
+				break;
+			case vk::Format::eA2B10G10R10UnormPack32:
+			case vk::Format::eA2R10G10B10UnormPack32: {
+				uint32_t v = 0;
+				std::memcpy(&v, p, 4);
+				const auto low  = static_cast<uint8_t>((v & 0x3ffu) >> 2u);
+				const auto mid  = static_cast<uint8_t>(((v >> 10u) & 0x3ffu) >> 2u);
+				const auto high = static_cast<uint8_t>(((v >> 20u) & 0x3ffu) >> 2u);
+				// Vulkan names components from the most significant bits: R is the low field of
+				// A2B10G10R10 and the high field of A2R10G10B10.
+				const bool r_low = format == vk::Format::eA2B10G10R10UnormPack32;
+				q[0]             = r_low ? low : high;
+				q[1]             = mid;
+				q[2]             = r_low ? high : low;
+				break;
+			}
+			default:
+				q[0] = p[0];
+				q[1] = p[1];
+				q[2] = p[2];
+				break;
+		}
+		q[3] = 255;
+	}
+	const auto tmp = path + ".part";
+	const int  ok  = stbi_write_png(tmp.c_str(), static_cast<int>(extent.width),
+	                                static_cast<int>(extent.height), 4, rgba.data(),
+	                                static_cast<int>(extent.width * 4u));
+	std::error_code ec;
+	if (ok != 0) {
+		std::filesystem::rename(tmp, path, ec);
+	}
+	LOGF("FrameCapture: %s %ux%u format=%d\n", ok != 0 && !ec ? path.c_str() : "FAILED",
+	     extent.width, extent.height, static_cast<int>(format));
+}
+
+void CompleteCaptures(CommandScheduler& scheduler) {
+	while (!g_captures.empty() && scheduler.IsFree(g_captures.front().tick)) {
+		auto capture = std::move(g_captures.front());
+		g_captures.pop_front();
+		auto&          staging = *capture.staging;
+		const uint64_t bytes   = uint64_t {capture.extent.width} * capture.extent.height * 4u;
+		staging.Invalidate(0, bytes);
+		const auto           mapped = staging.Mapped();
+		std::vector<uint8_t> pixels(mapped.begin(), mapped.begin() + static_cast<ptrdiff_t>(bytes));
+		std::thread(WriteCapturePng, capture.path, capture.extent, capture.format,
+		            std::move(pixels))
+		    .detach();
+	} // the staging buffer dies here, after its tick completed
+}
+
+void RequestCapture(GraphicContext& graphics, CommandScheduler& scheduler,
+                    CommandBuffer& command_buffer, Presenter::Frame& frame) {
+	const char* dir = CaptureDirectory();
+	if (dir == nullptr) {
+		return;
+	}
+	CompleteCaptures(scheduler);
+	std::error_code ec;
+	const auto      request = std::filesystem::path(dir) / "request";
+	if (!std::filesystem::exists(request, ec)) {
+		return;
+	}
+	std::string stem;
+	{
+		std::ifstream in(request);
+		std::getline(in, stem);
+	}
+	std::filesystem::remove(request, ec);
+	while (!stem.empty() && (stem.back() == '\r' || stem.back() == ' ')) {
+		stem.pop_back();
+	}
+	if (stem.empty()) {
+		stem = "capture-" + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+		                                       std::chrono::system_clock::now().time_since_epoch())
+		                                       .count());
+	}
+	const auto& image = frame.image;
+	if (!CaptureFormatSupported(image.format) || image.extent.width == 0 ||
+	    image.extent.height == 0) {
+		LOGF("FrameCapture: unsupported frame format=%d extent=%ux%u\n",
+		     static_cast<int>(image.format), image.extent.width, image.extent.height);
+		return;
+	}
+	const uint64_t bytes   = uint64_t {image.extent.width} * image.extent.height * 4u;
+	auto           staging = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Download, 0,
+	                                                  vk::BufferUsageFlagBits::eTransferDst, bytes);
+	command_buffer.EndRendering();
+	auto command = command_buffer.Handle();
+	frame.Transit(command, vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead);
+	vk::BufferImageCopy region {};
+	region.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	region.imageExtent      = {image.extent.width, image.extent.height, 1};
+	command.copyImageToBuffer(image.image, vk::ImageLayout::eTransferSrcOptimal, staging->Handle(), 1,
+	                          &region);
+	vk::BufferMemoryBarrier2 barrier {};
+	barrier.srcStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+	barrier.srcAccessMask       = vk::AccessFlagBits2::eTransferWrite;
+	barrier.dstStageMask        = vk::PipelineStageFlagBits2::eHost;
+	barrier.dstAccessMask       = vk::AccessFlagBits2::eHostRead;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.buffer              = staging->Handle();
+	barrier.offset              = 0;
+	barrier.size                = bytes;
+	vk::DependencyInfo dependency {};
+	dependency.bufferMemoryBarrierCount = 1;
+	dependency.pBufferMemoryBarriers    = &barrier;
+	command.pipelineBarrier2(dependency);
+	const auto tick = scheduler.CurrentTick();
+	g_captures.push_back({std::move(staging), tick, {image.extent.width, image.extent.height},
+	                      image.format, (std::filesystem::path(dir) / (stem + ".png")).string()});
+	LOGF("FrameCapture: requested %s %ux%u tick=%" PRIu64 "\n", stem.c_str(), image.extent.width,
+	     image.extent.height, tick);
+}
+
+} // namespace
+
 Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(buffer.IsInvalid());
@@ -886,6 +1071,8 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
+	RequestCapture(m_impl->window.graphic_ctx, m_impl->renderer.GetCommandScheduler(), buffer,
+	               *frame);
 	return *frame;
 }
 
