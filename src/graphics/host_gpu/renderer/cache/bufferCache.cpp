@@ -695,6 +695,20 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		}
 	}
 	(void)m_texture_cache.ClearMeta(vaddr);
+	// 2026-10-13: a DMA fill that covers a cached image exactly is a clear of that image. Clear the
+	// VkImage directly and keep it GPU-owned, like the compute-fill shortcut does, instead of
+	// invalidating it: the old path re-uploaded the whole surface from guest memory at the next bind
+	// (ng-59: 5000 uploads of the 2180x1228 scene colour in 150 s, each over GPU pixels). The buffer
+	// copy still receives the value for CPU readers. KYTY_DMA_FILL_IMAGE_CLEAR=0 restores the old path.
+	static const bool clear_images = [] {
+		const char* value = std::getenv("KYTY_DMA_FILL_IMAGE_CLEAR");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (clear_images && m_texture_cache.ClearImageFromBuffer(m_scheduler.Current(), vaddr, size, value)) {
+		auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
+		dst->Fill(dst_offset, size, value);
+		return;
+	}
 	if (!IsRegionGpuModified(vaddr, size)) {
 		// Access the guest mapping so write faults invalidate cached buffers and images.
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);

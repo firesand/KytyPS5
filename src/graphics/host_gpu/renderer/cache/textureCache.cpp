@@ -71,6 +71,19 @@ std::string DescribeImageInfo(const ImageInfo& info) {
 	                   info.metadata.range.address, info.metadata.range.size);
 }
 
+// KYTY_PROBE_KEEP_GPU_IMAGES=1 (discriminator 2026-10-13): a partial GPU buffer write at an image's
+// base, or a CPU write fault inside a GPU-owned image, currently hands authority to guest memory and
+// the next bind re-uploads the whole surface (stale outside the written bytes) over the GPU pixels.
+// The probe keeps such images GPU-owned instead (the written bytes are lost rather than the GPU
+// pixels); a visible difference means these re-uploads are what blackens GPU-rendered content.
+bool KeepGpuImagesProbe() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PROBE_KEEP_GPU_IMAGES");
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
+	}();
+	return enabled;
+}
+
 void ReportGpuOwnedOverlap(const char* kind, TextureCache::BindingType binding,
                            const ImageInfo& request, const ImageInfo& owner, uint64_t owner_age) {
 	static std::unordered_set<uint64_t> reported; // texture-cache lock held by the callers
@@ -2175,6 +2188,15 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 		}
 		ZeroCompanyImageLifecycle::Record(m_scheduler, "invalidate-gpu-before", id, image,
 		    {.address = address, .size = size});
+		if (image.IsGpuModified() && KeepGpuImagesProbe() && size < image.info.data.size) {
+			static uint64_t kept = 0;
+			if (++kept == 1 || kept % 1000 == 0) {
+				LOGF("KeepGpuImages: ignored partial GPU write 0x%" PRIx64 " bytes at the base of %s "
+				     "(kept=%" PRIu64 ")\n",
+				     size, DescribeImageInfo(image.info).c_str(), kept);
+			}
+			continue;
+		}
 		if (image.IsGpuModified()) {
 			// Rendering-defect forensics (2026-10-13): a GPU buffer write starting at this image's
 			// base hands authority back to guest memory; the image's own GPU pixels are then
@@ -2209,6 +2231,14 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 			continue;
 		}
 		if (owner->Overlaps(address, size)) {
+			if (owner->IsGpuModified() && KeepGpuImagesProbe()) {
+				static uint64_t kept = 0;
+				if (++kept == 1 || kept % 1000 == 0) {
+					LOGF("KeepGpuImages: ignored CPU write at 0x%" PRIx64 " inside %s (kept=%" PRIu64 ")\n",
+					     address, DescribeImageInfo(owner->info).c_str(), kept);
+				}
+				continue;
+			}
 			const auto flags_before = ZeroCompanyImageLifecycle::Flags(*owner);
 			owner->InvalidateCpuWrite(address, size);
 			UntrackImage(id);
