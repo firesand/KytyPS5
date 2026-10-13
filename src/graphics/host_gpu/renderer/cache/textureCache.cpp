@@ -30,6 +30,7 @@
 #include <span>
 #include <string>
 #include <tuple>
+#include <unordered_set>
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Libs::Graphics {
@@ -51,6 +52,40 @@ vk::Extent2D TextureCache::ViewExtent(const Image& image, uint32_t level, vk::Fo
 namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
+
+// Rendering-defect forensics (review 2026-10-13): a request that overlaps a live GPU-owned image but
+// matches neither its backing nor an overlap rule creates a second VkImage over the same guest
+// memory. Tiled GPU pixels never reach guest memory, so the second image is filled from stale
+// bytes (briefing-panel hypothesis: gray box / stripes / noise). The same applies when an overlap
+// rule frees a GPU-owned image instead of reusing it. Log both signatures once per
+// (owner address, request signature, kind).
+std::string DescribeImageInfo(const ImageInfo& info) {
+	return fmt::format("0x{:x}+0x{:x} {}x{}x{} mips={} layers={} samples={} {} guest={} type={} "
+	                   "tile={} bpb={} pitch={} meta={}:0x{:x}+0x{:x}",
+	                   info.data.address, info.data.size, info.extent.width, info.extent.height,
+	                   info.extent.depth, info.resources.levels, info.resources.layers, info.samples,
+	                   vk::to_string(info.pixel_format), static_cast<uint32_t>(info.guest_format),
+	                   static_cast<uint32_t>(info.type), static_cast<uint32_t>(info.tile_mode),
+	                   info.bytes_per_block, info.pitch, static_cast<uint32_t>(info.metadata.kind),
+	                   info.metadata.range.address, info.metadata.range.size);
+}
+
+void ReportGpuOwnedOverlap(const char* kind, TextureCache::BindingType binding,
+                           const ImageInfo& request, const ImageInfo& owner, uint64_t owner_age) {
+	static std::unordered_set<uint64_t> reported; // texture-cache lock held by the callers
+	const uint64_t key = owner.data.address ^ (uint64_t {request.extent.width} << 32u) ^
+	                     (uint64_t {request.extent.height} << 48u) ^
+	                     (static_cast<uint64_t>(request.pixel_format) << 8u) ^
+	                     (static_cast<uint64_t>(request.tile_mode) << 4u) ^ request.data.size ^
+	                     (uint64_t {static_cast<uint8_t>(binding)} << 60u) ^
+	                     (kind[0] == 's' ? 0u : 1u);
+	if (reported.size() >= 256 || !reported.insert(key).second) {
+		return;
+	}
+	LOGF("Image%s: request type=%d %s | gpu-owned age=%" PRIu64 " %s\n", kind,
+	     static_cast<int>(binding), DescribeImageInfo(request).c_str(), owner_age,
+	     DescribeImageInfo(owner).c_str());
+}
 
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
@@ -853,6 +888,10 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			    safe_to_delete ? "overlap-layout-free" : "overlap-layout-retain-young",
 			    cached_id, cached, {.request = &requested});
 			if (safe_to_delete) {
+				if (cached.IsGpuModified()) {
+					ReportGpuOwnedOverlap("FreeGpuOwned", binding, requested, cached.info,
+					                      current_tick - std::min(current_tick, cached.tick_accessed_last));
+				}
 				FreeImage(cached_id);
 			}
 			return {merged_id};
@@ -1490,6 +1529,14 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 		}
 		if (!result) {
+			for (const auto candidate: candidates) {
+				const auto* owner = m_slot_images.try_get(candidate);
+				if (owner != nullptr && owner->registered && owner->IsGpuModified()) {
+					const auto now = m_scheduler.CurrentTick();
+					ReportGpuOwnedOverlap("Split", desc.type, desc.info, owner->info,
+					                      now - std::min(now, owner->tick_accessed_last));
+				}
+			}
 			result         = InsertImage(desc.info);
 			auto& inserted = m_slot_images[result];
 			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,

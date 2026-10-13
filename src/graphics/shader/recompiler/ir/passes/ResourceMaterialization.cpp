@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <fmt/format.h>
 #include <functional>
+#include <mutex>
 #include <numeric>
 #include <unordered_set>
 
@@ -195,6 +196,49 @@ bool ReadScalarTable(uint64_t base, uint64_t size, uint64_t dynamic_offset,
 	return prefix.size_bytes() - 1u <= AddressMask - address &&
 	       runtime.read_specialization_memory != nullptr &&
 	       runtime.read_specialization_memory(runtime.userdata, address, prefix);
+}
+
+// Rendering-defect forensics (review 2026-10-13): a written storage image that reaches the renderer
+// as an all-zero descriptor had one of several origins: the game bound a null T#, the source is
+// inactive for this specialization, or validation rejected a real descriptor (reserved bits, type,
+// dimension). The renderer's NullStorageImage report cannot tell them apart because the dwords are
+// already destroyed there, so log the reason and the original dwords here, once per
+// (shader, image, reason).
+enum class ImageZeroReason : uint8_t { Inactive, GuestNull, InvalidDirect, InvalidIndirect, Dimension };
+
+const char* ImageZeroReasonName(ImageZeroReason reason) {
+	switch (reason) {
+		case ImageZeroReason::Inactive: return "inactive-source";
+		case ImageZeroReason::GuestNull: return "guest-null";
+		case ImageZeroReason::InvalidDirect: return "invalid-direct";
+		case ImageZeroReason::InvalidIndirect: return "invalid-indirect-candidate";
+		case ImageZeroReason::Dimension: return "dimension-mismatch";
+	}
+	return "?";
+}
+
+void ReportImageZeroed(const ResourcePlan& program, uint32_t index, const ImageResource& image,
+                       const DescriptorValue& original, ImageZeroReason reason) {
+	if (!image.written) {
+		return; // only swallowed writes matter for the black-mesh investigation
+	}
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> reported;
+	std::scoped_lock                    lock {mutex};
+	const auto key = program.shader_hash ^ (uint64_t {index} << 40u) ^
+	                 (uint64_t {static_cast<uint8_t>(reason)} << 56u);
+	if (reported.size() >= 512 || !reported.insert(key).second) {
+		return;
+	}
+	const auto& w = original.dwords;
+	// stderr like SpecializationFail: the unit tests link this pass without the logging library.
+	std::fprintf(stderr,
+	             "ImageZeroed: shader=0x%016" PRIx64 " stage=%d image=%u descriptor_index=%u "
+	             "reason=%s read=%d atomic=%d dwords=%08x %08x %08x %08x %08x %08x %08x %08x\n",
+	             program.shader_hash, static_cast<int>(program.stage), index, image.descriptor_index,
+	             ImageZeroReasonName(reason), image.read ? 1 : 0, image.atomic ? 1 : 0, w[0], w[1],
+	             w[2], w[3], w[4], w[5], w[6], w[7]);
+	std::fflush(stderr);
 }
 
 bool NormalizeIndirectStoreBuffer(DescriptorValue& value) {
@@ -1191,6 +1235,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		if (source->indirect_descriptor.has_value()) {
 			snapshot.images[i] = {.dword_count = 8u};
 			if (!active.empty() && !active[image.source]) {
+				ReportImageZeroed(program, i, image, snapshot.images[i], ImageZeroReason::Inactive);
 				continue;
 			}
 			const auto& indirect = *source->indirect_descriptor;
@@ -1199,18 +1244,33 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			        program, indirect, i, 8u, observed, clean, snapshot, snapshot.images,
 			        specialization.images, UINT32_MAX, [&](DescriptorValue& value) {
 				        // A broad heap also contains resources for other typed image operations.
-				        if (NullImageDescriptor(value) || !ValidImageDescriptor(value, image.r128) ||
-				            (bounded_table && DescriptorDimension(value, image.dimension) != image.dimension))
+				        const bool null    = NullImageDescriptor(value);
+				        const bool invalid = !null && !ValidImageDescriptor(value, image.r128);
+				        const bool mismatch =
+				            !null && !invalid && bounded_table &&
+				            DescriptorDimension(value, image.dimension) != image.dimension;
+				        if (null || invalid || mismatch) {
+					        ReportImageZeroed(program, i, image, value,
+					                          null      ? ImageZeroReason::GuestNull
+					                          : invalid ? ImageZeroReason::InvalidIndirect
+					                                    : ImageZeroReason::Dimension);
 					        value.dwords.fill(0u);
+				        }
 				        return true;
 			        })) {
 				return false;
 			}
 		} else {
+			const bool inactive = !active.empty() && !active[image.source];
 			if (!evaluate(image.source, snapshot.images[i], image.written)) {
 				return false;
 			}
 			if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
+				ReportImageZeroed(program, i, image, snapshot.images[i],
+				                  inactive ? ImageZeroReason::Inactive
+				                  : NullImageDescriptor(snapshot.images[i])
+				                      ? ImageZeroReason::GuestNull
+				                      : ImageZeroReason::InvalidDirect);
 				snapshot.images[i].dwords.fill(0);
 			}
 		}
