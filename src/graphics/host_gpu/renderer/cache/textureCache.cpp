@@ -2282,11 +2282,11 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	// image overlapping them qualifies. Large bindings keep the historical exact-base rule, because
 	// walking every page of a 528 MiB whole-heap binding (34k lookups) is unnecessary.
 	constexpr uint64_t SmallWrite = 64 * 1024;
-	const bool         small      = size <= SmallWrite;
 	static const bool  merge      = [] {
 		const char* value = std::getenv("KYTY_MERGE_PARTIAL_WRITES");
 		return value == nullptr || value[0] != '0'; // default on; =0 restores the lossy refresh
 	}();
+	const bool small = merge && size <= SmallWrite; // =0 also restores the exact-base rule
 	for (const auto id: FindImagesInRegion(address, small ? size : 1, true)) {
 		auto& image = m_slot_images[id];
 		if (small ? !image.Overlaps(address, size) : image.info.data.address != address) {
