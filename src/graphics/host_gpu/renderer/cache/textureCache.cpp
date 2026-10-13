@@ -73,6 +73,15 @@ std::string DescribeImageInfo(const ImageInfo& info) {
 void ReportGpuOwnedOverlap(const char* kind, TextureCache::BindingType binding,
                            const ImageInfo& request, const ImageInfo& owner, uint64_t owner_age) {
 	static std::unordered_set<uint64_t> reported; // texture-cache lock held by the callers
+	static uint32_t                     alias_lines = 0;
+	// ng-55: transient aliasing (different base or different extent) dominates and is legitimate
+	// (UE5 RDG reuses heap memory within a frame); keep it to a small sample and spend the budget
+	// on same-base/same-extent requests, which are views of one surface.
+	const bool same_surface = owner.data.address == request.data.address ||
+	                          (owner.extent == request.extent && owner.data.size == request.data.size);
+	if (!same_surface && alias_lines++ >= 32) {
+		return;
+	}
 	const uint64_t key = owner.data.address ^ (uint64_t {request.extent.width} << 32u) ^
 	                     (uint64_t {request.extent.height} << 48u) ^
 	                     (static_cast<uint64_t>(request.pixel_format) << 8u) ^
@@ -82,9 +91,9 @@ void ReportGpuOwnedOverlap(const char* kind, TextureCache::BindingType binding,
 	if (reported.size() >= 256 || !reported.insert(key).second) {
 		return;
 	}
-	LOGF("Image%s: request type=%d %s | gpu-owned age=%" PRIu64 " %s\n", kind,
-	     static_cast<int>(binding), DescribeImageInfo(request).c_str(), owner_age,
-	     DescribeImageInfo(owner).c_str());
+	LOGF("Image%s: %s request type=%d %s | gpu-owned age=%" PRIu64 " %s\n", kind,
+	     same_surface ? "same-surface" : "alias", static_cast<int>(binding),
+	     DescribeImageInfo(request).c_str(), owner_age, DescribeImageInfo(owner).c_str());
 }
 
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,

@@ -204,7 +204,14 @@ bool ReadScalarTable(uint64_t base, uint64_t size, uint64_t dynamic_offset,
 // dimension). The renderer's NullStorageImage report cannot tell them apart because the dwords are
 // already destroyed there, so log the reason and the original dwords here, once per
 // (shader, image, reason).
-enum class ImageZeroReason : uint8_t { Inactive, GuestNull, InvalidDirect, InvalidIndirect, Dimension };
+enum class ImageZeroReason : uint8_t {
+	Inactive,
+	GuestNull,
+	InvalidDirect,
+	InvalidIndirect,
+	Dimension,
+	ForcedUnevaluable // KYTY_PROBE_NO_SOURCE_PRUNING: pruned source that could not be evaluated
+};
 
 const char* ImageZeroReasonName(ImageZeroReason reason) {
 	switch (reason) {
@@ -213,6 +220,7 @@ const char* ImageZeroReasonName(ImageZeroReason reason) {
 		case ImageZeroReason::InvalidDirect: return "invalid-direct";
 		case ImageZeroReason::InvalidIndirect: return "invalid-indirect-candidate";
 		case ImageZeroReason::Dimension: return "dimension-mismatch";
+		case ImageZeroReason::ForcedUnevaluable: return "forced-unevaluable";
 	}
 	return "?";
 }
@@ -1153,12 +1161,22 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		snapshot.uniform_fill = fill.fill;
 		snapshot.uniform_fill.value = stored[0];
 	}
+	// KYTY_PROBE_NO_SOURCE_PRUNING: active value 2 marks a source the reachability walk would have
+	// nulled; it is evaluated like a live one and falls back to zero (reported) when that fails.
+	std::vector<uint8_t> forced_zero(program.descriptor_sources.size(), 0u);
+	const auto forced = [&](uint32_t source) { return !active.empty() && active[source] == 2u; };
 	const auto evaluate = [&](uint32_t source, DescriptorValue& value, bool written = false) {
 		if (source >= program.descriptor_sources.size()) {
 			return false;
 		}
 		if (active.empty() || active[source]) {
-			return (capture_reads && written ? clean : walker).EvaluateDescriptor(source, value);
+			if ((capture_reads && written ? clean : walker).EvaluateDescriptor(source, value)) {
+				return true;
+			}
+			if (!forced(source)) {
+				return false;
+			}
+			forced_zero[source] = 1u;
 		}
 		value = {};
 		value.dword_count = program.descriptor_sources[source].dword_count;
@@ -1180,8 +1198,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 					if (!MaterializeIndirectDescriptor(
 					        program, *source->indirect_descriptor, i, 4u, observed, clean, snapshot,
 					        snapshot.buffers, specialization.buffers, ShaderInfo::MaxBuffers,
-					        NormalizeIndirectStoreBuffer))
-						return false;
+					        NormalizeIndirectStoreBuffer)) {
+						if (!forced(base.source)) return false;
+						snapshot.buffers[i] = {.dword_count = 4u}; // probe: unevaluable pruned table
+					}
 				}
 			} else if (!evaluate(base.source, snapshot.buffers[i], base.written)) {
 				return false;
@@ -1258,7 +1278,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 				        }
 				        return true;
 			        })) {
-				return false;
+				if (!forced(image.source)) return false;
+				snapshot.images[i] = {.dword_count = 8u}; // probe: unevaluable pruned table
+				ReportImageZeroed(program, i, image, snapshot.images[i],
+				                  ImageZeroReason::ForcedUnevaluable);
 			}
 		} else {
 			const bool inactive = !active.empty() && !active[image.source];
@@ -1267,7 +1290,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			}
 			if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
 				ReportImageZeroed(program, i, image, snapshot.images[i],
-				                  inactive ? ImageZeroReason::Inactive
+				                  forced_zero[image.source] ? ImageZeroReason::ForcedUnevaluable
+				                  : inactive                ? ImageZeroReason::Inactive
 				                  : NullImageDescriptor(snapshot.images[i])
 				                      ? ImageZeroReason::GuestNull
 				                      : ImageZeroReason::InvalidDirect);

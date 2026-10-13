@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_set>
 
@@ -955,6 +956,19 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 	return true;
 }
 
+// KYTY_PROBE_NO_SOURCE_PRUNING=1 (rendering-defect probe 2026-10-13): the reachability walk below
+// nulls every descriptor source that lives only in control-flow blocks it considers unreachable for
+// the current SRT values. ng-55 showed all swallowed storage-image writes come from exactly that
+// verdict ("inactive-source"), so this probe keeps those sources alive (active value 2 = forced) and
+// refreshes their SRT reads best-effort; a visual difference means a wrong reachability verdict.
+static bool NoSourcePruning() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PROBE_NO_SOURCE_PRUNING");
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
+	}();
+	return enabled;
+}
+
 bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	if (!m_program.srt_plan_complete) return false;
 	const auto refresh = [&](uint32_t slot) {
@@ -1004,6 +1018,14 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 			pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
 		} else {
 			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
+		}
+	}
+	if (NoSourcePruning()) {
+		for (auto& flag: active) {
+			if (flag == 0u) flag = 2u; // forced: materialized if evaluable, zero (and reported) if not
+		}
+		for (uint32_t slot = 0; slot < m_program.srt_reads.size(); ++slot) {
+			(void)refresh(slot); // unreached blocks: best effort, the flat entry stays 0 on failure
 		}
 	}
 	return true;
