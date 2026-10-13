@@ -129,14 +129,11 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	}
 	Buffer*  buffer = nullptr;
 	uint64_t offset = 0;
-	if (written) {
-		// Before obtaining the buffer: the invalidation may now copy a GPU-owned image's pixels
-		// into the buffer backing this range (TextureCache::PreserveGpuPixelsAroundWrite), which can
-		// join buffers; the descriptor must capture the buffer that survives that join.
-		context.GetTextureCache().InvalidateMemoryFromGPU(address, size, /*write_pending=*/true);
-	}
 	if (unsynced_read && !written) {
-		buffer = &context.GetBufferCache().GetBuffer(id);
+		// Discovery or image preservation may have joined the saved owner.
+		// Re-resolve ownership without synchronizing this whole-heap read.
+		auto& cache = context.GetBufferCache();
+		buffer = &cache.GetBuffer(cache.FindBuffer(address, size));
 		offset = buffer->Offset(address);
 	} else {
 		std::tie(buffer, offset) = context.GetBufferCache().ObtainBuffer(
@@ -941,6 +938,21 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	}
 }
 
+// Image preservation may allocate the full image range and join existing cache buffers.
+// Complete every such mutation before capturing any native descriptor or indirect argument.
+void RenderExecutor::PrepareBufferImageWrites(std::span<PreparedBindings* const> stages) {
+	auto& textures = m_context.GetTextureCache();
+	for (const auto* prepared: stages) {
+		EXIT_IF(prepared == nullptr || prepared->runtime == nullptr || !*prepared->runtime);
+		for (const auto& resource: prepared->runtime->program->info.buffers) {
+			if (!resource.written || resource.descriptor_index == UINT32_MAX) continue;
+			const auto& source = prepared->buffer_sources[resource.descriptor_index];
+			if (source.address == 0 || source.size == 0 || source.untracked_write) continue;
+			textures.InvalidateMemoryFromGPU(source.address, source.size, /*write_pending=*/true);
+		}
+	}
+}
+
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
@@ -1060,6 +1072,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 			BindRenderTarget(target.image_id);
 		}
 	}
+	PrepareBufferImageWrites(stages);
 	// Discovery can read back PS5 metadata and submit the scheduler. Reserve draw buffers only
 	// after image identities are final; attachment layout transitions follow buffer alias copies.
 	for (auto* stage: stages) {
