@@ -36,6 +36,8 @@ struct TextureCacheTestAccess;
 class TextureCache {
 public:
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
+	// Exact means every byte in the range is written (DMA fill/copy), never a shader binding bound.
+	enum class GpuWriteCoverage : uint8_t { Conservative, Exact };
 
 	struct ImageDesc {
 		ImageInfo     info;
@@ -76,7 +78,8 @@ public:
 	// is seeded into the buffer first; otherwise the seed skips address+size and every `recorded` range
 	// (write-fault publishes, tests) because those bytes already hold the new data.
 	void InvalidateMemoryFromGPU(uint64_t address, uint64_t size, bool write_pending = false,
-	                             std::span<const std::pair<uint64_t, uint64_t>> recorded = {});
+	                             std::span<const std::pair<uint64_t, uint64_t>> recorded = {},
+	                             GpuWriteCoverage coverage = GpuWriteCoverage::Conservative);
 	// True when a GPU-owned image overlaps the range (FillBuffer/CopyBuffer CPU paths must not bypass
 	// the merge by writing guest memory directly).
 	[[nodiscard]] bool HasGpuOwnedImageIn(uint64_t address, uint64_t size);

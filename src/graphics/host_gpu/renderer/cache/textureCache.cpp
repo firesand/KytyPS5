@@ -2336,25 +2336,36 @@ bool TextureCache::HasGpuOwnedImageIn(uint64_t address, uint64_t size) {
 }
 
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, bool write_pending,
-                                           std::span<const std::pair<uint64_t, uint64_t>> recorded) {
+                                           std::span<const std::pair<uint64_t, uint64_t>> recorded,
+                                           GpuWriteCoverage coverage) {
 	if (!GuestRange {address, size}.Valid()) {
 		return;
 	}
 	std::scoped_lock lock {m_lock};
-	// Small writes (counters, headers, sub-rectangles) may land anywhere inside an image: every
-	// image overlapping them qualifies. Large bindings keep the historical exact-base rule, because
-	// walking every page of a 528 MiB whole-heap binding (34k lookups) is unnecessary.
+	// Exact DMA writes must invalidate interior overlaps at every size. A shader descriptor
+	// only bounds possible writes, so retain its existing selection policy here; treating a
+	// whole-heap binding as an exact write would discard unwritten native image contents.
 	constexpr uint64_t SmallWrite = 64 * 1024;
 	static const bool  merge      = [] {
 		const char* value = std::getenv("KYTY_MERGE_PARTIAL_WRITES");
 		return value == nullptr || value[0] != '0'; // default on; =0 restores the lossy refresh
 	}();
-	const bool small = merge && size <= SmallWrite; // =0 also restores the exact-base rule
+	const bool overlap = merge &&
+	    (size <= SmallWrite || coverage == GpuWriteCoverage::Exact);
 	// Oldest image first, so when several aliases share the bytes the most recently used one seeds
-	// the buffer last and wins.
+	// the buffer last and wins. This is not a per-byte authority proof among image aliases.
 	std::vector<std::pair<uint64_t, ImageId>> ordered;
-	for (const auto id: FindImagesInRegion(address, small ? size : 1, true)) {
-		ordered.emplace_back(m_slot_images[id].tick_accessed_last, id);
+	if (overlap && size > SmallWrite) {
+		// Bounded by cached image slots, not by the number of guest pages in a large DMA range.
+		m_slot_images.ForEach([&](ImageId id, const Image& image) {
+			if (image.registered && image.Overlaps(address, size)) {
+				ordered.emplace_back(image.tick_accessed_last, id);
+			}
+		});
+	} else {
+		for (const auto id: FindImagesInRegion(address, overlap ? size : 1, true)) {
+			ordered.emplace_back(m_slot_images[id].tick_accessed_last, id);
+		}
 	}
 	std::sort(ordered.begin(), ordered.end());
 	// Bytes that already hold the new data when the write was recorded before this call.
@@ -2365,7 +2376,7 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, bool
 	}
 	for (const auto& [age, id]: ordered) {
 		auto& image = m_slot_images[id];
-		if (small ? !image.Overlaps(address, size) : image.info.data.address != address) {
+		if (overlap ? !image.Overlaps(address, size) : image.info.data.address != address) {
 			continue;
 		}
 		const bool partial = address > image.info.data.address ||
