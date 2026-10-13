@@ -129,6 +129,12 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	}
 	Buffer*  buffer = nullptr;
 	uint64_t offset = 0;
+	if (written) {
+		// Before obtaining the buffer: the invalidation may now copy a GPU-owned image's pixels
+		// into the buffer backing this range (TextureCache::PreserveGpuPixelsAroundWrite), which can
+		// join buffers; the descriptor must capture the buffer that survives that join.
+		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
+	}
 	if (unsynced_read && !written) {
 		buffer = &context.GetBufferCache().GetBuffer(id);
 		offset = buffer->Offset(address);
@@ -144,11 +150,7 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 		EXIT("storage buffer offset adjustment is unsupported\n");
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
-	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
-	if (written) {
-		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
-	}
-	return result;
+	return {buffer->Handle(), aligned_offset, size + adjustment};
 }
 
 bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bool r128) {
