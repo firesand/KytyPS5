@@ -1402,7 +1402,8 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		attachment_view.layer_count = count;
 		attachment_view.usage       = vk::ImageUsageFlagBits::eColorAttachment;
 		image.Transit(vk::ImageLayout::eColorAttachmentOptimal,
-		              vk::AccessFlagBits2::eColorAttachmentWrite, {}, command.Handle());
+		              vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite,
+		              {}, command.Handle());
 		request.meta_buffer = meta_buffer->Handle();
 		request.meta_offset = meta_offset;
 		request.slice_bytes = static_cast<uint32_t>(slice_size);
