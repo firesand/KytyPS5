@@ -24018,6 +24018,99 @@ TestCase PackedMinMaxF16NanAndSignedZeroEdges() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase PackedMinMaxF16PayloadsFromMemory() {
+  using O = ShaderOpcode;
+  const auto pack = [](u32 low, u32 high) { return low | (high << 16u); };
+  struct Pair { u32 lhs, rhs, minimum, maximum; };
+  std::vector<Pair> pairs;
+  const auto append_nan = [&](u32 nan, bool signaling) {
+    // The quiet-bit distinction must hold independently of sign, operand order
+    // and packed lane. The other lane still performs an ordinary finite min/max.
+    const auto expected_nan_lane = signaling ? nan | 0x0200u : 0x4000u;
+    const Pair low{pack(nan, 0x3c00), pack(0x4000, 0xc000),
+                   pack(expected_nan_lane, 0xc000), pack(expected_nan_lane, 0x3c00)};
+    const Pair high{pack(0x3c00, nan), pack(0xc000, 0x4000),
+                    pack(0xc000, expected_nan_lane), pack(0x3c00, expected_nan_lane)};
+    for (const auto pair : {low, high}) {
+      pairs.push_back(pair);
+      pairs.push_back({pair.rhs, pair.lhs, pair.minimum, pair.maximum});
+    }
+  };
+  for (const auto qnan : {0x7e00u, 0xfe00u, 0x7e01u, 0xfe01u, 0x7fffu, 0xffffu})
+    append_nan(qnan, false);
+  // Retain the existing packed-instruction sNaN quieting expectations while
+  // testing that a qNaN with nonzero low payload is not mistaken for an sNaN.
+  for (const auto snan : {0x7d01u, 0xfd01u, 0x7c01u, 0xfc01u})
+    append_nan(snan, true);
+  pairs.push_back({0x80000000u, 0x00008000u, 0x80008000u, 0x00000000u});
+  pairs.push_back({0x00008000u, 0x80000000u, 0x80008000u, 0x00000000u});
+  pairs.push_back({0xfc007c00u, 0x40004000u, 0xfc004000u, 0x40007c00u});
+  pairs.push_back({0x40004000u, 0xfc007c00u, 0xfc004000u, 0x40007c00u});
+
+  TestCase test;
+  test.name = "PackedMinMaxF16PayloadsFromMemory";
+  for (u32 index = 0; index < pairs.size(); ++index) {
+    const auto& pair = pairs[index];
+    test.initial.insert(test.initial.end(), {pair.lhs, pair.rhs});
+    test.expected.insert(test.expected.end(), {pair.minimum, pair.maximum});
+    for (u32 operand = 0; operand < 2; ++operand) {
+      AppendVMovU32(&test.code, 30, (index * 2 + operand) * sizeof(u32));
+      AppendBufferLoadDword(&test.code, operand, 30);
+    }
+    test.code.push_back(EncodeSopp(0x0c, 0));
+    AppendVop3p(&test.code, 0x11, 10, Vgpr(0), Vgpr(1), 0, 0x3);
+    AppendVop3p(&test.code, 0x12, 11, Vgpr(0), Vgpr(1), 0, 0x3);
+    AppendStoreVgpr(&test.code, 10, index * 2);
+    AppendStoreVgpr(&test.code, 11, index * 2 + 1);
+  }
+  AppendEnd(&test.code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::S_WAITCNT,
+                  O::V_PK_MIN_F16, O::V_PK_MAX_F16, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+TestCase PackedMinMaxF16D850ChainFromMemory() {
+  using O = ShaderOpcode;
+  // Exact final packed RGB chain in CS d85064d235baac5b: max(+0,color),
+  // then min(64512,color). The literal source broadcasts its low half to both
+  // lanes, while source1 selects each color lane independently.
+  struct Color { u32 input, after_max, after_min; };
+  constexpr std::array colors{
+      Color{0x7fff7fffu, 0, 0}, Color{0xffffffffu, 0, 0},
+      Color{0xffff7fffu, 0, 0}, Color{0x7fffffffu, 0, 0},
+      Color{0x7e017e01u, 0, 0}, Color{0xfe01fe01u, 0, 0},
+      Color{0x7e007e00u, 0, 0}, Color{0xfe00fe00u, 0, 0},
+      Color{0x7d017d01u, 0x7f017f01u, 0x7be07be0u},
+      Color{0xfd01fd01u, 0xff01ff01u, 0x7be07be0u},
+      Color{0x80000000u, 0, 0}, Color{0x00008000u, 0, 0},
+      Color{0x7c007c00u, 0x7c007c00u, 0x7be07be0u},
+      Color{0xfc00fc00u, 0, 0},
+      Color{0x7bff7bffu, 0x7bff7bffu, 0x7be07be0u},
+      Color{0xbc003c00u, 0x00003c00u, 0x00003c00u}};
+  TestCase test;
+  test.name = "PackedMinMaxF16D850ChainFromMemory";
+  // Preload the entire input because each color produces two output DWORDs in
+  // the shared test buffer. No subsequent load can observe an overwritten input.
+  for (u32 index = 0; index < colors.size(); ++index) {
+    test.initial.push_back(colors[index].input);
+    test.expected.insert(test.expected.end(), {colors[index].after_max, colors[index].after_min});
+    AppendVMovU32(&test.code, 30, index * sizeof(u32));
+    AppendBufferLoadDword(&test.code, 40 + index, 30);
+  }
+  test.code.push_back(EncodeSopp(0x0c, 0));
+  for (u32 index = 0; index < colors.size(); ++index) {
+    test.code.push_back(EncodeVop1(0x01, 3, Vgpr(40 + index)));
+    test.code.insert(test.code.end(), {0xcc124003u, 0x10020680u});
+    AppendStoreVgpr(&test.code, 3, index * 2);
+    test.code.insert(test.code.end(), {0xcc114010u, 0x100206ffu, 0x00007be0u});
+    AppendStoreVgpr(&test.code, 16, index * 2 + 1);
+  }
+  AppendEnd(&test.code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::S_WAITCNT,
+                  O::V_PK_MIN_F16, O::V_PK_MAX_F16, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase VectorMinMaxF16Ops() {
   using O = ShaderOpcode;
 
@@ -37381,6 +37474,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(CvtPkrtzF16F32SubnormalRoundsTowardZero);
   AddCase(CvtPkrtzF16F32SdwaAndOutputModifiers);
   AddCase(PackedMinMaxF16NanAndSignedZeroEdges);
+  AddCase(PackedMinMaxF16PayloadsFromMemory);
+  AddCase(PackedMinMaxF16D850ChainFromMemory);
   AddCase(VectorMinMaxF16Ops);
   AddCase(VectorCvtF16U16ByteSource);
   AddCase(VectorCvtU16F16Sdwa);
@@ -43079,6 +43174,13 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--packed-integer-neg-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop3pIntegerNegationCapturedAndSelectedHalves());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--packed-f16-nan-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, PackedMinMaxF16PayloadsFromMemory());
+    RunCase(&vulkan, PackedMinMaxF16D850ChainFromMemory());
+    RunCase(&vulkan, PackedMinMaxF16NanAndSignedZeroEdges());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--dpp-only") == 0) {
