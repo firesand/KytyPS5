@@ -76,12 +76,17 @@ std::string DescribeImageInfo(const ImageInfo& info) {
 // the next bind re-uploads the whole surface (stale outside the written bytes) over the GPU pixels.
 // The probe keeps such images GPU-owned instead (the written bytes are lost rather than the GPU
 // pixels); a visible difference means these re-uploads are what blackens GPU-rendered content.
-bool KeepGpuImagesProbe() {
-	static const bool enabled = [] {
+// =1: ignore both partial GPU buffer writes and CPU write faults; =2: ignore only the partial GPU
+// buffer writes (ng-61: ignoring CPU writes blacked out the creator preview, so CPU writes into
+// GPU-owned images carry real content and must keep uploading).
+int KeepGpuImagesProbe() {
+	static const int level = [] {
 		const char* value = std::getenv("KYTY_PROBE_KEEP_GPU_IMAGES");
-		return value != nullptr && value[0] == '1' && value[1] == '\0';
+		return value != nullptr && value[1] == '\0' && (value[0] == '1' || value[0] == '2')
+		           ? value[0] - '0'
+		           : 0;
 	}();
-	return enabled;
+	return level;
 }
 
 void ReportGpuOwnedOverlap(const char* kind, TextureCache::BindingType binding,
@@ -2188,7 +2193,7 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 		}
 		ZeroCompanyImageLifecycle::Record(m_scheduler, "invalidate-gpu-before", id, image,
 		    {.address = address, .size = size});
-		if (image.IsGpuModified() && KeepGpuImagesProbe() && size < image.info.data.size) {
+		if (image.IsGpuModified() && KeepGpuImagesProbe() != 0 && size < image.info.data.size) {
 			static uint64_t kept = 0;
 			if (++kept == 1 || kept % 1000 == 0) {
 				LOGF("KeepGpuImages: ignored partial GPU write 0x%" PRIx64 " bytes at the base of %s "
@@ -2231,7 +2236,7 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 			continue;
 		}
 		if (owner->Overlaps(address, size)) {
-			if (owner->IsGpuModified() && KeepGpuImagesProbe()) {
+			if (owner->IsGpuModified() && KeepGpuImagesProbe() == 1) {
 				static uint64_t kept = 0;
 				if (++kept == 1 || kept % 1000 == 0) {
 					LOGF("KeepGpuImages: ignored CPU write at 0x%" PRIx64 " inside %s (kept=%" PRIu64 ")\n",
