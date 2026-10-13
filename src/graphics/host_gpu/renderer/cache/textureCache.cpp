@@ -2237,6 +2237,9 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 					LOGF("KeepGpuImages: ignored CPU write at 0x%" PRIx64 " inside %s (kept=%" PRIu64 ")\n",
 					     address, DescribeImageInfo(owner->info).c_str(), kept);
 				}
+				// The pages must still be unprotected or the guest re-faults on the same store forever
+				// (ng-60 froze at t=14 s with 16 M repeated faults).
+				UntrackImage(id);
 				continue;
 			}
 			const auto flags_before = ZeroCompanyImageLifecycle::Flags(*owner);
