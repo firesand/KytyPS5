@@ -290,6 +290,14 @@ static void GameEventFinger([[maybe_unused]] const EventFinger& f) {
 }
 
 static void GameEventController([[maybe_unused]] const EventController& f) {
+	if (!f.removed && !Controller::AcceptHostGamepad(f.id)) {
+		if (f.added) {
+			const char* path = SDL_GetJoystickPathForID(f.id);
+			LOGF("Controller: ignoring unselected pad %d path=%s\n", f.id,
+			     path != nullptr ? path : "?");
+		}
+		return;
+	}
 	EXIT_NOT_IMPLEMENTED(f.remapped);
 
 #ifdef KYTY_DBG_INPUT
@@ -465,6 +473,33 @@ void WindowContext::ProcessDisplayEvent(const SDL_DisplayEvent& display) {
 void WindowContext::ProcessEvent(double time_s) {
 	auto& game  = loop;
 	auto* event = &game.event;
+	// Apply isolation before system dialogs and shortcuts can consume host input.
+	if (!Controller::HostInputEnabled()) {
+		switch (event->type) {
+			case SDL_EVENT_KEY_DOWN:
+			case SDL_EVENT_KEY_UP:
+			case SDL_EVENT_TEXT_INPUT:
+			case SDL_EVENT_TEXT_EDITING:
+			case SDL_EVENT_MOUSE_BUTTON_DOWN:
+			case SDL_EVENT_MOUSE_BUTTON_UP:
+			case SDL_EVENT_MOUSE_MOTION:
+			case SDL_EVENT_MOUSE_WHEEL: return;
+			default: break;
+		}
+	}
+	if ((event->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ||
+	     event->type == SDL_EVENT_GAMEPAD_BUTTON_UP) &&
+	    !Controller::AcceptHostGamepad(event->gbutton.which)) {
+		return;
+	}
+	if (event->type == SDL_EVENT_GAMEPAD_AXIS_MOTION &&
+	    !Controller::AcceptHostGamepad(event->gaxis.which)) {
+		return;
+	}
+	if (event->type == SDL_EVENT_GAMEPAD_REMOVED && !Controller::HostInputEnabled() &&
+	    SDL_GetGamepadFromID(event->gdevice.which) == nullptr) {
+		return;
+	}
 	if ((event->type == SDL_EVENT_KEY_DOWN || event->type == SDL_EVENT_KEY_UP) &&
 	    event->key.key == SDLK_F7) {
 		if (event->type == SDL_EVENT_KEY_DOWN && event->key.repeat == 0) {

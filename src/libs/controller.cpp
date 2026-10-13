@@ -398,11 +398,45 @@ static int32_t TriggerEffectState(const PadTriggerEffectCommand& command, int va
 	}
 }
 
+static const char* RequiredPadPath() {
+	// An explicitly empty selector also fails closed. SDL's mapped Xbox names are
+	// not device identities; the Linux uinput event path is supplied by its owner.
+	static const char* const value = std::getenv("KYTY_PAD_PATH");
+	return value;
+}
+
+bool AcceptHostGamepad(int id) {
+	const char* required = RequiredPadPath();
+	if (required == nullptr) {
+		return true;
+	}
+	if (id == HOST_INPUT_CONTROLLER_ID) {
+		return false;
+	}
+	const char* path = SDL_GetJoystickPathForID(static_cast<SDL_JoystickID>(id));
+	return path != nullptr && std::strcmp(path, required) == 0;
+}
+
+bool HostInputEnabled() {
+	static const bool disabled = [] {
+		const char* value = std::getenv("KYTY_DISABLE_HOST_INPUT");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return RequiredPadPath() == nullptr && !disabled;
+}
+
 void Initialize() {
 	EXIT_IF(g_controller != nullptr);
 
 	g_controller = new GameController;
-	g_controller->Connect(HOST_INPUT_CONTROLLER_ID);
+	if (HostInputEnabled()) {
+		g_controller->Connect(HOST_INPUT_CONTROLLER_ID);
+	} else {
+		LOGF("Controller: host keyboard and mouse input disabled\n");
+	}
+	if (const char* path = RequiredPadPath(); path != nullptr) {
+		LOGF("Controller: required path=%s; no controller fallback\n", path);
+	}
 }
 
 void Shutdown() {
@@ -419,6 +453,9 @@ void EmergencyShutdown() {
 
 void GameController::Connect(int id) {
 	Common::LockGuard lock(m_mutex);
+	if (!AcceptHostGamepad(id)) {
+		return;
+	}
 
 	if (std::find(m_connected_ids.begin(), m_connected_ids.end(), id) != m_connected_ids.end()) {
 		return;
@@ -430,8 +467,10 @@ void GameController::Connect(int id) {
 		const auto  sdl_id   = static_cast<SDL_JoystickID>(id);
 		const char* pad_name = SDL_GetGamepadNameForID(sdl_id);
 		const char* joy_name = SDL_GetJoystickNameForID(sdl_id);
-		LOGF("Controller: pad %d connected (%s / %s)\n", id, pad_name != nullptr ? pad_name : "?",
-		     joy_name != nullptr ? joy_name : "?");
+		const char* path = SDL_GetJoystickPathForID(sdl_id);
+		LOGF("Controller: pad %d connected (%s / %s) path=%s\n", id,
+		     pad_name != nullptr ? pad_name : "?", joy_name != nullptr ? joy_name : "?",
+		     path != nullptr ? path : "?");
 		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(id));
 		    pad != nullptr) {
 			if (const auto& color = Config::GetControllerColor()) {
@@ -453,6 +492,11 @@ void GameController::Disconnect(int id) {
 	Common::LockGuard lock(m_mutex);
 
 	const auto it = std::find(m_connected_ids.begin(), m_connected_ids.end(), id);
+	// A required device may disappear between SDL_OpenGamepad and Connect's
+	// path check. Closing that already-open SDL handle must not connect a fallback.
+	if (it == m_connected_ids.end() && RequiredPadPath() != nullptr) {
+		return;
+	}
 	EXIT_IF(it == m_connected_ids.end());
 
 	m_connected_ids.erase(it);
@@ -472,7 +516,23 @@ void GameController::CheckActive() {
 	int  new_active_id = -1;
 	bool new_connected = false;
 
-	if (!m_connected_ids.empty()) {
+	if (const char* required = RequiredPadPath(); required != nullptr) {
+		for (const auto id: m_connected_ids) {
+			if (AcceptHostGamepad(id)) {
+				new_active_id = id;
+				new_connected = true;
+				break;
+			}
+		}
+		if (new_active_id != m_active_id) {
+			if (new_connected) {
+				LOGF("Controller: selected path=%s id=%d per KYTY_PAD_PATH\n", required,
+				     new_active_id);
+			} else {
+				LOGF("Controller: required pad unavailable path=%s; input disabled\n", required);
+			}
+		}
+	} else if (!m_connected_ids.empty()) {
 		new_active_id = m_connected_ids[0];
 		for (const auto id: m_connected_ids) {
 			if (id != HOST_INPUT_CONTROLLER_ID) {
@@ -543,7 +603,7 @@ void GameController::Button(int id, uint32_t button, bool down) {
 	Common::LockGuard lock(m_mutex);
 
 	// The keyboard shares the player-1 pad with the active gamepad.
-	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
+	if (m_active_id == id || (id == HOST_INPUT_CONTROLLER_ID && HostInputEnabled())) {
 		m_state.time = LibKernel::KernelGetProcessTime();
 
 		m_state.buttons = down ? m_state.buttons | button : m_state.buttons & ~button;
@@ -555,7 +615,7 @@ void GameController::Button(int id, uint32_t button, bool down) {
 void GameController::Axis(int id, Controller::Axis axis, int value) {
 	Common::LockGuard lock(m_mutex);
 
-	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
+	if (m_active_id == id || (id == HOST_INPUT_CONTROLLER_ID && HostInputEnabled())) {
 		m_state.time = LibKernel::KernelGetProcessTime();
 
 		int axis_id = static_cast<int>(axis);
@@ -582,7 +642,7 @@ void GameController::Axis(int id, Controller::Axis axis, int value) {
 void GameController::RightStick(int id, int x, int y) {
 	Common::LockGuard lock(m_mutex);
 
-	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
+	if (m_active_id == id || (id == HOST_INPUT_CONTROLLER_ID && HostInputEnabled())) {
 		m_state.time                                 = LibKernel::KernelGetProcessTime();
 		m_state.axes[static_cast<int>(Axis::RightX)] = x;
 		m_state.axes[static_cast<int>(Axis::RightY)] = y;
@@ -596,7 +656,7 @@ void GameController::TouchPad(int id, int finger, bool down, float x, float y) {
 	}
 
 	Common::LockGuard lock(m_mutex);
-	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
+	if (m_active_id == id || (id == HOST_INPUT_CONTROLLER_ID && HostInputEnabled())) {
 		auto& touch  = m_state.touch[finger];
 		m_state.time = LibKernel::KernelGetProcessTime();
 		if (down && !touch.down) {
@@ -783,6 +843,9 @@ void GameController::SetVibration(uint8_t large_motor, uint8_t small_motor) {
 }
 
 void GameController::ApplyVibration() {
+	if (m_active_id < 0) {
+		return;
+	}
 	const auto now = SDL_GetTicks();
 	const auto duration =
 	    m_vibration_until > now ? static_cast<uint32_t>(m_vibration_until - now) : 0;
