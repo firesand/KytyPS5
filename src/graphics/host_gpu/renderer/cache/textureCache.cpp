@@ -2176,6 +2176,22 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 		ZeroCompanyImageLifecycle::Record(m_scheduler, "invalidate-gpu-before", id, image,
 		    {.address = address, .size = size});
 		if (image.IsGpuModified()) {
+			// Rendering-defect forensics (2026-10-13): a GPU buffer write starting at this image's
+			// base hands authority back to guest memory; the image's own GPU pixels are then
+			// replaced by the buffer contents at the next bind (ng-58: scene targets re-uploaded
+			// hundreds of times). Report once per signature with the writer's size.
+			static std::unordered_map<uint64_t, uint32_t> hits; // texture-cache lock held
+			const auto&    info = image.info;
+			const uint64_t key  = (static_cast<uint64_t>(info.pixel_format) << 48u) ^
+			                     (uint64_t {info.extent.width} << 32u) ^
+			                     (uint64_t {info.extent.height} << 16u) ^
+			                     (uint64_t {static_cast<uint8_t>(info.tile_mode)} << 8u) ^
+			                     (info.data.size << 4u);
+			const auto count = ++hits[key];
+			if (count == 1 || count == 30 || count == 300) {
+				LOGF("ImageGpuInvalidatedByBuffer: hits=%u write_size=0x%" PRIx64 " %s\n", count,
+				     size, DescribeImageInfo(info).c_str());
+			}
 			image.ClearGpuModified();
 		}
 		image.MarkBufferModified();
