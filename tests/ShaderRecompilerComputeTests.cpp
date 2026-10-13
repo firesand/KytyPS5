@@ -6816,6 +6816,72 @@ public:
                             actual.size() > 2 ? actual[2] : 0u, actual.size() > 3 ? actual[3] : 0u));
       }
 
+      {
+        // A >64 KiB interior write must retire image authority before a later
+        // small write can preserve stale image pixels over the first write.
+        // Both mutations use the production DMA fill path; CPU backing starts
+        // poisoned and cannot supply either GPU-written value.
+        constexpr uint64_t large_merge_offset = 0x2f00000;
+        constexpr uint64_t large_merge_size = 0x40000;
+        constexpr uint64_t interior_offset = 0x10000;
+        constexpr uint64_t interior_size = 0x20000;
+        constexpr uint32_t old_pixels = 0x13579bdfu;
+        constexpr uint32_t large_write = 0x2468ace0u;
+        constexpr uint32_t later_write = 0x31415926u;
+        static_assert(large_merge_offset + large_merge_size <= allocation_size);
+        std::memset(memory + large_merge_offset, 0xa5, large_merge_size);
+        auto desc = MakeLinearDesc(
+            base + large_merge_offset, large_merge_size, vk::Format::eR32Uint,
+            Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+            {256, 256, 1}, 1, 4, 1);
+        const auto image = texture_cache.FindImage(desc);
+        vk::ClearValue painted{};
+        painted.color.uint32 = std::array{old_pixels, 0u, 0u, 0u};
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), image,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
+        auto &cache = resources.GetBufferCache();
+        cache.FillBuffer(desc.info.data.address + interior_offset,
+                         interior_size, large_write, false);
+        // Capture the first write before recording the second. This private
+        // native copy neither publishes guest backing nor refreshes the image.
+        auto initial = cache.ObtainBuffer(desc.info.data.address + interior_offset,
+                                          sizeof(uint32_t), false, false);
+        Require(name, "large interior native source", initial.first != nullptr,
+                "production fill did not retain a readable native buffer");
+        auto before = CreateHostBuffer(name, sizeof(uint32_t),
+                                       vk::BufferUsageFlagBits::eTransferDst, {0});
+        TransferReadBarrier(initial.first->Handle(), initial.first->Size());
+        const vk::BufferCopy copied{initial.second, 0, sizeof(uint32_t)};
+        scheduler.Current().Handle().copyBuffer(initial.first->Handle(),
+                                                before.buffer, 1, &copied);
+        HostReadBarrier(before.buffer, before.size,
+                        vk::PipelineStageFlagBits::eTransfer,
+                        vk::AccessFlagBits::eTransferWrite);
+        cache.FillBuffer(desc.info.data.address + sizeof(uint32_t),
+                         sizeof(uint32_t), later_write, false);
+        (void)texture_cache.FindTexture(image, desc);
+        const auto actual = ReadCachedTexel(name, context, image, {}, {256, 256, 1});
+        const auto first_write = ReadBuffer(name, before, 1);
+        DestroyBuffer(&before);
+        Require(name, "large interior initial native write",
+                first_write == std::vector<u32>{large_write},
+                "large write never reached native memory before preservation");
+        std::vector<u32> expected(large_merge_size / sizeof(uint32_t), old_pixels);
+        std::fill(expected.begin() + interior_offset / sizeof(uint32_t),
+                  expected.begin() + (interior_offset + interior_size) / sizeof(uint32_t),
+                  large_write);
+        expected[1] = later_write;
+        const auto mismatch = std::mismatch(actual.begin(), actual.end(),
+                                            expected.begin(), expected.end());
+        Require(name, "large interior write survives later small preservation",
+                actual == expected,
+                fmt::format("first mismatch dword {} of {} (native before={:#x}); "
+                            "later preservation lost the earlier write or untouched GPU pixels",
+                            std::distance(actual.begin(), mismatch.first), actual.size(),
+                            first_write.empty() ? 0u : first_write.front()));
+      }
+
       constexpr uint64_t exact_buffer_offset = 0x90000;
       constexpr uint32_t exact_buffer_value = 0x3f234567u;
       std::memcpy(memory + exact_buffer_offset, &exact_buffer_value,
