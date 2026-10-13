@@ -18,6 +18,8 @@
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
+#include <span>
+#include <utility>
 #include <vector>
 #include <string>
 
@@ -69,7 +71,15 @@ public:
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear, bool decline_if_aliased = false);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
-	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
+	// GPU buffer writes touching an image's memory hand authority to the buffer cache. write_pending:
+	// the write is recorded after this call (DMA fills/copies, storage descriptors), so the whole image
+	// is seeded into the buffer first; otherwise the seed skips address+size and every `recorded` range
+	// (write-fault publishes, tests) because those bytes already hold the new data.
+	void InvalidateMemoryFromGPU(uint64_t address, uint64_t size, bool write_pending = false,
+	                             std::span<const std::pair<uint64_t, uint64_t>> recorded = {});
+	// True when a GPU-owned image overlaps the range (FillBuffer/CopyBuffer CPU paths must not bypass
+	// the merge by writing guest memory directly).
+	[[nodiscard]] bool HasGpuOwnedImageIn(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
@@ -156,7 +166,8 @@ private:
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
 	[[nodiscard]] ImageDownload BuildDownload(const Image& image) const;
 	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
-	bool PreserveGpuPixelsAroundWrite(Image& image, uint64_t write_address, uint64_t write_size);
+	bool PreserveGpuPixels(ImageId id, Image& image,
+	                       std::span<const std::pair<uint64_t, uint64_t>> excluded);
 	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
 	                       uint64_t destination_size, ImageDownload transfer);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);

@@ -6780,6 +6780,33 @@ public:
                             actual.size() > 3 ? actual[3] : 0u, expected[0], expected[1],
                             expected[2], expected[3]));
       }
+      {
+        // Production order for DMA fills, copies and storage descriptors: the image is invalidated
+        // with write_pending=true BEFORE the write is recorded, so the whole image is seeded and the
+        // write lands on top (review 2026-10-13, D1).
+        vk::ClearValue painted{};
+        painted.color.uint32 = std::array{buffer_alias_image_value, 0u, 0u, 0u};
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), buffer_alias_image,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
+        const auto write_address = buffer_alias_desc.info.data.address + 4;
+        texture_cache.InvalidateMemoryFromGPU(write_address, sizeof(uint32_t),
+                                              /*write_pending=*/true);
+        auto writable = resources.GetBufferCache().ObtainBuffer(
+            write_address, sizeof(uint32_t), true, false);
+        Require(name, "pending-write image alias buffer allocation", writable.first != nullptr,
+                "failed to allocate the pending-write alias buffer");
+        writable.first->Fill(writable.second, sizeof(uint32_t), buffer_alias_write_value);
+        (void)texture_cache.FindTexture(buffer_alias_image, buffer_alias_desc);
+        const std::vector<u32> expected{buffer_alias_image_value, buffer_alias_write_value,
+                                        buffer_alias_image_value, buffer_alias_image_value};
+        const auto actual =
+            ReadCachedTexel(name, context, buffer_alias_image, {}, {4, 1, 1});
+        Require(name, "pending interior write merges with GPU texels", actual == expected,
+                fmt::format("pending write at offset 4 gave texels {:#x} {:#x} {:#x} {:#x}",
+                            actual.size() > 0 ? actual[0] : 0u, actual.size() > 1 ? actual[1] : 0u,
+                            actual.size() > 2 ? actual[2] : 0u, actual.size() > 3 ? actual[3] : 0u));
+      }
 
       constexpr uint64_t exact_buffer_offset = 0x90000;
       constexpr uint32_t exact_buffer_value = 0x3f234567u;

@@ -713,14 +713,16 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		dst->Fill(dst_offset, size, value);
 		return;
 	}
-	if (!IsRegionGpuModified(vaddr, size)) {
+	// A CPU fill into a GPU-owned image's memory would fault into InvalidateCpuAliases and lose the
+	// image's pixels; route it through the GPU so the merge below applies (review 2026-10-13, D5).
+	if (!IsRegionGpuModified(vaddr, size) && !m_texture_cache.HasGpuOwnedImageIn(vaddr, size)) {
 		// Access the guest mapping so write faults invalidate cached buffers and images.
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
 		std::fill(destination, destination + size / sizeof(uint32_t), value);
 		return;
 	}
 
-	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
+	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size, /*write_pending=*/true);
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
 	dst->Fill(dst_offset, size, value);
 }
@@ -739,7 +741,8 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		     src_vaddr, dst_vaddr, size, static_cast<int>(src_gds), static_cast<int>(dst_gds));
 	}
 	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
-	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
+	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size) &&
+	    !m_texture_cache.HasGpuOwnedImageIn(dst_vaddr, size)) {
 		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
 		            size);
 		return;
@@ -747,7 +750,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 
 	auto& command = m_scheduler.Current();
 	if (dst_memory) {
-		m_texture_cache.InvalidateMemoryFromGPU(dst_vaddr, size);
+		m_texture_cache.InvalidateMemoryFromGPU(dst_vaddr, size, /*write_pending=*/true);
 	}
 	const auto src_id      = src_memory ? FindBuffer(src_vaddr, size) : BufferId {};
 	const auto dst_id      = dst_memory ? FindBuffer(dst_vaddr, size) : BufferId {};
@@ -873,8 +876,10 @@ void BufferCache::PublishPendingTextureInvalidations() {
 	}
 	std::vector<std::pair<uint64_t, uint64_t>> pending;
 	pending.swap(m_pending_texture_invalidations);
+	// These writes already executed; every pending page of an image holds new data, so the seed
+	// must skip all of them, not just the entry being published (review 2026-10-13, D3).
 	for (const auto [vaddr, size]: pending) {
-		m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
+		m_texture_cache.InvalidateMemoryFromGPU(vaddr, size, /*write_pending=*/false, pending);
 	}
 }
 

@@ -133,7 +133,7 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 		// Before obtaining the buffer: the invalidation may now copy a GPU-owned image's pixels
 		// into the buffer backing this range (TextureCache::PreserveGpuPixelsAroundWrite), which can
 		// join buffers; the descriptor must capture the buffer that survives that join.
-		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
+		context.GetTextureCache().InvalidateMemoryFromGPU(address, size, /*write_pending=*/true);
 	}
 	if (unsynced_read && !written) {
 		buffer = &context.GetBufferCache().GetBuffer(id);

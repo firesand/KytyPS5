@@ -2035,90 +2035,137 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 // back to the buffer cache (ClearGpuModified + MarkBufferModified) and the next bind re-uploads the
 // WHOLE image from that memory. Tiled targets never publish their pixels there, so every byte outside
 // the written range came back stale (pinned by the regression "exact-base buffer write refreshes only
-// the written texel"). Before the write lands, copy the image's current pixels into the host buffer
-// that backs its memory, leaving the written range alone, so the later refresh merges GPU pixels with
-// the new bytes. Everything is recorded on the GPU timeline ahead of the write; no CPU wait.
-bool TextureCache::PreserveGpuPixelsAroundWrite(Image& image, uint64_t write_address,
-                                                uint64_t write_size) {
+// the written texel"). Seed the host buffer that backs the image with the image's current pixels so
+// the later refresh merges GPU pixels with the new bytes. `excluded` lists ranges whose bytes already
+// hold newer data (writes recorded before this call); an empty list seeds the whole image, which is
+// exact even when the caller's range only bounds the real write (storage descriptors). Everything is
+// recorded on the GPU timeline ahead of a pending write; no CPU wait.
+bool TextureCache::PreserveGpuPixels(ImageId id, Image& image,
+                                     std::span<const std::pair<uint64_t, uint64_t>> excluded) {
 	const auto& info = image.info;
-	if (image.depth_id || info.IsDepth() || info.samples != 1 || info.data.Empty() ||
-	    !image.SafeToDownload()) {
+	if (image.depth_id || info.samples != 1 || info.data.Empty() || !image.IsGpuModified() ||
+	    image.IsBufferModified() || image.IsDefinitelyCpuDirty()) {
 		return false;
+	}
+	if (image.IsMaybeCpuDirty()) {
+		// Same resolution as RefreshImage: a changed guest edge means the CPU wrote newer bytes, and
+		// those must win; an unchanged edge clears the suspicion.
+		TrackImage(id);
+		const auto hash = image.HashGuestEdges();
+		if (image.NeedsMaybeCpuHash()) {
+			image.SetMaybeCpuHash(hash);
+			return false;
+		}
+		(void)image.ResolveMaybeCpuHash(hash);
+		if (image.IsDefinitelyCpuDirty()) {
+			return false;
+		}
 	}
 	auto transfer = BuildDownload(image);
-	if (!transfer.valid || transfer.depth_target) {
+	if (!transfer.valid) {
 		return false;
 	}
-	auto&          texture = transfer.texture;
-	const uint64_t base    = info.data.address;
-	const uint64_t size    = info.data.size;
-	const uint64_t w0      = std::clamp(write_address, base, base + size) - base;
-	const uint64_t w1      = std::clamp(write_address + write_size, base, base + size) - base;
-	auto [buffer, offset]  = m_buffer_cache.ObtainBuffer(base, size, /*is_written=*/true,
-	                                                     /*is_texel_buffer=*/false);
+	const uint64_t base = info.data.address;
+	const uint64_t size = info.data.size;
+	// Complement of the excluded ranges inside the image, as (offset, length) runs.
+	std::vector<std::pair<uint64_t, uint64_t>> holes;
+	for (const auto& [address, length]: excluded) {
+		const uint64_t lo = std::clamp(address, base, base + size) - base;
+		const uint64_t hi = std::clamp(address + length, base, base + size) - base;
+		if (hi > lo) {
+			holes.emplace_back(lo, hi);
+		}
+	}
+	std::sort(holes.begin(), holes.end());
+	std::vector<vk::BufferCopy> runs;
+	uint64_t                    cursor = 0;
+	for (const auto& [lo, hi]: holes) {
+		if (lo > cursor) {
+			runs.emplace_back(cursor, cursor, lo - cursor);
+		}
+		cursor = std::max(cursor, hi);
+	}
+	if (cursor < size) {
+		runs.emplace_back(cursor, cursor, size - cursor);
+	}
+	if (runs.empty()) {
+		return true; // every byte is being rewritten: nothing to preserve
+	}
+	const bool whole = runs.size() == 1 && runs.front().size == size;
+	if (!whole && transfer.depth_target) {
+		return false; // depth downloads are whole-image only
+	}
+	auto [buffer, offset] = m_buffer_cache.ObtainBuffer(base, size, /*is_written=*/true,
+	                                                    /*is_texel_buffer=*/false);
 	if (buffer == nullptr) {
 		return false;
 	}
 	auto& command = m_scheduler.Current();
 	command.EndRendering();
-	const auto native  = command.Handle();
-	auto       scratch = m_tiler.GetScratchBuffer(size);
-	if (texture.tiles.empty()) {
-		if (texture.color_transform != ColorTransform::None) {
-			auto linear = m_tiler.GetScratchBuffer(size, scratch.buffer);
-			image.Download(texture.regions, linear.buffer, linear.offset, linear.size);
-			m_tiler.TransformColor(linear, scratch, texture.color_transform, false);
-		} else {
-			auto regions = texture.regions;
-			for (auto& copy: regions) {
-				copy.bufferOffset += scratch.offset;
-			}
-			image.Download(regions, scratch.buffer, scratch.offset, size);
-		}
+	const auto native = command.Handle();
+	if (whole) {
+		DownloadImage(image, *buffer, offset, size, std::move(transfer));
 	} else {
-		m_tiler.TileImage(image, texture.regions, scratch.buffer, scratch.offset, size,
-		                  texture.LinearSize(), texture.tiles, texture.color_transform);
+		auto& texture = transfer.texture;
+		auto  scratch = m_tiler.GetScratchBuffer(size);
+		if (texture.tiles.empty()) {
+			if (texture.color_transform != ColorTransform::None) {
+				auto linear = m_tiler.GetScratchBuffer(size, scratch.buffer);
+				image.Download(texture.regions, linear.buffer, linear.offset, linear.size);
+				m_tiler.TransformColor(linear, scratch, texture.color_transform, false);
+			} else {
+				auto regions = texture.regions;
+				for (auto& copy: regions) {
+					copy.bufferOffset += scratch.offset;
+				}
+				image.Download(regions, scratch.buffer, scratch.offset, size);
+			}
+		} else {
+			m_tiler.TileImage(image, texture.regions, scratch.buffer, scratch.offset, size,
+			                  texture.LinearSize(), texture.tiles, texture.color_transform);
+		}
+		std::array<vk::BufferMemoryBarrier, 2> before {};
+		before[0].srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eShaderWrite |
+		                          vk::AccessFlagBits::eTransferWrite;
+		before[0].dstAccessMask       = vk::AccessFlagBits::eTransferRead;
+		before[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		before[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		before[0].buffer              = scratch.buffer;
+		before[0].offset              = scratch.offset;
+		before[0].size                = size;
+		before[1]                     = before[0];
+		before[1].srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
+		                          vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+		before[1].dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+		before[1].buffer        = buffer->Handle();
+		before[1].offset        = offset;
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
+		                       0, nullptr, 2, before.data(), 0, nullptr);
+		for (auto& run: runs) {
+			run.srcOffset += scratch.offset;
+			run.dstOffset += offset;
+		}
+		native.copyBuffer(scratch.buffer, buffer->Handle(), static_cast<uint32_t>(runs.size()),
+		                  runs.data());
 	}
-	std::array<vk::BufferMemoryBarrier, 2> before {};
-	before[0].srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eShaderWrite |
-	                          vk::AccessFlagBits::eTransferWrite;
-	before[0].dstAccessMask       = vk::AccessFlagBits::eTransferRead;
-	before[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	before[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	before[0].buffer              = scratch.buffer;
-	before[0].offset              = scratch.offset;
-	before[0].size                = size;
-	before[1]                     = before[0];
-	before[1].srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
-	                          vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
-	before[1].dstAccessMask = vk::AccessFlagBits::eTransferWrite;
-	before[1].buffer        = buffer->Handle();
-	before[1].offset        = offset;
+	vk::BufferMemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eShaderWrite |
+	                      vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask       = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	after.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	after.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	after.buffer              = buffer->Handle();
+	after.offset              = offset;
+	after.size                = size;
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion, 0,
-	                       nullptr, 2, before.data(), 0, nullptr);
-	std::vector<vk::BufferCopy> copies;
-	if (w0 > 0) {
-		copies.emplace_back(scratch.offset, offset, w0);
-	}
-	if (w1 < size) {
-		copies.emplace_back(scratch.offset + w1, offset + w1, size - w1);
-	}
-	if (!copies.empty()) {
-		native.copyBuffer(scratch.buffer, buffer->Handle(), static_cast<uint32_t>(copies.size()),
-		                  copies.data());
-	}
-	auto after          = before[1];
-	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 	                       vk::PipelineStageFlagBits::eAllCommands, vk::DependencyFlagBits::eByRegion,
 	                       0, nullptr, 1, &after, 0, nullptr);
-	const auto tick            = m_scheduler.CurrentTick();
+	const auto tick             = m_scheduler.CurrentTick();
 	buffer->last_gpu_write_tick = tick;
 	m_buffer_cache.NoteGpuWrite(base, size, tick);
-	ZeroCompanyImageLifecycle::Record(m_scheduler, "preserve-gpu-pixels", {}, image,
-	    {.address = write_address, .size = write_size});
+	ZeroCompanyImageLifecycle::Record(m_scheduler, "preserve-gpu-pixels", id, image,
+	    {.address = base, .size = size, .value0 = whole ? 1u : 0u, .value1 = runs.size()});
 	return true;
 }
 
@@ -2273,7 +2320,22 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	return true;
 }
 
-void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
+bool TextureCache::HasGpuOwnedImageIn(uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid()) {
+		return false;
+	}
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		const auto* owner = m_slot_images.try_get(id);
+		if (owner != nullptr && owner->IsGpuModified() && owner->Overlaps(address, size)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, bool write_pending,
+                                           std::span<const std::pair<uint64_t, uint64_t>> recorded) {
 	if (!GuestRange {address, size}.Valid()) {
 		return;
 	}
@@ -2287,7 +2349,20 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 		return value == nullptr || value[0] != '0'; // default on; =0 restores the lossy refresh
 	}();
 	const bool small = merge && size <= SmallWrite; // =0 also restores the exact-base rule
+	// Oldest image first, so when several aliases share the bytes the most recently used one seeds
+	// the buffer last and wins.
+	std::vector<std::pair<uint64_t, ImageId>> ordered;
 	for (const auto id: FindImagesInRegion(address, small ? size : 1, true)) {
+		ordered.emplace_back(m_slot_images[id].tick_accessed_last, id);
+	}
+	std::sort(ordered.begin(), ordered.end());
+	// Bytes that already hold the new data when the write was recorded before this call.
+	std::vector<std::pair<uint64_t, uint64_t>> excluded;
+	if (!write_pending) {
+		excluded.emplace_back(address, size);
+		excluded.insert(excluded.end(), recorded.begin(), recorded.end());
+	}
+	for (const auto& [age, id]: ordered) {
 		auto& image = m_slot_images[id];
 		if (small ? !image.Overlaps(address, size) : image.info.data.address != address) {
 			continue;
@@ -2325,7 +2400,7 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 			if (partial && merge) {
 				static uint64_t merged = 0;
 				static uint64_t failed = 0;
-				if (PreserveGpuPixelsAroundWrite(image, address, size)) {
+				if (PreserveGpuPixels(id, image, excluded)) {
 					if (++merged == 1 || merged % 1000 == 0) {
 						LOGF("PartialWriteMerge: preserved GPU pixels around 0x%" PRIx64 " bytes in %s "
 						     "(merged=%" PRIu64 " unmergeable=%" PRIu64 ")\n",
