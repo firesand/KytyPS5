@@ -83,6 +83,11 @@ public:
 	// True when a GPU-owned image overlaps the range (FillBuffer/CopyBuffer CPU paths must not bypass
 	// the merge by writing guest memory directly).
 	[[nodiscard]] bool HasGpuOwnedImageIn(uint64_t address, uint64_t size);
+	// Host read of [address, size) (BufferCache::ReadMemory, GPU thread): records an image->buffer
+	// download of every GPU-authoritative image whose pages overlap the range and widens the range to
+	// cover them, so the buffer's host publish returns the GPU's pixels and one fault serves the whole
+	// surface. Returns true when a download was recorded (the caller keeps the copy path).
+	[[nodiscard]] bool SyncGpuImagesForHostRead(Buffer& buffer, uint64_t& address, uint64_t& size);
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
@@ -149,6 +154,12 @@ private:
 	void                      UntrackImageTail(ImageId id);
 	void                      MarkAsMaybeDirty(ImageId id, Image& image);
 	void                      TrackImageDownload(ImageId id, Image& image);
+	// A linear image the GPU writes may be read back by the game's CPU (UE staging surfaces: the
+	// dossier portrait is copied to a linear RGBA16F image, read on the CPU and re-tiled). Marking its
+	// range GPU-written in the buffer cache read-protects the pages, so the first CPU read faults into
+	// BufferCache::ReadMemory, which syncs the image (SyncGpuImagesForHostRead) before publishing.
+	// Nothing is copied at enrolment. KYTY_IMAGE_READBACK=0 disables the enrolment.
+	void                      EnrollCpuReadback(ImageId id, Image& image);
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);

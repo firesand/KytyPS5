@@ -9196,6 +9196,97 @@ public:
                   !boundary_buffer_cache.HasGpuDirtyBytes(final_word_address, sizeof(uint32_t)),
               "a final-byte CPU read did not publish the GPU-owned final word");
 
+      // CPU readback of a GPU-written linear image (Zero Company dossier portrait, Codex R28,
+      // 2026-10-14): a compute shader copies the rendered portrait into a linear RGBA16F image, the
+      // game reads that image's guest memory on the CPU and re-tiles it into a new texture; no GPU
+      // operation reads the linear copy again. Without read protection the CPU saw what the heap
+      // held (double-precision bone transforms). A storage or render-target bind of a linear image
+      // must read-protect its pages, and the first host read must publish the GPU's pixels.
+      {
+        constexpr uint64_t readback_offset = 0x2c00000;
+        constexpr uint32_t readback_width = 64;
+        constexpr uint32_t readback_height = 64;
+        constexpr uint64_t readback_size =
+            uint64_t{readback_width} * readback_height * sizeof(uint32_t);
+        constexpr uint64_t readback_address = base + readback_offset;
+        constexpr size_t readback_words = readback_size / sizeof(uint32_t);
+        std::vector<uint32_t> heap_garbage(readback_words);
+        for (size_t index = 0; index < heap_garbage.size(); ++index) {
+          heap_garbage[index] = 0x3ff00000u ^ static_cast<uint32_t>(index * 0x9e3779b9u);
+        }
+        std::memcpy(memory + readback_offset, heap_garbage.data(), readback_size);
+        auto readback_desc = MakeLinearDesc(
+            readback_address, readback_size, vk::Format::eR32Uint,
+            Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+            {readback_width, readback_height, 1}, 1, 4, 1);
+        readback_desc.type = BindingType::Storage;
+        readback_desc.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+        const auto readback_image = texture_cache.FindImage(readback_desc);
+        Require(name, "linear storage image for CPU readback", bool(readback_image),
+                "failed to register the linear storage image");
+        auto &readback_buffer_cache = resources.GetBufferCache();
+        (void)texture_cache.FindTexture(readback_image, readback_desc);
+        Require(name, "GPU-written linear image read-protected",
+                readback_buffer_cache.HasGpuDirtyBytes(readback_address, readback_size) &&
+                    !HostMemoryIsReadable(readback_address) &&
+                    !HostMemoryIsReadable(readback_address + readback_size - 1) &&
+                    texture_cache.GetImage(readback_image).IsGpuModified(),
+                "a storage bind of a linear image did not protect its pages against host reads");
+        constexpr uint32_t painted_value = 0x5a17c0deu;
+        vk::ClearValue readback_paint{};
+        readback_paint.color.uint32 = std::array{painted_value, 0u, 0u, 0u};
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), readback_image,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, readback_paint);
+        // The game's read: a plain load inside the image, served by the host fault handler.
+        const auto *readback_view =
+            reinterpret_cast<volatile uint32_t *>(readback_address);
+        const uint32_t first_read = readback_view[readback_words / 2 + 3];
+        Require(name, "host read publishes GPU pixels",
+                first_read == painted_value && HostMemoryIsReadable(readback_address) &&
+                    HostMemoryIsReadable(readback_address + readback_size - 1) &&
+                    !readback_buffer_cache.HasGpuDirtyBytes(readback_address, readback_size),
+                "a host read of a GPU-written linear image did not publish its pixels");
+        std::vector<uint32_t> published(readback_words);
+        std::memcpy(published.data(), memory + readback_offset, readback_size);
+        size_t readback_mismatches = 0;
+        for (const auto word : published) {
+          readback_mismatches += word != painted_value;
+        }
+        if (readback_mismatches != 0) {
+          std::printf("[host]    %s: %zu of %zu linear readback words stale (first 0x%08x)\n",
+                      name, readback_mismatches, published.size(), published[0]);
+        }
+        Require(name, "whole linear image published by one fault", readback_mismatches == 0,
+                "one host fault did not publish the whole GPU-written linear image");
+        Require(name, "published image stays GPU-authoritative",
+                texture_cache.GetImage(readback_image).IsGpuModified() &&
+                    !texture_cache.GetImage(readback_image).IsCpuDirty(),
+                "publishing a linear image to the host changed its ownership");
+        // A later GPU write re-protects the range; the earlier enrolment must not hide it.
+        (void)texture_cache.FindTexture(readback_image, readback_desc);
+        constexpr uint32_t repainted_value = 0x0badf00du;
+        readback_paint.color.uint32 = std::array{repainted_value, 0u, 0u, 0u};
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), readback_image,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, readback_paint);
+        Require(name, "rebound linear image re-protected",
+                !HostMemoryIsReadable(readback_address) &&
+                    readback_buffer_cache.HasGpuDirtyBytes(readback_address, readback_size),
+                "a second storage bind of the published image did not re-protect its pages");
+        const uint32_t second_read = readback_view[5];
+        Require(name, "second host read publishes the repaint",
+                second_read == repainted_value && HostMemoryIsReadable(readback_address),
+                "the second host read returned the first publication");
+        // A CPU store after publication dirties the image and is kept.
+        auto *readback_store = reinterpret_cast<volatile uint32_t *>(readback_address + 64);
+        *readback_store = 0x11223344u;
+        Require(name, "CPU store after readback dirties the image",
+                *readback_store == 0x11223344u &&
+                    texture_cache.GetImage(readback_image).IsDefinitelyCpuDirty(),
+                "a CPU store into a published linear image was lost or left the image clean");
+      }
+
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
       LibKernel::Memory::InstallGpuResources(nullptr);

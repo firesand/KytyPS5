@@ -536,6 +536,16 @@ void TextureCache::UntrackImageTail(ImageId id) {
 	}
 }
 
+// KYTY_IMAGE_READBACK=0 restores unprotected GPU-written linear images (the game's CPU then reads
+// whatever guest memory holds; Zero Company's dossier portrait became heap garbage, R28 2026-10-14).
+static bool ImageReadbackEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_IMAGE_READBACK");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 void TextureCache::TrackImageDownload(ImageId id, Image& image) {
 	if (m_readback_linear_images && !image.info.IsTiled() && !image.info.data.Empty()) {
 		if (!image.IsGpuModified()) {
@@ -1716,6 +1726,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 				CommitGpuWrite(image);
 			}
 			TrackImageDownload(id, image);
+			EnrollCpuReadback(id, image);
 			break;
 		default: EXIT("TextureCache: invalid texture binding\n");
 	}
@@ -1737,6 +1748,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	RefreshImage(id);
 	CommitGpuWrite(image);
 	TrackImageDownload(id, image);
+	EnrollCpuReadback(id, image);
 	return image.FindView(desc.view_info);
 }
 
@@ -2320,6 +2332,85 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	ZeroCompanyImageLifecycle::Record(m_scheduler, "download-cpu-publish-queued", id, image,
 	    {.address = range.address, .size = range.size, .value0 = offset});
 	return true;
+}
+
+void TextureCache::EnrollCpuReadback(ImageId id, Image& image) {
+	if (!ImageReadbackEnabled() || !image.registered || image.depth_id || image.info.IsDepth() ||
+	    image.info.IsTiled() || image.info.data.Empty() || !image.IsGpuModified()) {
+		return;
+	}
+	const auto range = image.info.data;
+	if (!GuestRange {range.address, range.size}.Valid()) {
+		return;
+	}
+	// Once per command stream, unless a host access already published (and unprotected) the range.
+	// Tracker-only query: BufferCache::IsRegionGpuModified flushes write faults into this cache's lock.
+	const auto tick = m_scheduler.CurrentTick();
+	if (image.cpu_readback_tick == tick &&
+	    m_buffer_cache.IsLabelRegionGpuModified(range.address, range.size)) {
+		return;
+	}
+	image.cpu_readback_tick = tick;
+	// A written binding marks the range GPU-modified in the memory tracker, which read-protects its
+	// pages; the buffer itself is only seeded when a host read actually faults.
+	(void)m_buffer_cache.ObtainBuffer(range.address, range.size, /*is_written=*/true,
+	                                  /*is_texel_buffer=*/false);
+	static std::atomic<uint64_t> enrolled {0};
+	const auto count = enrolled.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (count <= 8 || count % 1000 == 0) {
+		LOGF("ImageReadback: enrolled #%" PRIu64 " %s\n", count, DescribeImageInfo(image.info).c_str());
+	}
+	ZeroCompanyImageLifecycle::Record(m_scheduler, "cpu-readback-enroll", id, image);
+}
+
+bool TextureCache::SyncGpuImagesForHostRead(Buffer& buffer, uint64_t& address, uint64_t& size) {
+	if (!GuestRange {address, size}.Valid()) {
+		return false;
+	}
+	std::scoped_lock lock {m_lock};
+	uint64_t begin  = address;
+	uint64_t end    = address + size;
+	bool     synced = false;
+	for (const auto id: FindImagesInRegion(address, size, true)) {
+		auto* image = m_slot_images.try_get(id);
+		// Pages, not bytes: the host fault is one byte of a protected page the image may only share.
+		if (image == nullptr || !image->registered || image->depth_id || !image->SafeToDownload() ||
+		    !image->Overlaps(address, size, /*pages=*/true)) {
+			continue;
+		}
+		const auto range = image->info.data;
+		if (range.Empty() || !buffer.IsInBounds(range.address, range.size)) {
+			static std::atomic<uint64_t> outside {0};
+			if (outside.fetch_add(1, std::memory_order_relaxed) < 8) {
+				LOGF("ImageReadback: host read at 0x%" PRIx64 " hits %s outside its buffer; stale bytes\n",
+				     address, DescribeImageInfo(image->info).c_str());
+			}
+			continue;
+		}
+		auto transfer = BuildDownload(*image);
+		if (!transfer.valid) {
+			continue;
+		}
+		m_scheduler.EndRendering();
+		buffer.last_gpu_write_tick = m_scheduler.CurrentTick(); // the image->buffer copy recorded below
+		DownloadImage(*image, buffer, buffer.Offset(range.address), range.size, std::move(transfer));
+		begin  = std::min(begin, range.address);
+		end    = std::max(end, range.address + range.size);
+		synced = true;
+		static std::atomic<uint64_t> count {0};
+		const auto n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (n <= 8 || n % 100 == 0) {
+			LOGF("ImageReadback: synced #%" PRIu64 " %s for a host read at 0x%" PRIx64 "\n", n,
+			     DescribeImageInfo(image->info).c_str(), address);
+		}
+		ZeroCompanyImageLifecycle::Record(m_scheduler, "cpu-readback-sync", id, *image,
+		    {.address = address, .size = size});
+	}
+	if (synced) {
+		address = begin;
+		size    = end - begin;
+	}
+	return synced;
 }
 
 bool TextureCache::HasGpuOwnedImageIn(uint64_t address, uint64_t size) {

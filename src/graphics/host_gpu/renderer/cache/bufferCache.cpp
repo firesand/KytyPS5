@@ -345,9 +345,16 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			return;
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
-
-		if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
-			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+		// A GPU-authoritative image over these pages holds newer pixels than the buffer: record its
+		// download first and publish the whole image, so one fault serves the game's whole read.
+		uint64_t publish_vaddr = vaddr;
+		uint64_t publish_size  = size;
+		if (m_texture_cache.SyncGpuImagesForHostRead(buffer, publish_vaddr, publish_size)) {
+			// The copy is in flight in this tick: keep TryBarReadback off the host-visible path.
+			NoteGpuWrite(publish_vaddr, publish_size, m_scheduler.CurrentTick());
+		}
+		if (DownloadBufferMemory<false>(buffer, publish_vaddr, publish_size)) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(publish_vaddr, publish_size);
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
