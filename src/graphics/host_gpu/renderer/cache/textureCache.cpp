@@ -30,6 +30,7 @@
 #include <span>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 #include <vulkan/vulkan_format_traits.hpp>
 
@@ -1261,6 +1262,24 @@ void TextureCache::InitializeImage(ImageId id) {
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
 		ZeroCompanyImageLifecycle::Record(m_scheduler, "initialize-needs-upload", id, image);
+		// Rendering-defect forensics (2026-10-13): the dossier portrait and the briefing panel show
+		// noise/stripes that look like a CPU-produced (video-decoded) texture uploaded with the wrong
+		// layout. Report images the CPU keeps rewriting, once per signature at 30 and 300 uploads.
+		{
+			static std::unordered_map<uint64_t, uint32_t> uploads; // GPU thread only
+			const auto& info = image.info;
+			const uint64_t key = (static_cast<uint64_t>(info.pixel_format) << 48u) ^
+			                     (uint64_t {info.extent.width} << 32u) ^
+			                     (uint64_t {info.extent.height} << 16u) ^
+			                     (uint64_t {static_cast<uint8_t>(info.tile_mode)} << 8u) ^
+			                     info.resources.levels ^ (info.data.size << 4u);
+			const auto count = ++uploads[key];
+			if (count == 30 || count == 300) {
+				LOGF("ImageCpuRefresh: uploads=%u %s pitch=%u guest_format=%u\n", count,
+				     DescribeImageInfo(info).c_str(), info.pitch,
+				     static_cast<unsigned>(info.guest_format));
+			}
+		}
 		const auto [source, source_offset] =
 		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
 		if (source == nullptr) {
