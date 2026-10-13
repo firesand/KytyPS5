@@ -178,6 +178,13 @@ struct BufferCacheTestAccess {
                       MemoryUsage::Upload, size);
   }
 
+  static void SetUnusedStreamBufferSize(BufferCache &cache, uint64_t size) {
+    // Replace in place before any reservations; TextureCache's tiler retains this same object.
+    std::destroy_at(&cache.m_stream_buffer);
+    std::construct_at(&cache.m_stream_buffer, cache.m_graphics, cache.m_scheduler,
+                      MemoryUsage::Stream, size);
+  }
+
   static bool SynchronizeBufferFromImage(BufferCache &cache, Buffer &buffer,
                                          uint64_t address, uint64_t size) {
     return cache.SynchronizeBufferFromImage(buffer, address, size);
@@ -10316,6 +10323,112 @@ public:
     Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(
         physical, allocation_size) == 0, "ordered-count fixture release failed");
     std::printf("[gpu]     %-32s ok (14 direct 1D workgroups, delayed WG0)\n", name);
+  }
+
+  // Run with Vulkan validation enabled: the unfixed path attempts to append the
+  // complement copy to a command buffer that its tiler has already submitted.
+  void CheckPartialMergeCommandRollover() {
+    constexpr const char *name = "PartialMergeCommandRollover";
+    constexpr uintptr_t base = 0x0000000204790000ull;
+    constexpr uint64_t image_size = 0x10000;
+    constexpr uint64_t stream_size = 4096;
+    constexpr u32 preserved = 1;
+    constexpr u32 written = 7;
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "direct allocation", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), image_size, image_size,
+        0, &physical) == 0, "rollover allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping", LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, image_size, 0x3, 0x10, physical, image_size) == 0 &&
+        mapped == reinterpret_cast<void *>(base), "rollover mapping failed");
+    std::memset(mapped, 0xa5, image_size);
+    RenderContext context(m_runtime_context);
+    // This is the actual parameter stream referenced by TextureCache::m_tiler.
+    BufferCacheTestAccess::SetUnusedStreamBufferSize(context.GetBufferCache(), stream_size);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, image_size);
+      auto &scheduler = context.GetCommandScheduler();
+      auto &cache = context.GetBufferCache();
+      auto &textures = context.GetTextureCache();
+      auto desc = MakeLinearDesc(base, image_size, vk::Format::eR32Uint,
+          Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+          {128, 128, 1}, 1, sizeof(u32), 1);
+      desc.info.tile_mode = Prospero::TileMode::kStandard64KB;
+      // Insert plus native clear avoids using the tiler before the forced wrap.
+      const auto image = TextureCacheTestAccess::InsertImage(textures, desc.info);
+      vk::ClearValue painted{};
+      painted.color.uint32 = std::array{preserved, 0u, 0u, 0u};
+      TextureCacheTestAccess::ClearImage(textures, scheduler.Current(), image,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
+      auto [destination, offset] = cache.ObtainBuffer(base, image_size, true, false);
+      Require(name, "whole buffer allocation", destination != nullptr && offset == 0 &&
+                  destination->IsInBounds(base, image_size) &&
+                  textures.GetImage(image).SafeToDownload(),
+              "fixture requires independent GPU-owned image and full native buffer");
+      destination->Fill(offset, image_size, 0);
+      destination->Fill(offset, sizeof(u32), written);
+      const auto owner = BufferCacheTestAccess::PageOwner(cache, base);
+      const auto native_destination = destination->Handle();
+      auto &parameters = cache.GetUtilityBuffer(MemoryUsage::Stream);
+      Require(name, "small real parameter stream", parameters.Size() == stream_size,
+              "tiler fixture did not replace the utility parameter stream");
+      const auto tick = scheduler.CurrentTick();
+      const auto command = scheduler.Current().Handle();
+      const auto [padding, padding_offset] = parameters.Map(stream_size, 4);
+      Require(name, "fill parameter stream", padding != nullptr && padding_offset == 0 &&
+                  scheduler.CurrentTick() == tick,
+              "the stream was used or wrapped before the measured preservation call");
+      std::memset(padding, 0x3c, stream_size);
+      parameters.Commit();
+      // The actual DWORD write already exists in the buffer. Copy only its complement;
+      // unlike a pending whole-image seed, this exercises copyBuffer after TileImage.
+      textures.InvalidateMemoryFromGPU(base, sizeof(u32), /*write_pending=*/false);
+      Require(name, "tiler forced a command-buffer rollover",
+              scheduler.CurrentTick() > tick && scheduler.Current().Handle() != command,
+              "preservation did not wrap the real tiler parameter stream");
+      Require(name, "no owner-join confound",
+              BufferCacheTestAccess::PageOwner(cache, base) == owner &&
+                  cache.GetBuffer(owner).Handle() == native_destination,
+              "the command rollover fixture unexpectedly changed native buffer ownership");
+      Libs::Graphics::Buffer readback(m_runtime_context, scheduler, MemoryUsage::Download,
+          0, vk::BufferUsageFlagBits::eTransferDst, image_size);
+      readback.CopyFrom(scheduler.Current(), *destination, offset, 0, image_size,
+          vk::AccessFlagBits::eMemoryWrite, vk::AccessFlagBits::eMemoryWrite,
+          vk::AccessFlagBits::eMemoryRead, vk::AccessFlagBits::eHostRead);
+      scheduler.FlushAndWait();
+      readback.Invalidate(0, image_size);
+      Require(name, "mapped native readback", readback.Mapped().size() >= image_size,
+              "rollover result is not host-visible");
+      for (uint64_t index = 0; index < image_size / sizeof(u32); ++index) {
+        u32 actual = 0;
+        std::memcpy(&actual, readback.Mapped().data() + index * sizeof(u32), sizeof(actual));
+        const auto expected = index == 0 ? written : preserved;
+        Require(name, "preserved complement after rollover", actual == expected,
+                "native DWORD " + std::to_string(index) + " expected " + Hex(expected) +
+                    ", got " + Hex(actual));
+      }
+      // Image-to-buffer diagnostics must not have published the result to guest backing.
+      u32 poison = 0;
+      Require(name, "guest backing remained stale",
+              LibKernel::Memory::TryReadBacking(base + 4, &poison, sizeof(poison)) &&
+                  poison == 0xa5a5a5a5u,
+              "the result assertion could have been satisfied through a CPU refresh");
+      context.UnmapMemory(base, image_size);
+      scheduler.Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing", LibKernel::Memory::KernelMunmap(base, image_size) == 0,
+            "rollover mapping release failed");
+    Require(name, "release direct backing", LibKernel::Memory::KernelReleaseDirectMemory(
+        physical, image_size) == 0, "rollover allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
   }
 
   void CheckPartialMergePreparedOwners(bool indirect) {
@@ -44477,6 +44590,11 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     CheckOrderedCountClassification(vulkan);
     vulkan.CheckOrderedCountDispatch();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--partial-merge-command-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckPartialMergeCommandRollover();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--partial-merge-binding-only") == 0) {
