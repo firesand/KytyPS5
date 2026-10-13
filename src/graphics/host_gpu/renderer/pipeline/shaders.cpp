@@ -725,6 +725,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	info.stage             = comp_shader_stage_info;
 	info.layout            = pipeline.pipeline_layout;
 	info.basePipelineIndex = -1;
+	if (input_info.stage.program->info.has_ordered_gds) {
+		info.flags |= vk::PipelineCreateFlagBits::eDispatchBase;
+	}
 	if (PipelineNoOptProbe()) {
 		info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
 	}

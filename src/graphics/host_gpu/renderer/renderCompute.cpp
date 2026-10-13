@@ -42,6 +42,74 @@
 namespace Libs::Graphics {
 #include "graphics/host_gpu/renderer/zeroCompanyInputs.inl"
 
+// Serializing whole workgroups is safe only when they cannot read one another's
+// writes after releasing the ordered counter. Check the final native descriptor
+// spans too: aligned descriptor prefixes can overlap otherwise disjoint guest ranges.
+static const char* OrderedGdsSerialRejection(const ShaderComputeInputInfo& input,
+                                            const PreparedBindings& bindings,
+                                            uint32_t groups_x, uint32_t groups_y, uint32_t groups_z) {
+	const auto& program = *input.stage.program;
+	const auto& info = program.info;
+	if (!info.single_ordered_gds_add)
+		return info.ordered_gds_rejection != nullptr ? info.ordered_gds_rejection : "unclassified_ordered_shader";
+	if (groups_y != 1u || groups_z != 1u) return "multidimensional_dispatch";
+	if (groups_x > 4096u) return "ordered_wave_index_wrap";
+	if (std::ranges::any_of(info.inputs, [](const auto& value) {
+		return value.kind == ShaderRecompiler::IR::StageInputKind::NumWorkgroups;
+	})) return "num_workgroups_dependency";
+	uint32_t threads = 1;
+	for (const uint32_t extent: input.threads_num) {
+		if (extent == 0u || extent > program.wave_size / threads) return "multiple_or_invalid_guest_waves";
+		threads *= extent;
+	}
+	if (info.uses_lds || info.uses_dma || program.has_address_writes || !info.images.empty())
+		return "non_buffer_memory";
+	if (bindings.gds.buffer == nullptr) return "missing_gds_binding";
+	const auto& resources = info.buffers;
+	for (const auto& resource: resources) {
+		if (resource.atomic || (resource.read && resource.written)) return "read_write_buffer";
+		if (!resource.read && !resource.written) return "unknown_buffer_access";
+		if (resource.unbounded || resource.image_alias != ShaderRecompiler::IR::BufferResource::NoImageAlias ||
+		    resource.indirect_root != ShaderRecompiler::IR::BufferResource::NoIndirectBuffer)
+			return "unbounded_or_indirect_buffer";
+		const auto index = resource.descriptor_index;
+		if (index >= bindings.buffer_sources.size() || index >= bindings.buffers.size())
+			return "missing_buffer_binding";
+		const auto& guest = bindings.buffer_sources[index];
+		const auto& native = bindings.buffers[index];
+		if (guest.address == 0u || guest.size == 0u || guest.size > UINT64_MAX - guest.address ||
+		    native.buffer == nullptr || native.range == 0u || native.range == VK_WHOLE_SIZE ||
+		    native.range > UINT64_MAX - native.offset || native.buffer == bindings.gds.buffer)
+			return "unknown_buffer_range";
+	}
+	for (const auto& reader: resources) {
+		if (!reader.read) continue;
+		const auto& read_guest = bindings.buffer_sources[reader.descriptor_index];
+		const auto& read_native = bindings.buffers[reader.descriptor_index];
+		for (const auto& writer: resources) {
+			if (!writer.written) continue;
+			const auto& write_guest = bindings.buffer_sources[writer.descriptor_index];
+			const auto& write_native = bindings.buffers[writer.descriptor_index];
+			if (read_guest.address < write_guest.address + write_guest.size &&
+			    write_guest.address < read_guest.address + read_guest.size)
+				return "overlapping_guest_buffers";
+			if (read_native.buffer == write_native.buffer &&
+			    read_native.offset < write_native.offset + write_native.range &&
+			    write_native.offset < read_native.offset + read_native.range)
+				return "overlapping_native_buffers";
+		}
+	}
+	return nullptr;
+}
+
+static void LogOrderedGdsApproximation(uint64_t shader_hash, const char* reason) {
+	static std::atomic<uint32_t> count {0};
+	if (count.fetch_add(1, std::memory_order_relaxed) < 16u) {
+		LOGF("OrderedGds: retaining unordered approximation shader=0x%016" PRIx64 " reason=%s\n",
+		     shader_hash, reason);
+	}
+}
+
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
                                  GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
 	for (uint32_t i = 0; i < sources.size(); ++i) {
@@ -549,7 +617,27 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                    static_cast<uint32_t>(program.stage)};
 		CommandScheduler::Checkpoint(vk_buffer, m_context.GetCommandScheduler().RecordGpuOperation(event));
 	}
-	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	const char* ordered_rejection = program.info.has_ordered_gds
+	    ? OrderedGdsSerialRejection(input_info, bindings, thread_group_x, thread_group_y, thread_group_z)
+	    : "no_ordered_gds";
+	if (ordered_rejection == nullptr) {
+		static std::atomic<uint32_t> applied_count {0};
+		if (applied_count.fetch_add(1, std::memory_order_relaxed) < 16u)
+			LOGF("OrderedGds: serialized shader=0x%016" PRIx64 " groups=%ux1x1 guest_local=%ux%ux%u\n",
+			     program.shader_hash, thread_group_x, input_info.threads_num[0],
+			     input_info.threads_num[1], input_info.threads_num[2]);
+		// Preserve the logical WorkgroupId while ordering each wave's reservation.
+		// No host wait or shader spin is needed; one guest wave is one native group.
+		for (uint32_t group = 0; group < thread_group_x; ++group) {
+			vk_buffer.dispatchBase(group, 0, 0, 1, 1, 1);
+			if (group + 1u < thread_group_x)
+				ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		}
+	} else {
+		if (program.info.has_ordered_gds)
+			LogOrderedGdsApproximation(program.shader_hash, ordered_rejection);
+		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	}
 	if (GpuDiagnostics::Enabled()) {
 		if (persistent_group_probe) {
 			event.kind = "persistent-group-probe";
@@ -647,6 +735,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		                    static_cast<uint32_t>(program.stage)};
 		CommandScheduler::Checkpoint(vk_buffer, m_context.GetCommandScheduler().RecordGpuOperation(event));
 	}
+	if (program.info.has_ordered_gds)
+		LogOrderedGdsApproximation(program.shader_hash, "indirect_dispatch");
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();

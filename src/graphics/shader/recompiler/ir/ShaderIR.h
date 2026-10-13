@@ -483,6 +483,10 @@ struct ShaderInfo {
 	bool                            uses_swizzle                  = false;
 	bool                            uses_lds                      = false;
 	bool                            uses_gds                      = false;
+	// Decoded/native-CFG facts retained after ordered counting becomes ordinary atomics.
+	bool                            has_ordered_gds               = false;
+	bool                            single_ordered_gds_add        = false;
+	const char*                     ordered_gds_rejection         = "not_classified";
 	bool                            uses_flattened_srt            = false;
 	bool                            uses_dispatch_threads         = false;
 	bool                            bvh                           = false;

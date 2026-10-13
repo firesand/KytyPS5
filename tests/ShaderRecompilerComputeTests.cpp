@@ -10101,6 +10101,222 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckOrderedCountDispatch() {
+    constexpr const char *name = "OrderedCountDispatch";
+    constexpr uintptr_t base = 0x0000000205400000ull;
+    constexpr uint64_t allocation_size = 0x10000;
+    constexpr uint64_t output = base + 0x4000;
+    constexpr uint64_t audit = base + 0x8000;
+    constexpr uint64_t gds_mirror = base + 0xc000;
+    constexpr u32 groups = 14;
+    constexpr u32 output_words = 1024;
+    constexpr u32 sentinel = 0xa5a5a5a5u;
+    constexpr u32 return_packet = 0xffff1000u;
+    constexpr u32 delayed_iterations = 65536;
+
+    // Each guest workgroup is exactly one wave. Varying byte weights expose
+    // wrong allocation offsets, while records longer than 32 DWORDs also use
+    // the high virtual half on subgroup32 hosts. The final record terminates
+    // the PM4-like stream, so a permutation cannot masquerade as a valid copy.
+    std::array<u32, groups> lengths{}, offsets{}, checksums{};
+    std::vector<u32> expected_payload;
+    for (u32 group = 0; group < groups; ++group) {
+      const u32 words = group + 1 == groups ? 1u : 33u + 5u * (group % 4u);
+      const u32 iterations = group == 0 ? delayed_iterations : 0u;
+      lengths[group] = words;
+      offsets[group] = static_cast<u32>(expected_payload.size() * sizeof(u32));
+      expected_payload.push_back(group + 1 == groups ? return_packet : KYTY_PM4(words, Pm4::IT_NOP, 0));
+      for (u32 word = 1; word < words; ++word)
+        expected_payload.push_back(0x60000000u | (group << 16u) | word);
+      u32 checksum = group + 1u;
+      for (u32 iteration = 0; iteration < iterations; ++iteration)
+        checksum = checksum * 1664525u + 1013904223u;
+      checksums[group] = checksum;
+    }
+    const u32 expected_bytes = static_cast<u32>(expected_payload.size() * sizeof(u32));
+    Require(name, "fixture bounds", expected_payload.size() + 2u < output_words,
+            "weighted payload does not leave both output guards");
+
+    // s[0:3] unused, s[4:7] output, s[8:11] audit, s12 WorkgroupId.x,
+    // s13 TG_SIZE. Preserve its entry value in s28 for the canonical M0 setup.
+    // Generate weights and payloads from actual group/lane IDs so this ordering
+    // regression does not depend on unrelated source-descriptor specialization.
+    // There is no cross-workgroup spin wait: the bounded, observable checksum
+    // loop delays WG0 before allocation and remains safe when the renderer
+    // serializes this supported ordered-count dispatch shape.
+    std::vector<u32> code{
+        EncodeSMovB32(28, 13),
+        EncodeSMovB32(20, 12),
+        EncodeSop2(0x0e, 21, 20, InlineU32(3)),
+        EncodeSop2(0x26, 21, 21, InlineU32(5)),
+        EncodeSop2(0x00, 21, 21, InlineU32(33)),
+        EncodeSopc(0x06, 20, InlineU32(groups - 1)),
+        EncodeSop2(0x0a, 21, InlineU32(1), 21),
+        EncodeSopc(0x06, 20, InlineU32(0)),
+        EncodeSop2(0x0a, 22, 255, InlineU32(0)), delayed_iterations,
+        EncodeSop2(0x00, 23, 20, InlineU32(1)),
+        EncodeSMovB32(24, InlineU32(0)),
+        EncodeSopc(0x06, 22, InlineU32(0))};
+    const auto skip_delay = code.size();
+    code.push_back(0);
+    const auto delay_loop = code.size();
+    code.insert(code.end(), {
+        EncodeSop2(0x26, 23, 23, 255), 1664525u,
+        EncodeSop2(0x00, 23, 23, 255), 1013904223u,
+        EncodeSop2(0x00, 24, 24, InlineU32(1)),
+        EncodeSopc(0x0a, 24, 22)});
+    code.push_back(EncodeSopp(0x05, static_cast<u32>(delay_loop - code.size() - 1u)));
+    code[skip_delay] = EncodeSopp(0x05, static_cast<u32>(code.size() - skip_delay - 1u));
+    code.insert(code.end(), {
+        EncodeSop2(0x1e, 25, 21, InlineU32(2)),
+        EncodeVop1(0x01, 4, 25),
+        EncodeSMovB32(26, InlineU32(0)),
+        EncodeSop1(0x04, 126, InlineU32(1)),
+        EncodeSop2(0x34, 31, InlineU32(0), 26),
+        EncodeSop2(0x27, 30, 28, 255), 0x000c0006u,
+        EncodeSop2(0x10, 124, 30, 31),
+        EncodeDs0(0x3f, 0x300, true), EncodeDs1(5, 0, 4),
+        EncodeSopp(0x0c, 0xc07f),
+        EncodeVop1(0x02, 32, Vgpr(5)),
+        EncodeVop1(0x01, 6, 20),
+        EncodeVop2(0x1a, 6, InlineU32(4), 6),
+        EncodeMubuf0(0x1c), EncodeMubuf1(5, 2, 6),
+        EncodeVop1(0x01, 7, 20),
+        EncodeMubuf0(0x1c, 4), EncodeMubuf1(7, 2, 6),
+        EncodeVop1(0x01, 7, 23),
+        EncodeMubuf0(0x1c, 8), EncodeMubuf1(7, 2, 6),
+        EncodeVop1(0x01, 7, 21),
+        EncodeMubuf0(0x1c, 12), EncodeMubuf1(7, 2, 6),
+        EncodeSop1(0x04, 126, 193u),
+        EncodeVop1(0x01, 5, 32), // Broadcast lane 0's allocated base after restoring EXEC.
+        EncodeVop1(0x01, 2, 21),
+        EncodeVop2(0x1a, 8, InlineU32(2), 0),
+        EncodeVop2(0x25, 10, Vgpr(5), 8),
+        EncodeSop2(0x01, 29, 21, InlineU32(2)),
+        EncodeSop2(0x1e, 29, 29, InlineU32(16)),
+        EncodeSop2(0x10, 29, 29, 255), 0xc0001000u,
+        EncodeSopc(0x06, 20, InlineU32(groups - 1)),
+        EncodeSop2(0x0a, 29, 255, 29), return_packet,
+        EncodeSop2(0x1e, 33, 20, InlineU32(16)),
+        EncodeSop2(0x10, 33, 33, 255), 0x60000000u,
+        EncodeVop1(0x01, 11, 33),
+        EncodeVop2(0x1c, 11, Vgpr(0), 11),
+        EncodeVop1(0x01, 12, 29),
+        EncodeVopc(0xc2, InlineU32(0), 0),
+        EncodeVop2(0x01, 11, Vgpr(11), 12),
+        EncodeVopc(0xc1, Vgpr(0), 2),
+        EncodeSop1(0x04, 126, 106),
+        EncodeMubuf0(0x1c), EncodeMubuf1(11, 1, 10)});
+    AppendEnd(&code);
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size, allocation_size,
+        0, &physical) == 0, "ordered-count fixture allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, allocation_size, 0x3, 0x10, physical, allocation_size) == 0 &&
+        mapped == reinterpret_cast<void *>(base), "ordered-count fixture mapping failed");
+    std::memset(mapped, 0xa5, allocation_size);
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, allocation_size);
+      auto &cache = context.GetBufferCache();
+      auto &shaders = processor.GetShCtx();
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                           .num_thread_x = 64, .num_thread_y = 1, .num_thread_z = 1,
+                           .wave_size = 64, .user_sgpr = 12, .tgid_x_en = true, .tg_size_en = true});
+      const auto set_buffer = [&](u32 sgpr, uint64_t address, u32 bytes) {
+        ShaderBufferResource descriptor{};
+        descriptor.UpdateAddress48(address);
+        descriptor.fields[2] = bytes;
+        descriptor.fields[3] = DstSel(4, 5, 6, 7) |
+            (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+        for (u32 i = 0; i < 4; ++i)
+          shaders.SetCsUserSgpr(sgpr + i, descriptor.fields[i], HW::UserSgprType::Unknown);
+      };
+      // Leave guards immediately before and after each shader-visible range.
+      set_buffer(4, output + sizeof(u32), (output_words - 2) * sizeof(u32));
+      set_buffer(8, audit + sizeof(u32), groups * 4 * sizeof(u32));
+      auto [output_buffer, output_offset] = cache.ObtainBuffer(output, output_words * sizeof(u32), true);
+      output_buffer->Fill(output_offset, output_words * sizeof(u32), sentinel);
+      auto [audit_buffer, audit_offset] = cache.ObtainBuffer(audit, (groups * 4 + 2) * sizeof(u32), true);
+      audit_buffer->Fill(audit_offset, (groups * 4 + 2) * sizeof(u32), sentinel);
+      cache.FillBuffer(0, 4, 0, true);
+      cache.FillBuffer(4, 12, sentinel, true);
+
+      // Exercise packet decoding, CommandProcessor and RenderExecutor. Calling
+      // VulkanHarness::Dispatch directly would bypass the production fix.
+      const std::array<u32, 5> commands{
+          KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, 0), groups, 1, 1, 0x41u};
+      Pm4Execution execution;
+      Require(name, "production dispatch", processor.Process(execution, commands) == Pm4ProcessResult::Complete,
+              "the production direct-dispatch packet was not consumed");
+      cache.CopyBuffer(gds_mirror, 0, 16, false, true);
+      cache.ReadMemory(output, output_words * sizeof(u32));
+      cache.ReadMemory(audit, (groups * 4 + 2) * sizeof(u32));
+      cache.ReadMemory(gds_mirror, 16);
+      std::array<u32, output_words> actual{};
+      std::array<u32, groups * 4 + 2> observed{};
+      std::array<u32, 4> counter{};
+      Require(name, "native readback", LibKernel::Memory::TryReadBacking(output, actual.data(), sizeof(actual)) &&
+                  LibKernel::Memory::TryReadBacking(audit, observed.data(), sizeof(observed)) &&
+                  LibKernel::Memory::TryReadBacking(gds_mirror, counter.data(), sizeof(counter)),
+              "ordered-count native output or GDS counter could not be read back");
+      std::printf("[gpu]     %s allocation offsets:", name);
+      for (u32 group = 0; group < groups; ++group)
+        std::printf(" %u:%u/%u", group, observed[1 + group * 4], offsets[group]);
+      std::printf(" (actual/expected bytes), GDS=%u/%u\n", counter[0], expected_bytes);
+      for (u32 group = 0; group < groups; ++group) {
+        const auto index = 1 + group * 4;
+        std::printf("[gpu]     audit WG%u id=%u/%u checksum=%08x/%08x weight=%u/%u\n", group,
+                    observed[index + 1], group, observed[index + 2], checksums[group],
+                    observed[index + 3], lengths[group]);
+      }
+      std::fflush(stdout);
+      Require(name, "audit guards", observed.front() == sentinel && observed.back() == sentinel,
+              "ordered-count audit wrote outside its descriptor");
+      for (u32 group = 0; group < groups; ++group) {
+        const auto index = 1 + group * 4;
+        Require(name, "guest workgroup IDs and bounded delay", observed[index + 1] == group &&
+                    observed[index + 2] == checksums[group] && observed[index + 3] == lengths[group],
+                "workgroup " + std::to_string(group) +
+                    " lost its ID, checksum or generated weight (dispatchBase must preserve guest IDs)");
+      }
+      Require(name, "GDS allocation total and guards", counter[0] == expected_bytes &&
+                  counter[1] == sentinel && counter[2] == sentinel && counter[3] == sentinel,
+              "ordered count used the wrong byte weight or GDS address");
+      for (u32 group = 0; group < groups; ++group)
+        Require(name, "guest ordered allocation", observed[1 + group * 4] == offsets[group],
+                "workgroup " + std::to_string(group) + " expected byte offset " +
+                    std::to_string(offsets[group]) + ", got " +
+                    std::to_string(observed[1 + group * 4]) +
+                    "; unordered arrival can place RETURN before earlier command records");
+      for (u32 word = 0; word < actual.size(); ++word) {
+        const auto expected = word > 0 && word <= expected_payload.size()
+                                  ? expected_payload[word - 1] : sentinel;
+        Require(name, "ordered payload, final RETURN and untouched guards", actual[word] == expected,
+                "output word " + std::to_string(word) + " expected " + Hex(expected) +
+                    ", got " + Hex(actual[word]));
+      }
+      context.UnmapMemory(base, allocation_size);
+      context.GetCommandScheduler().Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(
+        physical, allocation_size) == 0, "ordered-count fixture release failed");
+    std::printf("[gpu]     %-32s ok (14 direct 1D workgroups, delayed WG0)\n", name);
+  }
+
   void CheckNativeIndirectDispatch() {
     constexpr const char *name = "NativeIndirectDispatch";
     constexpr uintptr_t base = 0x0000000204600000ull;
@@ -37947,6 +38163,142 @@ void CheckComputeLdsLimit(VulkanHarness &vulkan) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+// Inspect the production compiler's dispatch-order eligibility without creating
+// pipelines or submitting commands. Invalid variants retain the ordinary
+// fallback; an optional reservation remains eligible, but a repeated one does
+// not satisfy the narrow at-most-once canonical compute-wave ADD policy.
+void CheckOrderedCountClassification(VulkanHarness &vulkan) {
+  constexpr const char *name = "OrderedCountClassification";
+  enum class WaveInput { Canonical, ArbitraryM0, WrongSavedSource, ClobberedSaved, Cycle, Bypass, ExecBypass };
+  struct ClassificationCase {
+    const char *label;
+    u32 offset;
+    WaveInput input;
+    bool eligible;
+  };
+  constexpr std::array cases{
+      ClassificationCase{"canonical", 0x300, WaveInput::Canonical, true},
+      ClassificationCase{"raw OFFSET0=1", 0x301, WaveInput::Canonical, false},
+      ClassificationCase{"raw OFFSET0=4", 0x304, WaveInput::Canonical, false},
+      ClassificationCase{"OFFSET1=2", 0x200, WaveInput::Canonical, false},
+      ClassificationCase{"OFFSET1=7", 0x700, WaveInput::Canonical, false},
+      ClassificationCase{"OFFSET1=19", 0x1300, WaveInput::Canonical, false},
+      ClassificationCase{"arbitrary M0", 0x300, WaveInput::ArbitraryM0, false},
+      ClassificationCase{"wrong TG_SIZE copy", 0x300, WaveInput::WrongSavedSource, false},
+      ClassificationCase{"clobbered TG_SIZE copy", 0x300, WaveInput::ClobberedSaved, false},
+      ClassificationCase{"ordered op in bounded cycle", 0x300, WaveInput::Cycle, false},
+      ClassificationCase{"return bypasses ordered op", 0x300, WaveInput::Bypass, true},
+      ClassificationCase{"EXECZ skips ordered op", 0x300, WaveInput::ExecBypass, true},
+  };
+  std::array<std::vector<u32>, cases.size()> shaders;
+  for (size_t i = 0; i < cases.size(); ++i) {
+    auto &code = shaders[i];
+    const auto shape = cases[i].input;
+    code = {EncodeSMovB32(28, shape == WaveInput::WrongSavedSource ? 12 : 13),
+            EncodeSMovB32(26, InlineU32(0)),
+            EncodeVop1(0x01, 4, InlineU32(4)),
+            EncodeSop1(0x04, 126, InlineU32(1))};
+    if (shape == WaveInput::ClobberedSaved)
+      code.push_back(EncodeSMovB32(28, InlineU32(0)));
+    if (shape == WaveInput::Cycle)
+      code.push_back(EncodeSMovB32(20, InlineU32(0)));
+    size_t bypass_branch = 0;
+    if (shape == WaveInput::Bypass || shape == WaveInput::ExecBypass) {
+      code.push_back(EncodeSopc(0x06, 12, InlineU32(0)));
+      if (shape == WaveInput::ExecBypass)
+        code.push_back(EncodeSop2(0x0b, 126, InlineU32(0), 193u));
+      bypass_branch = code.size();
+      code.push_back(0);
+    }
+    const auto ordered_begin = code.size();
+    if (shape == WaveInput::ArbitraryM0) {
+      code.push_back(EncodeSMovB32(124, InlineU32(0)));
+    } else {
+      code.insert(code.end(), {
+          EncodeSop2(0x34, 31, InlineU32(0), 26),
+          EncodeSop2(0x27, 30, 28, 255), 0x000c0006u,
+          EncodeSop2(0x10, 124, 30, 31)});
+    }
+    code.insert(code.end(), {EncodeDs0(0x3f, cases[i].offset, true), EncodeDs1(5, 0, 4)});
+    if (shape == WaveInput::Cycle) {
+      // Two iterations for WG0, one for every other group. The TG_SIZE copy is
+      // unchanged; rejection must come from repeating the ordered reservation.
+      code.push_back(EncodeSop2(0x00, 20, 20, InlineU32(1)));
+      code.push_back(EncodeSop2(0x00, 21, 12, 20));
+      code.push_back(EncodeSopc(0x0a, 21, InlineU32(2)));
+      code.push_back(EncodeSopp(0x05, static_cast<u32>(ordered_begin - code.size() - 1u)));
+    }
+    if (shape == WaveInput::Bypass || shape == WaveInput::ExecBypass)
+      code[bypass_branch] = EncodeSopp(shape == WaveInput::ExecBypass ? 0x08 : 0x05,
+                                     static_cast<u32>(code.size() - bypass_branch - 1u));
+    AppendEnd(&code);
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+  }
+
+  GraphicContext graphics;
+  graphics.device = vulkan.Device();
+  graphics.physical_device_properties = vulkan.RuntimeContext().GetPhysicalDeviceProperties();
+  PipelineCache cache(graphics);
+  for (size_t i = 0; i < cases.size(); ++i) {
+    HW::ComputeShaderInfo regs{};
+    regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(shaders[i].data());
+    regs.cs_regs.num_thread_x = 64;
+    regs.cs_regs.num_thread_y = regs.cs_regs.num_thread_z = 1;
+    regs.cs_regs.wave_size = 64;
+    regs.cs_regs.user_sgpr = 12;
+    regs.cs_regs.tgid_x_en = true;
+    regs.cs_regs.tg_size_en = true;
+    ShaderComputeInputInfo input{};
+    const auto program = cache.GetComputeProgram(regs, {}, input);
+    Require(name, cases[i].label, program.id != 0 && input.stage.program != nullptr,
+            "production compiler did not return a program");
+    const auto &info = input.stage.program->info;
+    ShaderRecompiler::Decoder::Program decoded;
+    ShaderRecompiler::Decoder::DecodeProgram(shaders[i], decoded);
+    const auto classification = ShaderRecompiler::ClassifyOrderedGds(decoded, input);
+    Require(name, cases[i].label,
+            classification.has_ordered_gds && classification.eligible == cases[i].eligible &&
+                info.has_ordered_gds && info.single_ordered_gds_add == classification.eligible,
+            std::string("wrong canonical ordered-GDS eligibility for ") + cases[i].label);
+  }
+  std::printf("[compile] %-32s ok (3 eligible, 9 rejected; no dispatch)\n", name);
+}
+
+// Read the user's captured binary at runtime; no game shader bytes are embedded.
+// This path does not initialize Vulkan, materialize descriptors, or submit work.
+bool ClassifyOrderedShaderFile(const char *path) {
+  constexpr const char *name = "ClassifyOrderedShaderFile";
+  std::ifstream file(path, std::ios::binary | std::ios::ate);
+  Require(name, "open", file.is_open(), "cannot open captured shader binary");
+  const auto bytes = static_cast<std::streamoff>(file.tellg());
+  Require(name, "size", bytes > 0 && bytes <= 4 * 1024 * 1024 && bytes % sizeof(u32) == 0,
+          "shader binary must contain complete DWORDs and fit within 4 MiB");
+  std::vector<u32> code(static_cast<size_t>(bytes) / sizeof(u32));
+  file.seekg(0);
+  file.read(reinterpret_cast<char *>(code.data()), static_cast<std::streamsize>(bytes));
+  Require(name, "read", file.gcount() == static_cast<std::streamsize>(bytes),
+          "captured shader binary was truncated");
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(code, decoded);
+  ShaderComputeInputInfo input{};
+  input.wave_size = 64;
+  input.threads_num[0] = input.dispatch_threads_num[0] = 64;
+  input.threads_num[1] = input.threads_num[2] = 1;
+  input.dispatch_threads_num[1] = input.dispatch_threads_num[2] = 1;
+  input.thread_ids_num = 1;
+  input.workgroup_register = 16;
+  input.group_id[0] = true;
+  input.tg_size_en = true;
+  const auto result = ShaderRecompiler::ClassifyOrderedGds(decoded, input);
+  std::printf("[host]    %s path=%s bytes=%zu wave=64 local=64x1x1 user_sgpr=16 "
+              "WGx=s16 TG_SIZE=s17 has_ordered_gds=%u eligible=%u reason=%s (CPU only)\n",
+              name, path, code.size() * sizeof(u32), result.has_ordered_gds ? 1u : 0u,
+              result.eligible ? 1u : 0u, result.rejection != nullptr ? result.rejection : "eligible");
+  return result.has_ordered_gds && result.eligible;
+}
+
 void CheckPs5GameExampleImageClearRuntimeShape() {
   const auto MakeCode = [] {
     std::vector<u32> code;
@@ -43106,6 +43458,8 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc == 3 && std::strcmp(argv[1], "--classify-ordered-shader") == 0)
+    return ClassifyOrderedShaderFile(argv[2]) ? 0 : 1;
   if (argc == 2 && std::strcmp(argv[1], "--fragment-output-only") == 0) {
     VulkanHarness vulkan;
     for (const auto &test : GraphicsTypedColorExports()) {
@@ -43966,6 +44320,12 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckSampledDccClear();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--ordered-count-dispatch-only") == 0) {
+    VulkanHarness vulkan;
+    CheckOrderedCountClassification(vulkan);
+    vulkan.CheckOrderedCountDispatch();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--native-indirect-only") == 0) {

@@ -60,6 +60,16 @@ struct ShaderSource {
 	std::vector<std::pair<uint64_t, uint64_t>> reads;
 };
 
+// CPU-only classification of the same decoded/native-CFG policy used by compilation.
+// Rejection strings are process-local static literals; no guest resources are read.
+struct OrderedGdsClassification {
+	bool has_ordered_gds = false;
+	bool eligible = false;
+	const char* rejection = "no_ordered_gds";
+};
+[[nodiscard]] OrderedGdsClassification ClassifyOrderedGds(
+    const Decoder::Program& decoded, const ShaderComputeInputInfo& input);
+
 [[nodiscard]] ShaderSource PrepareShaderSource(std::span<const uint32_t> code,
 	                                           const CompileOptions& options);
 const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime);

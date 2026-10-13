@@ -579,7 +579,160 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 	source.call_targets = std::move(static_cast<ResourcePlan&>(query));
 }
 
+uint32_t OrderedScalarCode(const Decoder::Operand& operand) {
+	switch (operand.kind) {
+		case Decoder::OperandKind::Sgpr: return operand.reg;
+		case Decoder::OperandKind::VccLo: return 106u;
+		case Decoder::OperandKind::VccHi: return 107u;
+		case Decoder::OperandKind::M0: return 124u;
+		default: return UINT32_MAX;
+	}
+}
+
+bool OrderedImmediate(const Decoder::Operand& operand, uint32_t value) {
+	return (operand.kind == Decoder::OperandKind::IntegerInlineConstant ||
+	        operand.kind == Decoder::OperandKind::LiteralConstant) && operand.value == value;
+}
+
+const char* CanonicalOrderedWaveRejection(const Decoder::Program& decoded, const CFG::Graph& cfg,
+                                          const ShaderComputeInputInfo& input, uint32_t instruction,
+                                          uint32_t block_id) {
+	const auto* block = cfg.FindBlock(block_id);
+	const auto* entry = cfg.FindBlock(cfg.entry_block);
+	if (!input.tg_size_en) return "tg_size_disabled";
+	if (block == nullptr || entry == nullptr) return "missing_native_block";
+	if (!entry->predecessors.empty()) return "entry_has_predecessors";
+	if (instruction < block->inst_begin + 3u) return "m0_setup_crosses_block";
+	const auto& pack = decoded.instructions[instruction - 3u];
+	const auto& extract = decoded.instructions[instruction - 2u];
+	const auto& combine = decoded.instructions[instruction - 1u];
+	const auto high = OrderedScalarCode(pack.dst);
+	const auto low = OrderedScalarCode(extract.dst);
+	if (pack.opcode != Decoder::Opcode::S_PACK_HH_B32_B16 || !OrderedImmediate(pack.src0, 0u))
+		return "m0_pack_pattern";
+	if (extract.opcode != Decoder::Opcode::S_BFE_U32 || !OrderedImmediate(extract.src1, 0x000c0006u))
+		return "m0_extract_pattern";
+	if (combine.opcode != Decoder::Opcode::S_OR_B32 || OrderedScalarCode(combine.dst) != 124u ||
+	    high == UINT32_MAX || low == UINT32_MAX || high == low ||
+	    !((OrderedScalarCode(combine.src0) == high && OrderedScalarCode(combine.src1) == low) ||
+	      (OrderedScalarCode(combine.src1) == high && OrderedScalarCode(combine.src0) == low)))
+		return "m0_combine_pattern";
+	if (extract.src0.kind != Decoder::OperandKind::Sgpr) return "tg_size_not_sgpr";
+	const auto saved = extract.src0.reg;
+	uint32_t tg_size = input.workgroup_register;
+	for (const bool enabled: input.group_id) tg_size += enabled ? 1u : 0u;
+	if (tg_size >= IR::NumScalarRegs || saved >= IR::NumScalarRegs) return "tg_size_register_range";
+	uint32_t entry_begin = entry->inst_begin;
+	if (saved != tg_size) {
+		uint32_t copy = UINT32_MAX;
+		for (uint32_t index = entry->inst_begin; index < entry->inst_end; ++index) {
+			const auto& inst = decoded.instructions[index];
+			if (inst.opcode == Decoder::Opcode::S_MOV_B32 &&
+			    OrderedScalarCode(inst.dst) == saved && OrderedScalarCode(inst.src0) == tg_size) {
+				if (copy != UINT32_MAX) return "tg_size_multiple_entry_copies";
+				copy = index;
+			}
+		}
+		if (copy == UINT32_MAX || copy >= instruction - 2u) return "tg_size_entry_copy_missing";
+		for (uint32_t index = entry->inst_begin; index < copy; ++index)
+			if (CFG::MayWriteScalarRegister(decoded.instructions[index], tg_size))
+				return "tg_size_entry_source_clobbered";
+		entry_begin = copy + 1u;
+	}
+	// Every path to BFE must retain that entry value. A visited-block walk handles
+	// unrelated loops without assuming a single predecessor or aborting on joins.
+	std::vector<std::pair<uint32_t, uint32_t>> pending {{block_id, instruction - 2u}};
+	std::vector<uint32_t> visited;
+	while (!pending.empty()) {
+		const auto [id, end] = pending.back();
+		pending.pop_back();
+		if (std::ranges::find(visited, id) != visited.end()) continue;
+		visited.push_back(id);
+		const auto* current = cfg.FindBlock(id);
+		if (current == nullptr) return "tg_size_predecessor_missing";
+		const auto begin = id == entry->id ? entry_begin : current->inst_begin;
+		if (begin > end) return "tg_size_copy_after_use";
+		for (uint32_t index = begin; index < end; ++index)
+			if (CFG::MayWriteScalarRegister(decoded.instructions[index], saved))
+				return "tg_size_saved_value_clobbered";
+		if (id == entry->id) continue;
+		for (const auto predecessor: current->predecessors) {
+			const auto* previous = cfg.FindBlock(predecessor);
+			if (previous == nullptr) return "tg_size_predecessor_missing";
+			pending.emplace_back(predecessor, previous->inst_end);
+		}
+	}
+	return nullptr;
+}
+
+OrderedGdsClassification ClassifyOrderedGdsImpl(const Decoder::Program& decoded, const CFG::Graph& cfg,
+                                               const ShaderComputeInputInfo* input) {
+	OrderedGdsClassification result;
+	uint32_t ordered_count = 0;
+	uint32_t ordered_block = UINT32_MAX;
+	uint32_t ordered_instruction = UINT32_MAX;
+	const char* rejected = nullptr;
+	for (const auto& block: cfg.blocks) {
+		if (block.terminator.kind == CFG::TerminatorKind::Unsupported) rejected = "unsupported_terminator";
+		for (uint32_t index = block.inst_begin; index < block.inst_end; ++index) {
+			const auto& inst = decoded.instructions.at(index);
+			if (inst.family == Decoder::Family::FLAT) rejected = "flat_memory_instruction";
+			// Scalar descriptor fetches may become immutable prepared payload. The
+			// runtime guard rejects uses_dma, which covers all remaining GPU address reads.
+			if (inst.opcode == Decoder::Opcode::DS_ORDERED_COUNT) {
+				result.has_ordered_gds = true;
+				++ordered_count;
+				ordered_block = block.id;
+				ordered_instruction = index;
+				// Check the original byte too: the decoder masks OFFSET0's low two bits.
+				if (!inst.gds || inst.offset != 0u || (inst.raw[0] & 0xffu) != 0u ||
+				    inst.secondary_offset != 3u) rejected = "ordered_instruction_variant";
+			} else if (inst.family == Decoder::Family::DS && inst.gds) {
+				rejected = "other_gds_instruction";
+			}
+		}
+	}
+	if (!result.has_ordered_gds) return result;
+	const auto Reject = [&](const char* reason) {
+		result.rejection = reason;
+		return result;
+	};
+	if (rejected != nullptr) return Reject(rejected);
+	if (ordered_count != 1u) return Reject("multiple_ordered_instructions");
+	if (input == nullptr) return Reject("not_compute_shader");
+	if (const auto reason = CanonicalOrderedWaveRejection(decoded, cfg, *input,
+	                                                      ordered_instruction, ordered_block))
+		return Reject(reason);
+	const auto* ordered = cfg.FindBlock(ordered_block);
+	if (ordered == nullptr) return Reject("missing_ordered_block");
+	// Inspect the native CFG, not the emitter's dispatcher loop. A separate
+	// bounded copy loop after the reservation does not repeat the ordered op.
+	for (const auto& component: cfg.components) {
+		if (std::ranges::find(component.blocks, ordered_block) != component.blocks.end() &&
+		    component.blocks.size() > 1u) return Reject("ordered_instruction_in_cycle");
+	}
+	if (std::ranges::find(ordered->successors, ordered_block) != ordered->successors.end())
+		return Reject("ordered_instruction_self_loop");
+	// The reservation may be skipped (for example when EXEC is empty). At most
+	// one execution per workgroup is sufficient: the dispatch guard separately
+	// proves that shader reads cannot observe another workgroup's buffer writes,
+	// and rejects all other GDS/address/LDS/image dependencies. Serializing a
+	// skipped workgroup therefore preserves its path without waiting on a peer.
+	bool has_return = false;
+	for (const auto& block: cfg.blocks)
+		has_return |= block.terminator.kind == CFG::TerminatorKind::Return;
+	if (!has_return) return Reject("missing_return");
+	result.eligible = true;
+	result.rejection = nullptr;
+	return result;
+}
+
 } // namespace
+
+OrderedGdsClassification ClassifyOrderedGds(const Decoder::Program& decoded,
+                                             const ShaderComputeInputInfo& input) {
+	return ClassifyOrderedGdsImpl(decoded, CFG::BuildGraph(decoded), &input);
+}
 
 ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOptions& options) {
 	EXIT_IF(code.empty());
@@ -818,6 +971,11 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		}
 	}
 	IR::TrackResources(ir, decoded, native_cfg);
+	const auto ordered = ClassifyOrderedGdsImpl(decoded, native_cfg,
+	    options.stage == ShaderType::Compute ? options.input_info.compute : nullptr);
+	ir.info.has_ordered_gds = ordered.has_ordered_gds;
+	ir.info.single_ordered_gds_add = ordered.eligible;
+	ir.info.ordered_gds_rejection = ordered.rejection;
 	TranslateResult result;
 	result.program = std::move(ir);
 	if (options.dump_ir) {
