@@ -9287,6 +9287,75 @@ public:
                 "a CPU store into a published linear image was lost or left the image clean");
       }
 
+      // Two enrolled linear images sharing one 4 KiB page: a host read of the first must also sync
+      // and publish the second before their shared page is unprotected (review 2026-10-14, C2).
+      {
+        constexpr uint64_t pair_a_offset = 0x2c10000;
+        constexpr uint64_t pair_a_size = 0x1800; // 64x24 R32Uint, ends in the middle of a page
+        constexpr uint64_t pair_b_offset = pair_a_offset + pair_a_size;
+        constexpr uint64_t pair_b_size = 0x2800; // 64x40 R32Uint, starts in that page
+        constexpr uint64_t pair_a_address = base + pair_a_offset;
+        constexpr uint64_t pair_b_address = base + pair_b_offset;
+        std::memset(memory + pair_a_offset, 0xa5, pair_a_size + pair_b_size);
+        auto pair_a_desc = MakeLinearDesc(
+            pair_a_address, pair_a_size, vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
+            Prospero::ImageType::kColor2D, {64, 24, 1}, 1, 4, 1);
+        pair_a_desc.type = BindingType::Storage;
+        pair_a_desc.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+        auto pair_b_desc = MakeLinearDesc(
+            pair_b_address, pair_b_size, vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
+            Prospero::ImageType::kColor2D, {64, 40, 1}, 1, 4, 1);
+        pair_b_desc.type = BindingType::Storage;
+        pair_b_desc.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+        const auto pair_a = texture_cache.FindImage(pair_a_desc);
+        const auto pair_b = texture_cache.FindImage(pair_b_desc);
+        Require(name, "adjacent linear storage images", bool(pair_a) && bool(pair_b) && pair_a != pair_b,
+                "failed to register two adjacent linear storage images");
+        (void)texture_cache.FindTexture(pair_a, pair_a_desc);
+        (void)texture_cache.FindTexture(pair_b, pair_b_desc);
+        constexpr uint32_t pair_a_value = 0x0a0a0a0au;
+        constexpr uint32_t pair_b_value = 0x0b0b0b0bu;
+        vk::ClearValue pair_paint{};
+        pair_paint.color.uint32 = std::array{pair_a_value, 0u, 0u, 0u};
+        TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), pair_a,
+                                           {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, pair_paint);
+        pair_paint.color.uint32 = std::array{pair_b_value, 0u, 0u, 0u};
+        TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), pair_b,
+                                           {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, pair_paint);
+        Require(name, "adjacent images read-protected",
+                !HostMemoryIsReadable(pair_a_address) &&
+                    !HostMemoryIsReadable(pair_b_address + pair_b_size - 1),
+                "storage binds of adjacent linear images did not protect their pages");
+        const auto *pair_a_view = reinterpret_cast<volatile uint32_t *>(pair_a_address);
+        const uint32_t pair_first = pair_a_view[1];
+        Require(name, "host read of the first image publishes both",
+                pair_first == pair_a_value && HostMemoryIsReadable(pair_b_address + pair_b_size - 1),
+                "a host read of one image left its page-sharing neighbour protected or stale");
+        std::vector<uint32_t> pair_words((pair_a_size + pair_b_size) / sizeof(uint32_t));
+        std::memcpy(pair_words.data(), memory + pair_a_offset, pair_a_size + pair_b_size);
+        size_t pair_mismatches = 0;
+        for (size_t index = 0; index < pair_words.size(); ++index) {
+          const uint32_t expected =
+              index < pair_a_size / sizeof(uint32_t) ? pair_a_value : pair_b_value;
+          pair_mismatches += pair_words[index] != expected;
+        }
+        if (pair_mismatches != 0) {
+          std::printf("[host]    %s: %zu adjacent-image words stale\n", name, pair_mismatches);
+          for (size_t chunk = 0; chunk < pair_words.size(); chunk += 256) {
+            size_t bad = 0;
+            for (size_t index = chunk; index < chunk + 256 && index < pair_words.size(); ++index) {
+              const uint32_t expected =
+                  index < pair_a_size / sizeof(uint32_t) ? pair_a_value : pair_b_value;
+              bad += pair_words[index] != expected;
+            }
+            std::printf("[host]      words %5zu..%5zu (byte 0x%05zx): %3zu stale, first word 0x%08x\n",
+                        chunk, chunk + 255, chunk * 4, bad, pair_words[chunk]);
+          }
+        }
+        Require(name, "shared boundary page holds both images", pair_mismatches == 0,
+                "the page shared by two enrolled images was published with stale bytes");
+      }
+
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
       LibKernel::Memory::InstallGpuResources(nullptr);

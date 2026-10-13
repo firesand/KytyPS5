@@ -1727,7 +1727,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 				CommitGpuWrite(image);
 			}
 			TrackImageDownload(id, image);
-			EnrollCpuReadback(id, image);
+			EnrollCpuReadback(id, image, /*require_gpu_modified=*/true);
 			break;
 		default: EXIT("TextureCache: invalid texture binding\n");
 	}
@@ -1749,7 +1749,8 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	RefreshImage(id);
 	CommitGpuWrite(image);
 	TrackImageDownload(id, image);
-	EnrollCpuReadback(id, image);
+	// CPU-readback enrolment of linear colour targets happens in PrepareGraphicsBindings
+	// (EnrollCpuReadbackTarget): here the draw has already captured its native buffer handles.
 	return image.FindView(desc.view_info);
 }
 
@@ -2335,12 +2336,23 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	return true;
 }
 
-void TextureCache::EnrollCpuReadback(ImageId id, Image& image) {
+void TextureCache::EnrollCpuReadbackTarget(ImageId id) {
+	std::scoped_lock lock {m_lock};
+	auto* image = m_slot_images.try_get(id);
+	if (image == nullptr) {
+		return;
+	}
+	// The draw's colour write makes the image GPU-owned later, in FindRenderTarget; the enrolment's
+	// buffer join must happen now, before the draw captures native buffer handles.
+	EnrollCpuReadback(id, *image, /*require_gpu_modified=*/false);
+}
+
+void TextureCache::EnrollCpuReadback(ImageId id, Image& image, bool require_gpu_modified) {
 	// The host fault that publishes the image needs the GPU thread (BufferCache::ReadMemory uses
 	// SendCommandSync); contexts without one (unit tests) must not read-protect image pages.
 	if (!ImageReadbackEnabled() || !m_scheduler.Context().HasGpu() || !image.registered ||
 	    image.depth_id || image.info.IsDepth() || image.info.IsTiled() || image.info.data.Empty() ||
-	    !image.IsGpuModified()) {
+	    (require_gpu_modified && !image.IsGpuModified())) {
 		return;
 	}
 	const auto range = image.info.data;
@@ -2368,57 +2380,86 @@ void TextureCache::EnrollCpuReadback(ImageId id, Image& image) {
 	ZeroCompanyImageLifecycle::Record(m_scheduler, "cpu-readback-enroll", id, image);
 }
 
-bool TextureCache::SyncGpuImagesForHostRead(Buffer& buffer, uint64_t& address, uint64_t& size) {
+bool TextureCache::SyncGpuImagesForHostRead(Buffer& buffer, uint64_t& address, uint64_t& size,
+                                            bool record) {
 	if (!GuestRange {address, size}.Valid()) {
 		return false;
 	}
-	std::scoped_lock lock {m_lock};
-	uint64_t begin  = address;
-	uint64_t end    = address + size;
-	bool     synced = false;
-	for (const auto id: FindImagesInRegion(address, size, true)) {
-		auto* image = m_slot_images.try_get(id);
-		// Only images enrolled by EnrollCpuReadback: elsewhere a GPU-modified image over a GPU-dirty
-		// buffer range is not proof that the image is newer (depth/stencil planes, probes). Pages, not
-		// bytes: the host fault is one byte of a protected page the image may only share.
-		if (image == nullptr || !image->registered || !image->cpu_readback_pending || image->depth_id ||
-		    !image->SafeToDownload() || !image->Overlaps(address, size, /*pages=*/true)) {
-			continue;
-		}
-		const auto range = image->info.data;
-		if (range.Empty() || !buffer.IsInBounds(range.address, range.size)) {
-			static std::atomic<uint64_t> outside {0};
-			if (outside.fetch_add(1, std::memory_order_relaxed) < 8) {
-				LOGF("ImageReadback: host read at 0x%" PRIx64 " hits %s outside its buffer; stale bytes\n",
-				     address, DescribeImageInfo(image->info).c_str());
+	std::scoped_lock    lock {m_lock};
+	uint64_t             begin = address;
+	uint64_t             end   = address + size;
+	std::vector<ImageId> selected;
+	// Fixpoint over the page-rounded hull: the publish unprotects whole pages, and a page at the
+	// hull's edge may hold the head or tail of another enrolled image, which must be synced too
+	// (review 2026-10-14, C2). Only images EnrollCpuReadback enrolled: elsewhere a GPU-modified image
+	// over a GPU-dirty buffer range is not proof that the image is newer (depth/stencil planes).
+	for (;;) {
+		const auto page_begin = Common::AlignDown(begin, TRACKER_PAGE_SIZE);
+		const auto page_end   = Common::AlignUp(end, TRACKER_PAGE_SIZE);
+		bool       grew       = false;
+		for (const auto id: FindImagesInRegion(page_begin, page_end - page_begin, true)) {
+			if (std::find(selected.begin(), selected.end(), id) != selected.end()) {
+				continue;
 			}
-			continue;
+			auto* image = m_slot_images.try_get(id);
+			if (image == nullptr || !image->registered || !image->cpu_readback_pending ||
+			    image->depth_id || !image->SafeToDownload() ||
+			    !image->Overlaps(page_begin, page_end - page_begin)) {
+				continue;
+			}
+			const auto range = image->info.data;
+			if (range.Empty()) {
+				continue;
+			}
+			if (!buffer.IsInBounds(range.address, range.size)) {
+				static std::atomic<uint64_t> outside {0};
+				if (outside.fetch_add(1, std::memory_order_relaxed) < 8) {
+					LOGF("ImageReadback: host read at 0x%" PRIx64 " hits %s outside its buffer; stale bytes\n",
+					     address, DescribeImageInfo(image->info).c_str());
+				}
+				continue;
+			}
+			selected.push_back(id);
+			begin = std::min(begin, range.address);
+			end   = std::max(end, range.address + range.size);
+			grew  = true;
 		}
-		auto transfer = BuildDownload(*image);
-		if (!transfer.valid) {
-			continue;
+		if (!grew) {
+			break;
 		}
-		m_scheduler.EndRendering();
-		buffer.last_gpu_write_tick = m_scheduler.CurrentTick(); // the image->buffer copy recorded below
-		DownloadImage(*image, buffer, buffer.Offset(range.address), range.size, std::move(transfer));
-		image->cpu_readback_pending = false; // the next GPU write enrols again
-		begin  = std::min(begin, range.address);
-		end    = std::max(end, range.address + range.size);
-		synced = true;
-		static std::atomic<uint64_t> count {0};
-		const auto n = count.fetch_add(1, std::memory_order_relaxed) + 1;
-		if (n <= 8 || n % 100 == 0) {
-			LOGF("ImageReadback: synced #%" PRIu64 " %s for a host read at 0x%" PRIx64 "\n", n,
-			     DescribeImageInfo(image->info).c_str(), address);
-		}
-		ZeroCompanyImageLifecycle::Record(m_scheduler, "cpu-readback-sync", id, *image,
-		    {.address = address, .size = size});
 	}
-	if (synced) {
-		address = begin;
-		size    = end - begin;
+	if (selected.empty()) {
+		return false;
 	}
-	return synced;
+	if (record) {
+		for (const auto id: selected) {
+			auto&      image = m_slot_images[id];
+			const auto range = image.info.data;
+			auto       transfer = BuildDownload(image);
+			// The publish below unprotects the pages either way; an image that cannot be downloaded
+			// keeps the old (stale) behaviour instead of faulting forever.
+			image.cpu_readback_pending = false; // the next GPU write enrols again
+			if (!transfer.valid) {
+				LOGF("ImageReadback: cannot download %s for a host read; stale bytes\n",
+				     DescribeImageInfo(image.info).c_str());
+				continue;
+			}
+			m_scheduler.EndRendering();
+			buffer.last_gpu_write_tick = m_scheduler.CurrentTick(); // the image->buffer copy below
+			DownloadImage(image, buffer, buffer.Offset(range.address), range.size, std::move(transfer));
+			static std::atomic<uint64_t> count {0};
+			const auto n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (n <= 8 || n % 100 == 0) {
+				LOGF("ImageReadback: synced #%" PRIu64 " %s for a host read at 0x%" PRIx64 "\n", n,
+				     DescribeImageInfo(image.info).c_str(), address);
+			}
+			ZeroCompanyImageLifecycle::Record(m_scheduler, "cpu-readback-sync", id, image,
+			    {.address = address, .size = size});
+		}
+	}
+	address = begin;
+	size    = end - begin;
+	return true;
 }
 
 bool TextureCache::HasGpuOwnedImageIn(uint64_t address, uint64_t size) {
@@ -2696,6 +2737,12 @@ void TextureCache::RunGarbageCollector() {
 			--deletions;
 			auto owner = m_slot_images.try_get(id);
 			if (owner == nullptr || !owner->registered || owner->depth_id) {
+				continue;
+			}
+			// Enrolled for a CPU read: its pages are read-protected on the buffer side and the buffer
+			// holds no pixels yet. Freeing it here would make the next host fault publish stale bytes
+			// over the pixels DownloadImageMemory wrote (review 2026-10-14, C1).
+			if (owner->cpu_readback_pending) {
 				continue;
 			}
 			if (owner->IsGpuModified()) {

@@ -87,7 +87,12 @@ public:
 	// download of every GPU-authoritative image whose pages overlap the range and widens the range to
 	// cover them, so the buffer's host publish returns the GPU's pixels and one fault serves the whole
 	// surface. Returns true when a download was recorded (the caller keeps the copy path).
-	[[nodiscard]] bool SyncGpuImagesForHostRead(Buffer& buffer, uint64_t& address, uint64_t& size);
+	// `record` false only computes the hull (the caller publishes pending GPU writes over it first).
+	[[nodiscard]] bool SyncGpuImagesForHostRead(Buffer& buffer, uint64_t& address, uint64_t& size,
+	                                            bool record);
+	// Linear colour targets are enrolled here, from PrepareGraphicsBindings, because FindRenderTarget
+	// runs after the draw captured its native buffer handles and the enrolment can join buffers.
+	void EnrollCpuReadbackTarget(ImageId id);
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
@@ -159,7 +164,7 @@ private:
 	// range GPU-written in the buffer cache read-protects the pages, so the first CPU read faults into
 	// BufferCache::ReadMemory, which syncs the image (SyncGpuImagesForHostRead) before publishing.
 	// Nothing is copied at enrolment. KYTY_IMAGE_READBACK=0 disables the enrolment.
-	void                      EnrollCpuReadback(ImageId id, Image& image);
+	void                      EnrollCpuReadback(ImageId id, Image& image, bool require_gpu_modified);
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);

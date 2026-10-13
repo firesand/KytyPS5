@@ -345,13 +345,24 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			return;
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
-		// A GPU-authoritative image over these pages holds newer pixels than the buffer: record its
-		// download first and publish the whole image, so one fault serves the game's whole read.
+		// Publish completed unbounded GPU writes to the texture cache first, so an image they
+		// overwrote is no longer GPU-authoritative when the sync asks (review 2026-10-14, C3/C5).
+		PrepareHostRead(vaddr, size);
+		PublishPendingTextureInvalidations();
+		// An enrolled image over these pages holds newer pixels than the buffer: record its download
+		// first and publish the whole image, so one fault serves the game's whole read.
 		uint64_t publish_vaddr = vaddr;
 		uint64_t publish_size  = size;
-		if (m_texture_cache.SyncGpuImagesForHostRead(buffer, publish_vaddr, publish_size)) {
-			// The copy is in flight in this tick: keep TryBarReadback off the host-visible path.
-			NoteGpuWrite(publish_vaddr, publish_size, m_scheduler.CurrentTick());
+		if (m_texture_cache.SyncGpuImagesForHostRead(buffer, publish_vaddr, publish_size,
+		                                             /*record=*/false)) {
+			// The hull can reach pages other unbounded writes touched: publish those as well.
+			PrepareHostRead(publish_vaddr, publish_size);
+			PublishPendingTextureInvalidations();
+			if (m_texture_cache.SyncGpuImagesForHostRead(buffer, publish_vaddr, publish_size,
+			                                             /*record=*/true)) {
+				// The copy is in flight in this tick: keep TryBarReadback off the host-visible path.
+				NoteGpuWrite(publish_vaddr, publish_size, m_scheduler.CurrentTick());
+			}
 		}
 		if (DownloadBufferMemory<false>(buffer, publish_vaddr, publish_size)) {
 			m_memory_tracker.UnmarkRegionAsGpuModified(publish_vaddr, publish_size);
@@ -998,6 +1009,13 @@ void BufferCache::RunGarbageCollector() {
 			return false;
 		}
 		if (dirty) {
+			// An enrolled image over this buffer still holds the pixels: sync it in before the publish
+			// drops the read protection (review 2026-10-14, C4). OnCommandBoundary ran above.
+			uint64_t sync_vaddr = buffer.CpuAddress();
+			uint64_t sync_size  = buffer.Size();
+			if (m_texture_cache.SyncGpuImagesForHostRead(buffer, sync_vaddr, sync_size, /*record=*/true)) {
+				NoteGpuWrite(sync_vaddr, sync_size, m_scheduler.CurrentTick());
+			}
 			EXIT_NOT_IMPLEMENTED(!DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size()));
 			dirty_buffers.push_back(id);
 		} else {

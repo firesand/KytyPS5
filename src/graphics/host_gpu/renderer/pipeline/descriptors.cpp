@@ -1072,6 +1072,12 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 			BindRenderTarget(target.image_id);
 		}
 	}
+	// Linear colour targets a CPU may read back: enrol now, because the enrolment can join cache
+	// buffers and the draw captures native buffer handles below and in AcquireVertexBuffers, before
+	// FindRenderTarget runs (review 2026-10-14, C7/C8).
+	for (const auto& target: colors) {
+		cache.EnrollCpuReadbackTarget(target.image_id);
+	}
 	PrepareBufferImageWrites(stages);
 	// Discovery can read back PS5 metadata and submit the scheduler. Reserve draw buffers only
 	// after image identities are final; attachment layout transitions follow buffer alias copies.
