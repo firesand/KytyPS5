@@ -77,9 +77,14 @@ void ReportGpuOwnedOverlap(const char* kind, TextureCache::BindingType binding,
 	// ng-55: transient aliasing (different base or different extent) dominates and is legitimate
 	// (UE5 RDG reuses heap memory within a frame); keep it to a small sample and spend the budget
 	// on same-base/same-extent requests, which are views of one surface.
-	const bool same_surface = owner.data.address == request.data.address ||
-	                          (owner.extent == request.extent && owner.data.size == request.data.size);
-	if (!same_surface && alias_lines++ >= 32) {
+	// ng-56: same base + same extent with a different element size is still RDG reuse of a larger
+	// allocation; a view of one surface keeps base, extent, element size and backing size.
+	const bool same_surface = owner.data.address == request.data.address &&
+	                          owner.extent == request.extent &&
+	                          owner.bytes_per_block * owner.samples ==
+	                              request.bytes_per_block * request.samples &&
+	                          owner.data.size == request.data.size;
+	if (!same_surface && alias_lines++ >= 48) {
 		return;
 	}
 	const uint64_t key = owner.data.address ^ (uint64_t {request.extent.width} << 32u) ^
