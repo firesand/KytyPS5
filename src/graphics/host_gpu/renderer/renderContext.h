@@ -37,6 +37,9 @@ public:
 	void                                    InitializeGpu(VideoOut::VideoOutDriver* video_out);
 	void                                    ShutdownGpu();
 	[[nodiscard]] GuestGpu&                 GetGpu() const;
+	// False before InitializeGpu and after shutdown (unit tests that never start the GPU thread):
+	// paths that need SendCommandSync, such as CPU readback enrolment, must stay inactive then.
+	[[nodiscard]] bool HasGpu() const noexcept { return m_gpu != nullptr; }
 	[[nodiscard]] VideoOut::VideoOutDriver& GetVideoOut() const;
 
 	Common::Mutex&      GetMutex() { return m_mutex; }

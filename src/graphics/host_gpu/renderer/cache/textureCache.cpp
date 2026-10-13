@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -2335,8 +2336,11 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 }
 
 void TextureCache::EnrollCpuReadback(ImageId id, Image& image) {
-	if (!ImageReadbackEnabled() || !image.registered || image.depth_id || image.info.IsDepth() ||
-	    image.info.IsTiled() || image.info.data.Empty() || !image.IsGpuModified()) {
+	// The host fault that publishes the image needs the GPU thread (BufferCache::ReadMemory uses
+	// SendCommandSync); contexts without one (unit tests) must not read-protect image pages.
+	if (!ImageReadbackEnabled() || !m_scheduler.Context().HasGpu() || !image.registered ||
+	    image.depth_id || image.info.IsDepth() || image.info.IsTiled() || image.info.data.Empty() ||
+	    !image.IsGpuModified()) {
 		return;
 	}
 	const auto range = image.info.data;
@@ -2350,7 +2354,8 @@ void TextureCache::EnrollCpuReadback(ImageId id, Image& image) {
 	    m_buffer_cache.IsLabelRegionGpuModified(range.address, range.size)) {
 		return;
 	}
-	image.cpu_readback_tick = tick;
+	image.cpu_readback_tick    = tick;
+	image.cpu_readback_pending = true;
 	// A written binding marks the range GPU-modified in the memory tracker, which read-protects its
 	// pages; the buffer itself is only seeded when a host read actually faults.
 	(void)m_buffer_cache.ObtainBuffer(range.address, range.size, /*is_written=*/true,
@@ -2373,9 +2378,11 @@ bool TextureCache::SyncGpuImagesForHostRead(Buffer& buffer, uint64_t& address, u
 	bool     synced = false;
 	for (const auto id: FindImagesInRegion(address, size, true)) {
 		auto* image = m_slot_images.try_get(id);
-		// Pages, not bytes: the host fault is one byte of a protected page the image may only share.
-		if (image == nullptr || !image->registered || image->depth_id || !image->SafeToDownload() ||
-		    !image->Overlaps(address, size, /*pages=*/true)) {
+		// Only images enrolled by EnrollCpuReadback: elsewhere a GPU-modified image over a GPU-dirty
+		// buffer range is not proof that the image is newer (depth/stencil planes, probes). Pages, not
+		// bytes: the host fault is one byte of a protected page the image may only share.
+		if (image == nullptr || !image->registered || !image->cpu_readback_pending || image->depth_id ||
+		    !image->SafeToDownload() || !image->Overlaps(address, size, /*pages=*/true)) {
 			continue;
 		}
 		const auto range = image->info.data;
@@ -2394,6 +2401,7 @@ bool TextureCache::SyncGpuImagesForHostRead(Buffer& buffer, uint64_t& address, u
 		m_scheduler.EndRendering();
 		buffer.last_gpu_write_tick = m_scheduler.CurrentTick(); // the image->buffer copy recorded below
 		DownloadImage(*image, buffer, buffer.Offset(range.address), range.size, std::move(transfer));
+		image->cpu_readback_pending = false; // the next GPU write enrols again
 		begin  = std::min(begin, range.address);
 		end    = std::max(end, range.address + range.size);
 		synced = true;

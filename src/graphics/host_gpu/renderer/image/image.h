@@ -152,8 +152,10 @@ public:
 	// The current stencil plane's mapping into the depth image, also retained by its association.
 	ImageSubresourceRange stencil_subresources;
 	uint64_t         tick_accessed_last = 0;
-	// Scheduler tick of the last CPU-readback enrolment (TextureCache::EnrollCpuReadback).
-	uint64_t         cpu_readback_tick  = 0;
+	// CPU readback (TextureCache::EnrollCpuReadback): tick of the last enrolment, and whether a host
+	// fault may still sync this image into the buffer cache (only enrolled images are ever synced).
+	uint64_t         cpu_readback_tick    = 0;
+	bool             cpu_readback_pending = false;
 	size_t           lru_id             = 0;
 
 private:
