@@ -2102,7 +2102,6 @@ bool TextureCache::PreserveGpuPixels(ImageId id, Image& image,
 	}
 	auto& command = m_scheduler.Current();
 	command.EndRendering();
-	const auto native = command.Handle();
 	if (whole) {
 		DownloadImage(image, *buffer, offset, size, std::move(transfer));
 	} else {
@@ -2124,6 +2123,8 @@ bool TextureCache::PreserveGpuPixels(ImageId id, Image& image,
 			m_tiler.TileImage(image, texture.regions, scratch.buffer, scratch.offset, size,
 			                  texture.LinearSize(), texture.tiles, texture.color_transform);
 		}
+		// Tile preparation can wrap its parameter stream and replace the native command buffer.
+		const auto native = m_scheduler.Current().Handle();
 		std::array<vk::BufferMemoryBarrier, 2> before {};
 		before[0].srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eShaderWrite |
 		                          vk::AccessFlagBits::eTransferWrite;
@@ -2158,7 +2159,7 @@ bool TextureCache::PreserveGpuPixels(ImageId id, Image& image,
 	after.buffer              = buffer->Handle();
 	after.offset              = offset;
 	after.size                = size;
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::PipelineStageFlagBits::eAllCommands, vk::DependencyFlagBits::eByRegion,
 	                       0, nullptr, 1, &after, 0, nullptr);
 	const auto tick             = m_scheduler.CurrentTick();
