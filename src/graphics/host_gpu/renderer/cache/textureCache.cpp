@@ -1274,8 +1274,16 @@ void TextureCache::InitializeImage(ImageId id) {
 			                     (uint64_t {static_cast<uint8_t>(info.tile_mode)} << 8u) ^
 			                     info.resources.levels ^ (info.data.size << 4u);
 			const auto count = ++uploads[key];
-			if (count == 30 || count == 300) {
-				LOGF("ImageCpuRefresh: uploads=%u %s pitch=%u guest_format=%u\n", count,
+			// An upload over GPU-owned pixels replaces GPU results with guest memory that tiled
+			// targets never receive (stale or zero): a candidate mechanism for the black meshes.
+			static uint64_t over_gpu = 0;
+			const bool      gpu      = image.IsGpuModified();
+			if (gpu) ++over_gpu;
+			if (count == 1 || count == 30 || count == 300 || (gpu && count % 100 == 0)) {
+				LOGF("ImageCpuRefresh: uploads=%u gpu_owned=%d buffer_modified=%d cpu_dirty=%d "
+				     "maybe_dirty=%d over_gpu_total=%" PRIu64 " %s pitch=%u guest_format=%u\n",
+				     count, gpu ? 1 : 0, image.IsBufferModified() ? 1 : 0,
+				     image.IsDefinitelyCpuDirty() ? 1 : 0, image.IsMaybeCpuDirty() ? 1 : 0, over_gpu,
 				     DescribeImageInfo(info).c_str(), info.pitch,
 				     static_cast<unsigned>(info.guest_format));
 			}
