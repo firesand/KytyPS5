@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
+#include "graphics/host_gpu/renderer/gpuDiagnostics.h"
+
 #include "common/alignment.h"
 #include <fmt/format.h>
 #include <chrono>
@@ -566,8 +568,15 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	m_last_upload_bytes = total_size;
 	m_last_upload_pages = copies.size();
 	if (source) {
-		m_sync_stats.copy_batches++;
+		m_sync_stats.copy_buffers++;
 		buffer.last_gpu_write_tick = m_scheduler.CurrentTick(); // the staging copy below
+		if (m_upload_batch_open && !is_texel_buffer) {
+			// Queued: EndUploadBatch records the copy behind one shared barrier pair. Texel buffers
+			// stay immediate: their image refresh below must follow the copy.
+			m_pending_uploads.push_back({source, buffer.Handle(), std::move(copies)});
+			return false;
+		}
+		m_sync_stats.copy_batches++;
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
 		const auto native = command.Handle();
@@ -613,7 +622,9 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 		return reinterpret_cast<const void*>(buffer.CpuAddress() + copy.dstOffset);
 	};
 
-	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
+	// Inside an upload batch the staging ring must not wait (a wait can flush the tick and would
+	// split the batch's copies from their staging data); a full ring falls back to a temporary.
+	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4, /*allow_wait=*/!m_upload_batch_open);
 	if (mapped != nullptr) {
 		for (size_t i = 0; i < copies.size(); i++) {
 			auto& copy = copies[i];
@@ -981,6 +992,55 @@ void BufferCache::FlushWriteFaults(bool wait) {
 	m_scheduler.Wait(tick);
 	m_scheduler.WaitPriorityOperations(tick);
 	DrainPendingGpuModified();
+}
+
+void BufferCache::BeginUploadBatch() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_UPLOAD_BATCH");
+		const bool  on    = value == nullptr || value[0] != '0';
+		LOGF("BufferCache: upload batching %s\n", on ? "on" : "off");
+		return on;
+	}();
+	// Serialized diagnostics flush after every operation; keep the per-buffer barriers there so a
+	// flush can never split a batch from its staging data.
+	if (!enabled || m_upload_batch_open || GpuDiagnostics::Serialize()) {
+		return;
+	}
+	m_upload_batch_open = true;
+	m_upload_batch_tick = m_scheduler.CurrentTick();
+}
+
+void BufferCache::EndUploadBatch() {
+	if (!m_upload_batch_open) {
+		return;
+	}
+	m_upload_batch_open = false;
+	if (m_pending_uploads.empty()) {
+		return;
+	}
+	// The queued copies' staging data is watched under the tick they were committed in; the
+	// copies must execute in that same tick (UploadCopies never waits inside a batch).
+	EXIT_IF(m_scheduler.CurrentTick() != m_upload_batch_tick);
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto        native = command.Handle();
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
+	                       vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer,
+	                       vk::DependencyFlagBits::eByRegion, 1, &before, 0, nullptr, 0, nullptr);
+	for (const auto& upload: m_pending_uploads) {
+		native.copyBuffer(upload.source, upload.destination, static_cast<uint32_t>(upload.copies.size()),
+		                  upload.copies.data());
+	}
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::DependencyFlagBits::eByRegion, 1, &after, 0, nullptr, 0, nullptr);
+	m_sync_stats.copy_batches++;
+	m_pending_uploads.clear();
 }
 
 void BufferCache::PrepareHostRead(uint64_t vaddr, uint64_t size) {

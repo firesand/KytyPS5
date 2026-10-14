@@ -151,13 +151,21 @@ public:
 		uint64_t obtain_calls = 0, obtain_bytes = 0, obtain_pages = 0;
 		uint64_t range_calls = 0, range_bytes = 0, range_pages = 0;
 		uint64_t download_calls = 0, download_wait_ns = 0, read_memory_calls = 0;
-		uint64_t copy_batches = 0; // SynchronizeBuffer calls that recorded a staging copy (one barrier pair each)
+		uint64_t copy_batches = 0; // barrier pairs recorded around staging copies
+		uint64_t copy_buffers = 0; // SynchronizeBuffer calls that recorded or queued a staging copy
 		uint64_t bar_readbacks = 0;
 		uint64_t host_joins = 0; // replaced buffers copied on the host (complete)
 		uint64_t gpu_joins  = 0; // replaced buffers copied on the GPU (in flight)
 	};
 	[[nodiscard]] SyncStats TakeSyncStats() { return std::exchange(m_sync_stats, {}); }
 	void SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	// Upload batching (CPU-write synchronization): between Begin and End, SynchronizeBuffer queues
+	// its staging copies instead of recording each with its own full-pipeline barrier pair; End
+	// records one barrier pair around all of them. Nothing may read a queued buffer on the GPU
+	// before End (SyncCpuWrites only synchronizes, so it is the only user). KYTY_UPLOAD_BATCH=0
+	// restores the per-buffer barriers.
+	void BeginUploadBatch();
+	void EndUploadBatch();
 	// Tracker regions whose CPU-dirty state changed since the last call: func(address, size).
 	// Callers clip them to mapped guest memory before synchronizing (buffers may extend past it).
 	template <typename Func>
@@ -225,6 +233,14 @@ private:
 	// Scratch for page-driven range synchronization (GPU thread): candidate page runs and the
 	// per-buffer hull of the runs it owns.
 	std::vector<std::pair<uint64_t, uint64_t>>                     m_sync_candidates;
+	struct PendingUpload {
+		vk::Buffer                  source;
+		vk::Buffer                  destination;
+		std::vector<vk::BufferCopy> copies;
+	};
+	std::vector<PendingUpload> m_pending_uploads;
+	bool                       m_upload_batch_open = false;
+	uint64_t                   m_upload_batch_tick = 0;
 	struct SyncOwner {
 		BufferId id;
 		uint64_t start  = 0;

@@ -9415,6 +9415,35 @@ public:
           std::printf("[host]    %s: page-driven sync contents: device copy not host-visible, skipped\n",
                       name);
         }
+        // Batched: two dirty owners in one synchronization share one barrier pair and both
+        // device copies receive their bytes.
+        auto *sync_store_a =
+            reinterpret_cast<volatile uint32_t *>(base + sync_a_offset + 0x2000);
+        auto *sync_store_b =
+            reinterpret_cast<volatile uint32_t *>(base + sync_b_offset + 0x3000);
+        *sync_store_a = 0xa11ce5edu;
+        *sync_store_b = 0xb0bbe5edu;
+        (void)sync_cache.TakeSyncStats();
+        sync_cache.BeginUploadBatch();
+        sync_cache.SynchronizeBuffersInRange(base + sync_a_offset,
+                                             sync_b_offset + sync_owner_size - sync_a_offset);
+        sync_cache.EndUploadBatch();
+        const auto batch_stats = sync_cache.TakeSyncStats();
+        const char *batch_mode = std::getenv("KYTY_UPLOAD_BATCH");
+        const bool batching = batch_mode == nullptr || batch_mode[0] != '0';
+        Require(name, "batched sync barrier pairs",
+                batch_stats.copy_buffers == 2 &&
+                    batch_stats.copy_batches == (batching ? 1u : 2u) &&
+                    !sync_cache.IsRegionCpuModified(base + sync_a_offset, sync_owner_size) &&
+                    !sync_cache.IsRegionCpuModified(base + sync_b_offset, sync_owner_size),
+                "a batched range synchronization did not record one barrier pair for two owners");
+        scheduler.FlushAndWait();
+        uint32_t batch_a = 0, batch_b = 0;
+        if (sync_cache.PeekDeviceCopy(base + sync_a_offset + 0x2000, &batch_a, sizeof(batch_a)) &&
+            sync_cache.PeekDeviceCopy(base + sync_b_offset + 0x3000, &batch_b, sizeof(batch_b))) {
+          Require(name, "batched sync contents", batch_a == 0xa11ce5edu && batch_b == 0xb0bbe5edu,
+                  "a batched range synchronization did not deliver both owners' CPU bytes");
+        }
       }
 
       resources.UnmapMemory(base, allocation_size);

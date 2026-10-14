@@ -108,6 +108,7 @@ struct FaultSampler {
 		sync_sum.download_wait_ns += sync.download_wait_ns;
 		sync_sum.read_memory_calls += sync.read_memory_calls;
 		sync_sum.copy_batches += sync.copy_batches;
+		sync_sum.copy_buffers += sync.copy_buffers;
 		protect_sum.first += protects.first;
 		protect_sum.second += protects.second;
 		hot_sum.hashed += hot.hashed;
@@ -163,9 +164,9 @@ struct FaultSampler {
 		                    protects_all.first, protects_all.second >> 10, hot_all.hashed,
 		                    hot_all.skipped, hot_all.demoted, hot_all.invalidated);
 		const auto& rs = reads_all.sites;
-		line += fmt::format(" | cpu-sync {} calls {} regions {} copy-batches | cp reads: args {} ({} ms)"
-		                    " count {} ({} ms) dispatch {} ({} ms) pred {} ({} ms)",
-		                    syncs_all.calls, syncs_all.regions, sync_all.copy_batches,
+		line += fmt::format(" | cpu-sync {} calls {} regions {} copy-batches {} copy-buffers"
+		                    " | cp reads: args {} ({} ms) count {} ({} ms) dispatch {} ({} ms) pred {} ({} ms)",
+		                    syncs_all.calls, syncs_all.regions, sync_all.copy_batches, sync_all.copy_buffers,
 		                    rs[HostReadProbe::DrawArgs].first,
 		                    rs[HostReadProbe::DrawArgs].second / 1000000,
 		                    rs[HostReadProbe::DrawCount].first, rs[HostReadProbe::DrawCount].second / 1000000,
@@ -279,6 +280,7 @@ void RenderContext::SyncCpuWrites() {
 		return value != nullptr && value[0] == '1';
 	}();
 	std::shared_lock lock(m_mapped_ranges_mutex);
+	m_buffer_cache.BeginUploadBatch();
 	if (sync_all) {
 		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			SyncProbe::NoteRegion();
@@ -294,6 +296,7 @@ void RenderContext::SyncCpuWrites() {
 			});
 		});
 	}
+	m_buffer_cache.EndUploadBatch();
 }
 
 void RenderContext::RunGarbageCollector() {
