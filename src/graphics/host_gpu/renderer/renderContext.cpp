@@ -155,8 +155,9 @@ struct FaultSampler {
 		syncs_sum.calls += syncs.calls;
 		syncs_sum.regions += syncs.regions;
 		for (size_t i = 0; i < budget.categories.size(); ++i) {
-			budget_sum.categories[i].first += budget.categories[i].first;
-			budget_sum.categories[i].second += budget.categories[i].second;
+			budget_sum.categories[i].calls += budget.categories[i].calls;
+			budget_sum.categories[i].inclusive_ns += budget.categories[i].inclusive_ns;
+			budget_sum.categories[i].exclusive_ns += budget.categories[i].exclusive_ns;
 		}
 		if (++calls % 64 != 0) return;
 		const auto sync_all = std::exchange(sync_sum, {});
@@ -224,17 +225,16 @@ struct FaultSampler {
 		                    rs[HostReadProbe::Predication].second / 1000000);
 		const auto& bc = budget_all.categories;
 		const auto  ms = [](uint64_t ns) { return ns / 1000000; };
+		const auto cat = [&](BudgetProbe::Category c) {
+			return fmt::format("{}/{} ({})", ms(bc[c].inclusive_ns), ms(bc[c].exclusive_ns), bc[c].calls);
+		};
 		line += fmt::format(" | wall {} ms | gpu-thread cpu user {} sys {} ms | process cpu user {} sys {} ms"
-		                    " | gpu-thread budget ms: wait {} ({}) sync {} ({}) draw {} ({}) dispatch {} ({})"
-		                    " protect {} ({}) submit {} ({})",
+		                    " | gpu-thread budget incl/excl ms (calls): wait {} sync {} draw {} dispatch {}"
+		                    " protect {} submit {}",
 		                    wall_ms, cpu_delta.thread_user_ms, cpu_delta.thread_sys_ms,
-		                    cpu_delta.process_user_ms, cpu_delta.process_sys_ms,
-		                    ms(bc[BudgetProbe::Wait].second), bc[BudgetProbe::Wait].first,
-		                    ms(bc[BudgetProbe::Sync].second), bc[BudgetProbe::Sync].first,
-		                    ms(bc[BudgetProbe::Draw].second), bc[BudgetProbe::Draw].first,
-		                    ms(bc[BudgetProbe::Dispatch].second), bc[BudgetProbe::Dispatch].first,
-		                    ms(bc[BudgetProbe::Protect].second), bc[BudgetProbe::Protect].first,
-		                    ms(bc[BudgetProbe::Submit].second), bc[BudgetProbe::Submit].first);
+		                    cpu_delta.process_user_ms, cpu_delta.process_sys_ms, cat(BudgetProbe::Wait),
+		                    cat(BudgetProbe::Sync), cat(BudgetProbe::Draw), cat(BudgetProbe::Dispatch),
+		                    cat(BudgetProbe::Protect), cat(BudgetProbe::Submit));
 		LOGF("%s\n", line.c_str());
 		last_total = now;
 	}

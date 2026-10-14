@@ -92,21 +92,36 @@ private:
 // Wall-time budget of the GPU thread per interval: where the serial thread's time goes, including
 // kernel time (perf records user space only on this machine). Categories overlap (Sync and Protect
 // run inside Draw/Dispatch preparation); the reader subtracts.
+struct BudgetCounters {
+	std::atomic<uint64_t> calls {0};
+	std::atomic<uint64_t> inclusive_ns {0};
+	std::atomic<uint64_t> exclusive_ns {0};
+};
+
 struct BudgetProbe {
 	enum Category : uint32_t { Wait = 0, Sync, Draw, Dispatch, Protect, Submit, CategoryCount };
-	struct Snapshot {
-		std::array<std::pair<uint64_t, uint64_t>, CategoryCount> categories {}; // calls, nanoseconds
+	struct Entry {
+		uint64_t calls = 0, inclusive_ns = 0, exclusive_ns = 0;
 	};
-	inline static std::array<HostReadCounters, CategoryCount> s_categories {};
-	static void Add(Category category, uint64_t ns) noexcept {
+	struct Snapshot {
+		std::array<Entry, CategoryCount> categories {};
+	};
+	inline static std::array<BudgetCounters, CategoryCount> s_categories {};
+	// Exclusive time: a scope's own time minus the time of scopes nested inside it on the same
+	// thread (Codex review 2026-10-15: waits reach MasterSemaphore::Wait from inside sync/draw/
+	// dispatch; inclusive numbers alone do not partition the thread's time).
+	inline static thread_local uint64_t s_nested_ns = 0; // child time to subtract, per open scope
+	static void Add(Category category, uint64_t inclusive_ns, uint64_t exclusive_ns) noexcept {
 		s_categories[category].calls.fetch_add(1, std::memory_order_relaxed);
-		s_categories[category].ns.fetch_add(ns, std::memory_order_relaxed);
+		s_categories[category].inclusive_ns.fetch_add(inclusive_ns, std::memory_order_relaxed);
+		s_categories[category].exclusive_ns.fetch_add(exclusive_ns, std::memory_order_relaxed);
 	}
 	static Snapshot Take() noexcept {
 		Snapshot snapshot;
 		for (uint32_t i = 0; i < CategoryCount; ++i) {
 			snapshot.categories[i] = {s_categories[i].calls.exchange(0, std::memory_order_relaxed),
-			                          s_categories[i].ns.exchange(0, std::memory_order_relaxed)};
+			                          s_categories[i].inclusive_ns.exchange(0, std::memory_order_relaxed),
+			                          s_categories[i].exclusive_ns.exchange(0, std::memory_order_relaxed)};
 		}
 		return snapshot;
 	}
@@ -119,15 +134,25 @@ public:
 	BudgetScope(BudgetProbe::Category category, bool active) noexcept
 	    : m_category(category), m_enabled(active && ProbeEnabled::Get()),
 	      m_begin(m_enabled ? std::chrono::steady_clock::now()
-	                        : std::chrono::steady_clock::time_point {}) {}
+	                        : std::chrono::steady_clock::time_point {}) {
+		if (m_enabled) {
+			// Save the enclosing scope's child accumulator and start a fresh one for this scope.
+			m_outer_nested_ns       = BudgetProbe::s_nested_ns;
+			BudgetProbe::s_nested_ns = 0;
+		}
+	}
 	~BudgetScope() {
 		if (!m_enabled) {
 			return;
 		}
 		const auto elapsed = std::chrono::steady_clock::now() - m_begin;
-		BudgetProbe::Add(m_category, static_cast<uint64_t>(
-		                                 std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed)
-		                                     .count()));
+		const auto inclusive = static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
+		const auto children  = BudgetProbe::s_nested_ns;
+		const auto exclusive = inclusive > children ? inclusive - children : 0;
+		BudgetProbe::Add(m_category, inclusive, exclusive);
+		// This scope's whole time is child time for the enclosing scope.
+		BudgetProbe::s_nested_ns = m_outer_nested_ns + inclusive;
 	}
 	BudgetScope(const BudgetScope&)            = delete;
 	BudgetScope& operator=(const BudgetScope&) = delete;
@@ -136,6 +161,7 @@ private:
 	BudgetProbe::Category                 m_category;
 	bool                                  m_enabled;
 	std::chrono::steady_clock::time_point m_begin;
+	uint64_t                              m_outer_nested_ns = 0;
 };
 
 // CPU time (user, system) of the calling thread and of the whole process, in milliseconds, read
