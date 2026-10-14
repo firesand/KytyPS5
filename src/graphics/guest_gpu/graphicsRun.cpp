@@ -10,6 +10,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/hostReadStats.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -1069,6 +1070,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 			// One begin/end pair per DB; bit 63 marks each counter ready.
 			constexpr uint64_t ready_bit = 1ull << 63u;
 			PrepareHostRead(reinterpret_cast<uint64_t>(address), 16u * 2u * sizeof(uint64_t));
+			HostReadScope host_read(HostReadProbe::Predication);
 			const auto* results = reinterpret_cast<const volatile uint64_t*>(address);
 			for (uint32_t db = 0; db < 16u; db++) {
 				const auto begin = results[db * 2u];
@@ -1089,7 +1091,10 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 			// The wait selector applies only to Z-pass query readiness.
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
 			PrepareHostRead(reinterpret_cast<uint64_t>(address), sizeof(uint64_t));
-			value = *reinterpret_cast<const volatile uint64_t*>(address);
+			{
+				HostReadScope host_read(HostReadProbe::Predication);
+				value = *reinterpret_cast<const volatile uint64_t*>(address);
+			}
 			break;
 		default: EXIT("unknown predication op: 0x%08" PRIx32 "\n", op);
 	}
@@ -1168,7 +1173,10 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	uint32_t draw_count = max_count_or_count;
 	if (count_addr != nullptr) {
 		PrepareHostRead(reinterpret_cast<uint64_t>(count_addr), sizeof(uint32_t));
-		draw_count = *count_addr;
+		{
+			HostReadScope host_read(HostReadProbe::DrawCount);
+			draw_count = *count_addr;
+		}
 		if (draw_count > max_count_or_count) {
 			draw_count = max_count_or_count;
 		}
@@ -1196,6 +1204,11 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	// becomes a runaway draw).
 	PrepareHostRead(m_draw_indirect_args_base_addr + data_offset,
 	                static_cast<uint64_t>(draw_count - 1) * stride_in_bytes + args_size);
+	{
+		HostReadScope host_read(HostReadProbe::DrawArgs);
+		HostReadProbe::Touch(m_draw_indirect_args_base_addr + data_offset,
+		                     static_cast<uint64_t>(draw_count - 1) * stride_in_bytes + args_size);
+	}
 
 	for (uint32_t i = 0; i < draw_count; i++) {
 		const auto args_addr = m_draw_indirect_args_base_addr + data_offset +
@@ -1281,7 +1294,14 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 		// Host-side read of GPU-built dispatch arguments (audit 2026-10-12).
 		PrepareHostRead(args_addr, sizeof(vk::DispatchIndirectCommand));
 		const auto* args = reinterpret_cast<const vk::DispatchIndirectCommand*>(args_addr);
-		DispatchDirect(args->x, args->y, args->z, mode);
+		uint32_t    x = 0, y = 0, z = 0;
+		{
+			HostReadScope host_read(HostReadProbe::DispatchArgs);
+			x = args->x;
+			y = args->y;
+			z = args->z;
+		}
+		DispatchDirect(x, y, z, mode);
 		return;
 	}
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));

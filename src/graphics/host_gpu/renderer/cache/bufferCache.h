@@ -151,6 +151,7 @@ public:
 		uint64_t obtain_calls = 0, obtain_bytes = 0, obtain_pages = 0;
 		uint64_t range_calls = 0, range_bytes = 0, range_pages = 0;
 		uint64_t download_calls = 0, download_wait_ns = 0, read_memory_calls = 0;
+		uint64_t copy_batches = 0; // SynchronizeBuffer calls that recorded a staging copy (one barrier pair each)
 		uint64_t bar_readbacks = 0;
 		uint64_t host_joins = 0; // replaced buffers copied on the host (complete)
 		uint64_t gpu_joins  = 0; // replaced buffers copied on the GPU (in flight)

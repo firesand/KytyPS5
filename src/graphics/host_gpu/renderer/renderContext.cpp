@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include "graphics/host_gpu/hostReadStats.h"
+
 #include <cstdlib>
 #include <fmt/format.h>
 #include <vector>
@@ -84,7 +86,8 @@ struct FaultSampler {
 	}
 	template <typename Describe>
 	void Dump(Describe&& describe, const BufferCache::SyncStats& sync,
-	          std::pair<uint64_t, uint64_t> protects, HotPageStats hot) {
+	          std::pair<uint64_t, uint64_t> protects, HotPageStats hot,
+	          const HostReadProbe::Snapshot& host_reads, SyncProbe::Snapshot syncs) {
 		if (!enabled) return;
 		static uint64_t last_total = 0;
 		static int      calls      = 0;
@@ -93,6 +96,8 @@ struct FaultSampler {
 		static BufferCache::SyncStats         sync_sum {};
 		static std::pair<uint64_t, uint64_t>  protect_sum {};
 		static HotPageStats                   hot_sum {};
+		static HostReadProbe::Snapshot        reads_sum {};
+		static SyncProbe::Snapshot            syncs_sum {};
 		sync_sum.obtain_calls += sync.obtain_calls;
 		sync_sum.obtain_bytes += sync.obtain_bytes;
 		sync_sum.obtain_pages += sync.obtain_pages;
@@ -102,16 +107,25 @@ struct FaultSampler {
 		sync_sum.download_calls += sync.download_calls;
 		sync_sum.download_wait_ns += sync.download_wait_ns;
 		sync_sum.read_memory_calls += sync.read_memory_calls;
+		sync_sum.copy_batches += sync.copy_batches;
 		protect_sum.first += protects.first;
 		protect_sum.second += protects.second;
 		hot_sum.hashed += hot.hashed;
 		hot_sum.skipped += hot.skipped;
 		hot_sum.demoted += hot.demoted;
 		hot_sum.invalidated += hot.invalidated;
+		for (size_t i = 0; i < host_reads.sites.size(); ++i) {
+			reads_sum.sites[i].first += host_reads.sites[i].first;
+			reads_sum.sites[i].second += host_reads.sites[i].second;
+		}
+		syncs_sum.calls += syncs.calls;
+		syncs_sum.regions += syncs.regions;
 		if (++calls % 64 != 0) return;
 		const auto sync_all = std::exchange(sync_sum, {});
 		const auto protects_all = std::exchange(protect_sum, {});
 		const auto hot_all = std::exchange(hot_sum, {});
+		const auto reads_all = std::exchange(reads_sum, {});
+		const auto syncs_all = std::exchange(syncs_sum, {});
 		const auto now = total.load(std::memory_order_relaxed);
 		std::unordered_map<uint64_t, uint32_t> pages;
 		uint32_t sampled = 0;
@@ -148,6 +162,17 @@ struct FaultSampler {
 		line += fmt::format(" | protect {} calls {} KiB | hot hashed {} skipped {} demoted {} rehash-miss {}",
 		                    protects_all.first, protects_all.second >> 10, hot_all.hashed,
 		                    hot_all.skipped, hot_all.demoted, hot_all.invalidated);
+		const auto& rs = reads_all.sites;
+		line += fmt::format(" | cpu-sync {} calls {} regions {} copy-batches | cp reads: args {} ({} ms)"
+		                    " count {} ({} ms) dispatch {} ({} ms) pred {} ({} ms)",
+		                    syncs_all.calls, syncs_all.regions, sync_all.copy_batches,
+		                    rs[HostReadProbe::DrawArgs].first,
+		                    rs[HostReadProbe::DrawArgs].second / 1000000,
+		                    rs[HostReadProbe::DrawCount].first, rs[HostReadProbe::DrawCount].second / 1000000,
+		                    rs[HostReadProbe::DispatchArgs].first,
+		                    rs[HostReadProbe::DispatchArgs].second / 1000000,
+		                    rs[HostReadProbe::Predication].first,
+		                    rs[HostReadProbe::Predication].second / 1000000);
 		LOGF("%s\n", line.c_str());
 		last_total = now;
 	}
@@ -247,6 +272,7 @@ void RenderContext::SyncCpuWrites() {
 		}
 		m_bda_synced_epoch = m_bda_sync_epoch;
 	}
+	SyncProbe::NoteCall();
 	// KYTY_BDA_SYNC_ALL=1 restores the walk over every cached buffer.
 	static const bool sync_all = [] {
 		const char* value = std::getenv("KYTY_BDA_SYNC_ALL");
@@ -255,12 +281,14 @@ void RenderContext::SyncCpuWrites() {
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	if (sync_all) {
 		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
+			SyncProbe::NoteRegion();
 			m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
 		});
 	} else {
 		// Only regions with new CPU-dirty pages (and regions holding hot pages), clipped to mapped
 		// memory: cached buffers can extend past the mapping and unmapped pages must not be read.
 		m_buffer_cache.ForEachBdaSyncPendingRegion([this](uint64_t vaddr, uint64_t size) {
+			SyncProbe::NoteRegion();
 			m_mapped_ranges.ForEachInRange(vaddr, size, [this](uint64_t start, uint64_t end) {
 				m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
 			});
@@ -276,7 +304,7 @@ void RenderContext::RunGarbageCollector() {
 		    return text;
 	    },
 	    m_buffer_cache.TakeSyncStats(), PageManager::TakeProtectStats(),
-	    MemoryTracker::TakeHotStats());
+	    MemoryTracker::TakeHotStats(), HostReadProbe::Take(), SyncProbe::Take());
 	m_buffer_cache.FlushWriteFaults(false);
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;

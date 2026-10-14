@@ -566,6 +566,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	m_last_upload_bytes = total_size;
 	m_last_upload_pages = copies.size();
 	if (source) {
+		m_sync_stats.copy_batches++;
 		buffer.last_gpu_write_tick = m_scheduler.CurrentTick(); // the staging copy below
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
