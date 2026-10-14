@@ -129,6 +129,27 @@ public:
 		return threshold;
 	}
 	[[nodiscard]] bool HasHotPages() const { return m_has_hot.load(std::memory_order_relaxed); }
+	// Pages a CPU-write synchronization has to examine in [vaddr, vaddr + size): CPU-dirty pages
+	// (new writes; hot pages stay CPU-dirty) and, for safety, the hot set. The bits are copied under
+	// the region lock and emitted as runs after it is released, so the caller can synchronize the
+	// owning buffers (which take this lock again) without nesting.
+	template <typename Func>
+	void ForEachSyncCandidateRun(uint64_t vaddr, uint64_t size, Func&& func) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		RegionBits candidates;
+		{
+			std::scoped_lock guard(lock);
+			candidates = RegionBits(m_cpu_dirty, start, end);
+			if (HasHotPages()) {
+				for (const auto [first, last]: RegionBits(m_hot, start, end)) {
+					candidates.SetRange(first, last);
+				}
+			}
+		}
+		for (const auto [first, last]: candidates) {
+			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
+		}
+	}
 
 	// Write-fault window: extends [vaddr, vaddr + size) forward over pages that are neither
 	// CPU- nor GPU-dirty, up to `ahead` pages from the faulting page, so one fault unprotects the

@@ -1061,6 +1061,60 @@ void BufferCache::ProcessFaultBuffer() {
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
+	// Page-driven (default): the tracker lists the CPU-dirty and hot page runs of the range and only
+	// their owning buffers are synchronized. The historical loop visited every cached buffer in the
+	// range: in the first mission that was ~29,000 buffer visits per sync, 13 syncs per second, for
+	// ~2,200 non-empty uploads (Codex perf-sync-30 counters; ng-68 profile: tree walk + slot lookups
+	// ~8.5% of CPU). KYTY_SYNC_PAGE_DRIVEN=0 restores the buffer walk for A/B.
+	static const bool page_driven = [] {
+		const char* value = std::getenv("KYTY_SYNC_PAGE_DRIVEN");
+		const bool  on    = value == nullptr || value[0] != '0';
+		LOGF("BufferCache: %s range synchronization\n", on ? "page-driven" : "buffer-walk");
+		return on;
+	}();
+	if (page_driven) {
+		m_sync_candidates.clear();
+		m_memory_tracker.ForEachSyncCandidateRun(
+		    vaddr, size, [this](uint64_t address, uint64_t bytes) noexcept {
+			    m_sync_candidates.emplace_back(address, bytes);
+		    });
+		// One synchronization per owning buffer: the hull of its candidate runs. ForEachUploadRange
+		// only emits the dirty/hot pages inside it, so the hull costs a bit-scan, not uploads.
+		m_sync_owners.clear();
+		for (const auto [run_address, run_size]: m_sync_candidates) {
+			uint64_t       cursor  = run_address;
+			const uint64_t run_end = run_address + run_size;
+			while (cursor < run_end) {
+				const auto* owner = m_page_table.Find(cursor >> PageTable::kPageBits);
+				if (owner == nullptr || !*owner) {
+					cursor = Common::AlignDown(cursor, CACHING_PAGESIZE) + CACHING_PAGESIZE;
+					continue;
+				}
+				auto&      buffer = m_slot_buffers[*owner];
+				const auto start  = std::max(buffer.CpuAddress(), cursor);
+				const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), run_end);
+				if (start < finish) {
+					auto found = m_sync_owners.find(owner->index);
+					if (found == m_sync_owners.end()) {
+						m_sync_owners.emplace(owner->index, SyncOwner {*owner, start, finish});
+					} else {
+						found->second.start  = std::min(found->second.start, start);
+						found->second.finish = std::max(found->second.finish, finish);
+					}
+				}
+				cursor = std::max(buffer.CpuAddress() + buffer.Size(),
+				                  Common::AlignDown(cursor, CACHING_PAGESIZE) + CACHING_PAGESIZE);
+			}
+		}
+		for (const auto& [index, hull]: m_sync_owners) {
+			auto& buffer = m_slot_buffers[hull.id];
+			(void)SynchronizeBuffer(buffer, hull.start, hull.finish - hull.start, false, false);
+			m_sync_stats.range_calls++;
+			m_sync_stats.range_bytes += m_last_upload_bytes;
+			m_sync_stats.range_pages += m_last_upload_pages;
+		}
+		return;
+	}
 	const auto end = vaddr + size;
 	auto       it  = m_buffers.upper_bound(vaddr);
 	if (it != m_buffers.begin()) {

@@ -130,6 +130,15 @@ public:
 	void ValidateGpuDirtyOwnership(const RangeSet&, uint64_t, uint64_t, const char*) {}
 #endif
 
+	// Runs of pages a CPU-write synchronization must examine (see RegionManager). GPU thread.
+	template <typename Func>
+	void ForEachSyncCandidateRun(uint64_t vaddr, uint64_t size, Func&& func) {
+		CheckNotInUploadCallback();
+		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			manager->ForEachSyncCandidateRun(manager->GetCpuAddr() + offset, bytes, func);
+		});
+	}
+
 	template <bool clear, typename Func>
 	void ForEachDownloadRange(uint64_t vaddr, uint64_t size, Func&& func) {
 		static_assert(std::is_nothrow_invocable_v<Func&, uint64_t, uint64_t>);

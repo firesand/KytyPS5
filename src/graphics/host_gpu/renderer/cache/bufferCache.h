@@ -221,6 +221,15 @@ private:
 	Buffer                                            m_gds_buffer;
 	Buffer                                            m_bda_pagetable_buffer;
 	Common::SlotVector<Buffer>                        m_slot_buffers;
+	// Scratch for page-driven range synchronization (GPU thread): candidate page runs and the
+	// per-buffer hull of the runs it owns.
+	std::vector<std::pair<uint64_t, uint64_t>>                     m_sync_candidates;
+	struct SyncOwner {
+		BufferId id;
+		uint64_t start  = 0;
+		uint64_t finish = 0;
+	};
+	std::unordered_map<uint32_t, SyncOwner>                        m_sync_owners; // keyed by slot index
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
