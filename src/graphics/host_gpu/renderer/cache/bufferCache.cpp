@@ -344,27 +344,38 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
-		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
-		// Publish completed unbounded GPU writes to the texture cache first, so an image they
-		// overwrote is no longer GPU-authoritative when the sync asks (review 2026-10-14, C3/C5).
-		PrepareHostRead(vaddr, size);
-		PublishPendingTextureInvalidations();
-		// An enrolled image over these pages holds newer pixels than the buffer: record its download
-		// first and publish the whole image, so one fault serves the game's whole read.
 		uint64_t publish_vaddr = vaddr;
 		uint64_t publish_size  = size;
-		if (m_texture_cache.SyncGpuImagesForHostRead(buffer, publish_vaddr, publish_size,
-		                                             /*record=*/false)) {
-			// The hull can reach pages other unbounded writes touched: publish those as well.
+		const auto current_buffer = [&]() -> Buffer& {
+			return m_slot_buffers[FindBuffer(publish_vaddr, publish_size)];
+		};
+		bool sync_images = false;
+		for (;;) {
+			// Publishing an unbounded write can preserve an overlapping image, extend its
+			// buffer, and retire the previous owner. Resolve only after those mutations.
 			PrepareHostRead(publish_vaddr, publish_size);
 			PublishPendingTextureInvalidations();
-			if (m_texture_cache.SyncGpuImagesForHostRead(buffer, publish_vaddr, publish_size,
-			                                             /*record=*/true)) {
-				// The copy is in flight in this tick: keep TryBarReadback off the host-visible path.
-				NoteGpuWrite(publish_vaddr, publish_size, m_scheduler.CurrentTick());
+			uint64_t expanded_vaddr = publish_vaddr;
+			uint64_t expanded_size  = publish_size;
+			sync_images = m_texture_cache.SyncGpuImagesForHostRead(
+			    current_buffer(), expanded_vaddr, expanded_size, /*record=*/false);
+			if (!sync_images ||
+			    (expanded_vaddr == publish_vaddr && expanded_size == publish_size)) {
+				break;
 			}
+			// A page-sharing image widened the publication hull. Drain writes over the full
+			// new range before selecting its authoritative images, then reacquire its owner.
+			publish_vaddr = expanded_vaddr;
+			publish_size  = expanded_size;
 		}
-		if (DownloadBufferMemory<false>(buffer, publish_vaddr, publish_size)) {
+		if (sync_images && m_texture_cache.SyncGpuImagesForHostRead(
+			                   current_buffer(), publish_vaddr, publish_size, /*record=*/true)) {
+			// The copy is in flight in this tick: keep TryBarReadback off the host-visible path.
+			NoteGpuWrite(publish_vaddr, publish_size, m_scheduler.CurrentTick());
+		}
+		// Image-copy preparation may wait for stream space. Do not carry a cached Buffer
+		// reference across it; download from the current owner of the complete hull.
+		if (DownloadBufferMemory<false>(current_buffer(), publish_vaddr, publish_size)) {
 			m_memory_tracker.UnmarkRegionAsGpuModified(publish_vaddr, publish_size);
 		}
 		if (is_write) {

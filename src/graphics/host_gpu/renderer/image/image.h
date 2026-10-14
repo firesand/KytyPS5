@@ -73,6 +73,7 @@ public:
 	void InvalidateCpuWrite(uint64_t vaddr, uint64_t size) {
 		if (ImageRangeOverlaps(info.data.address, info.data.size, vaddr, size)) {
 			m_cpu_dirty        = true;
+			cpu_readback_pending = false;
 			m_maybe_cpu_dirty  = false;
 			m_maybe_hash_valid = false;
 		} else if (ImagePageRangesOverlap(info.data.address, info.data.size, vaddr, size)) {
@@ -105,6 +106,9 @@ public:
 		m_maybe_cpu_dirty  = false;
 		m_maybe_hash_valid = false;
 		m_cpu_dirty |= hash != m_maybe_cpu_hash;
+		if (m_cpu_dirty) {
+			cpu_readback_pending = false;
+		}
 		return m_cpu_dirty;
 	}
 
@@ -119,10 +123,17 @@ public:
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
 	void               MarkGpuModified() noexcept { m_gpu_modified = true; }
-	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
+	void ClearGpuModified() noexcept {
+		m_gpu_modified = false;
+		cpu_readback_pending = false;
+	}
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
-	void               MarkBufferModified() noexcept { m_buffer_modified = true; }
+	void MarkBufferModified() noexcept {
+		m_buffer_modified = true;
+		// Buffer contents supersede these pixels; a host read must use the buffer owner.
+		cpu_readback_pending = false;
+	}
 	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
 
 	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size,

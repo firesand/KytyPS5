@@ -2362,7 +2362,7 @@ void TextureCache::EnrollCpuReadback(ImageId id, Image& image, bool require_gpu_
 	// Once per command stream, unless a host access already published (and unprotected) the range.
 	// Tracker-only query: BufferCache::IsRegionGpuModified flushes write faults into this cache's lock.
 	const auto tick = m_scheduler.CurrentTick();
-	if (image.cpu_readback_tick == tick &&
+	if (image.cpu_readback_pending && image.cpu_readback_tick == tick &&
 	    m_buffer_cache.IsLabelRegionGpuModified(range.address, range.size)) {
 		return;
 	}
@@ -2727,6 +2727,12 @@ void TextureCache::RunGarbageCollector() {
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
 		// first.
 		m_lru_cache.ForEachItemBelow(tick - age, [&](ImageId id) {
+			// Pending images must survive until publication, but must not exhaust the batch
+			// before later obsolete images can be considered for retirement.
+			const auto* owner = m_slot_images.try_get(id);
+			if (owner != nullptr && owner->cpu_readback_pending) {
+				return false;
+			}
 			candidates.push_back(id);
 			return candidates.size() == deletions;
 		});

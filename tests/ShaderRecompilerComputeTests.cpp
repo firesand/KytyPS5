@@ -9371,6 +9371,262 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // Independent selectors keep a retirement failure from hiding a stale native-owner failure.
+  void CheckImageReadbackOwnership(uint32_t scenario) {
+    const bool pending_join = scenario == 0;
+    const bool pending_gc_prefix = scenario == 2;
+    const bool reenroll_only = scenario == 3;
+    const char *name = pending_join ? "ImageReadbackPendingJoin"
+                       : pending_gc_prefix ? "ImageReadbackGcBudget"
+                       : reenroll_only ? "ImageReadbackReenroll"
+                                       : "ImageReadbackSuperseded";
+    constexpr uintptr_t base = 0x0000000206800000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t alignment = 0x10000;
+    constexpr uint64_t image_address = base + 0x10000;
+    constexpr uint64_t image_size = 0x4000; // 64x64 R32Uint, including the aligned pitch
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                alignment, 0, &direct_offset) == 0,
+            "readback ownership allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "readback ownership mapping failed");
+    std::memset(mapped, 0xa5, allocation_size);
+    {
+      LibKernel::Memory::InstallGpuResources(&context);
+      context.MapMemory(base, allocation_size);
+      auto &textures = context.GetTextureCache();
+      auto &buffers = context.GetBufferCache();
+      const auto MakeStorage = [&](uint64_t address) {
+        auto desc = MakeLinearDesc(address, image_size, vk::Format::eR32Uint,
+            Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+            {64, 64, 1}, 1, 4, 1);
+        desc.type = TextureCache::BindingType::Storage;
+        desc.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+        return desc;
+      };
+      const auto Paint = [&](ImageId image, uint32_t value) {
+        vk::ClearValue clear{};
+        clear.color.uint32 = std::array{value, 0u, 0u, 0u};
+        TextureCacheTestAccess::ClearImage(textures, scheduler.Current(), image,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+      };
+      const auto CheckHost = [&](uint64_t address, uint32_t value,
+                                 bool expect_whole_image = true) {
+        const auto *words = reinterpret_cast<volatile const uint32_t *>(address);
+        const uint32_t first = words[37]; // real host fault, not a direct ReadMemory call
+        const bool head_readable = HostMemoryIsReadable(address);
+        const bool tail_readable = HostMemoryIsReadable(address + image_size - 1);
+        std::printf("[gpu]     %s: host address=0x%llx first=0x%08x expected=0x%08x "
+                    "head_readable=%d tail_readable=%d whole_image=%d\n", name,
+                    static_cast<unsigned long long>(address), first, value,
+                    head_readable, tail_readable, expect_whole_image);
+        Require(name, "host publication", first == value && head_readable &&
+                    (!expect_whole_image || tail_readable),
+                "host fault returned stale bytes or failed the image publication boundary");
+        // An enrolled image publishes its full extent in one fault. Once a buffer supersedes it,
+        // ordinary buffer readback is page-sized; subsequent volatile loads may fault other pages.
+        size_t mismatches = 0;
+        for (size_t index = 0; index < image_size / sizeof(uint32_t); ++index) {
+          mismatches += words[index] != value;
+        }
+        Require(name, "host pixels", mismatches == 0,
+                "published image contains stale native or guest pixels");
+      };
+      if (pending_join) {
+        // I is a GPU-written sampled image, not an enrolled storage target. Its initial upload
+        // uses staging, so no full-I buffer exists. B starts halfway through I and also holds E.
+        // Publishing a completed unbounded write inside I must preserve I and join B leftward.
+        constexpr uint64_t source_size = 0x20000;
+        constexpr uint64_t buffer_address = image_address + 0x10000;
+        constexpr uint64_t buffer_size = 0x30000;
+        constexpr uint64_t enrolled_address = image_address + 0x30000;
+        constexpr uint32_t source_value = 0x13579bdfu;
+        constexpr uint32_t written_value = 0x2468ace0u;
+        constexpr uint32_t enrolled_value = 0xc001d00du;
+        auto source_desc = MakeLinearDesc(image_address, source_size, vk::Format::eR32Uint,
+            Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+            {64, 512, 1}, 1, 4, 1);
+        const auto source = textures.FindImage(source_desc);
+        Require(name, "source image", bool(source), "failed to register the preservation source");
+        (void)textures.FindTexture(source, source_desc);
+        Paint(source, source_value);
+        textures.MarkGpuWritten(source);
+        Require(name, "staged source without enrolled buffer",
+                textures.GetImage(source).SafeToDownload() &&
+                    !textures.GetImage(source).cpu_readback_pending &&
+                    !BufferCacheTestAccess::PageOwner(buffers, image_address),
+                "source setup unexpectedly enrolled or cached the full image");
+        const auto [initial_buffer, initial_offset] =
+            buffers.ObtainBuffer(buffer_address, buffer_size, false, false);
+        Require(name, "partial buffer", initial_buffer != nullptr && initial_offset == 0 &&
+                    initial_buffer->CpuAddress() == buffer_address &&
+                    initial_buffer->Size() == buffer_size,
+                "the initial buffer does not start inside the preservation source");
+        const auto initial_owner = BufferCacheTestAccess::PageOwner(buffers, buffer_address);
+        auto enrolled_desc = MakeStorage(enrolled_address);
+        const auto enrolled = textures.FindImage(enrolled_desc);
+        Require(name, "enrolled image", bool(enrolled), "failed to register the CPU-read image");
+        (void)textures.FindTexture(enrolled, enrolled_desc);
+        Paint(enrolled, enrolled_value);
+        Require(name, "enrollment keeps partial owner",
+                BufferCacheTestAccess::PageOwner(buffers, enrolled_address) == initial_owner &&
+                    !HostMemoryIsReadable(enrolled_address),
+                "enrollment joined the buffer before the pending-publication test");
+        // The native store deliberately bypasses immediate texture invalidation, as an unbounded
+        // shader store does. MarkPageWritten is the production completed-fault callback: it queues
+        // the page for publication; no command-boundary helper drains that queue before the read.
+        initial_buffer->Fill(initial_buffer->Offset(buffer_address),
+                             BufferCache::WRITE_FAULT_PAGESIZE, written_value);
+        scheduler.FlushAndWait();
+        buffers.NoteUnboundedWrite(buffer_address, BufferCache::WRITE_FAULT_PAGESIZE);
+        buffers.MarkPageWritten(buffer_address);
+        Require(name, "completed write awaits publication",
+                buffers.IsLabelRegionGpuModified(buffer_address,
+                                                  BufferCache::WRITE_FAULT_PAGESIZE) &&
+                    textures.GetImage(source).IsGpuModified() &&
+                    BufferCacheTestAccess::PageOwner(buffers, enrolled_address) == initial_owner,
+                "pending write was lost or its image invalidation ran before the host fault");
+        CheckHost(enrolled_address, enrolled_value);
+        const auto current_owner = BufferCacheTestAccess::PageOwner(buffers, enrolled_address);
+        Require(name, "pending invalidation forced join", current_owner &&
+                    current_owner != initial_owner &&
+                    buffers.GetBuffer(current_owner).CpuAddress() == image_address,
+                "the production pending publication did not replace the held buffer");
+        // The old implementation can return correct host pixels after copying into retired B.
+        // Read the CURRENT owner's native bytes directly, without ObtainBuffer/CPU synchronization.
+        auto &current = buffers.GetBuffer(current_owner);
+        auto native = CreateHostBuffer(name, image_size + 8,
+            vk::BufferUsageFlagBits::eTransferDst, {});
+        vk::BufferMemoryBarrier before{};
+        before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+        before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+        before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        before.buffer = current.Handle();
+        before.size = current.Size();
+        scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+            vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0, nullptr);
+        const std::array copies{
+            vk::BufferCopy{current.Offset(enrolled_address), 0, image_size},
+            vk::BufferCopy{current.Offset(image_address), image_size, 4},
+            vk::BufferCopy{current.Offset(buffer_address), image_size + 4, 4}};
+        scheduler.Current().Handle().copyBuffer(current.Handle(), native.buffer,
+                                                copies.size(), copies.data());
+        auto after = before;
+        after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        after.buffer = native.buffer;
+        after.size = native.size;
+        scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+            vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &after, 0, nullptr);
+        scheduler.FlushAndWait();
+        const auto native_words = ReadBuffer(name, native, (image_size + 8) / 4);
+        DestroyBuffer(&native);
+        const auto bad = std::count_if(native_words.begin(), native_words.end() - 2,
+                                      [&](uint32_t value) { return value != enrolled_value; });
+        std::printf("[gpu]     %s: current-owner stale words=%zu, first=0x%08x, "
+                    "preserved=0x%08x, written=0x%08x\n", name, size_t(bad), native_words[0],
+                    native_words[native_words.size() - 2], native_words.back());
+        Require(name, "current native owner holds published image", bad == 0,
+                "readback updated a retired buffer while the current cached owner kept stale pixels");
+        Require(name, "preservation excludes completed writes",
+                native_words[native_words.size() - 2] == source_value &&
+                    native_words.back() == written_value,
+                "pending preservation lost untouched image pixels or overwrote the completed store");
+      } else {
+        auto desc = MakeStorage(image_address);
+        if (pending_gc_prefix) {
+          // This target was never enrolled. Its eligibility is independent of cancellation;
+          // only the ten older, genuinely pending sources can block it in this selector.
+          desc.type = TextureCache::BindingType::Texture;
+          desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+        }
+        const auto image = textures.FindImage(desc);
+        Require(name, "image", bool(image), "failed to register the image");
+        (void)textures.FindTexture(image, desc);
+        Paint(image, 0x11112222u);
+        if (reenroll_only) {
+          const auto tick = scheduler.CurrentTick();
+          buffers.FillBuffer(image_address, image_size, 0x33334444u, false);
+          Require(name, "buffer supersedes image",
+                  textures.GetImage(image).IsBufferModified() &&
+                      !textures.GetImage(image).IsGpuModified() &&
+                      scheduler.CurrentTick() == tick &&
+                      buffers.IsLabelRegionGpuModified(image_address, image_size),
+                  "exact GPU fill did not supersede the enrolled image in the same tick");
+          (void)textures.FindTexture(image, desc);
+          Paint(image, 0x55556666u);
+          Require(name, "same-tick re-enrollment", scheduler.CurrentTick() == tick &&
+                      textures.GetImage(image).cpu_readback_pending,
+                  "a superseded image's new write was not enrolled in the same tick");
+          CheckHost(image_address, 0x55556666u);
+        } else {
+          Require(name, "initial enrollment state",
+                  textures.GetImage(image).cpu_readback_pending == !pending_gc_prefix,
+                  "the retirement and GC-budget cases do not have distinct initial eligibility");
+          buffers.FillBuffer(image_address, image_size, 0x9999aaaau, false);
+          Require(name, "buffer replacement",
+                  !textures.GetImage(image).IsGpuModified() &&
+                      textures.GetImage(image).IsBufferModified() &&
+                      !HostMemoryIsReadable(image_address),
+                  "full GPU overwrite did not supersede the image with protected buffer data");
+          CheckHost(image_address, 0x9999aaaau, /*expect_whole_image=*/false);
+          std::vector<ImageId> oldest;
+          if (pending_gc_prefix) {
+            for (uint32_t index = 0; index < 10; ++index) {
+              auto pending_desc = MakeStorage(base + 0x80000 + index * 0x10000);
+              const auto pending = textures.FindImage(pending_desc);
+              Require(name, "pending GC source", bool(pending), "failed to create a pending source");
+              (void)textures.FindTexture(pending, pending_desc);
+              Paint(pending, 0xb0000000u + index);
+              Require(name, "live pending source", textures.GetImage(pending).cpu_readback_pending &&
+                          textures.GetImage(pending).SafeToDownload(),
+                      "GC prefix does not contain a genuinely pending image");
+              oldest.push_back(pending);
+            }
+          }
+          oldest.push_back(image);
+          // Normal collection considers ten candidates. Ten protected old sources must not starve
+          // the eleventh obsolete image; all retained sources still owe real pixels to CPU readers.
+          TextureCacheTestAccess::ConfigureGarbageCollection(textures, oldest, 81, UINT64_MAX);
+          textures.RunGarbageCollector();
+          Require(name, "superseded image retires", !TextureCacheTestAccess::Contains(textures, image),
+                  "an image superseded by a full buffer overwrite remained pinned in texture GC");
+          for (size_t index = 0; index + 1 < oldest.size(); ++index) {
+            const auto pending = oldest[index];
+            Require(name, "live pending image survives", TextureCacheTestAccess::Contains(textures, pending),
+                    "GC discarded pixels still owed to a host reader");
+            CheckHost(base + 0x80000 + index * 0x10000, 0xb0000000u + uint32_t(index));
+          }
+          CheckHost(image_address, 0x9999aaaau, /*expect_whole_image=*/false);
+        }
+      }
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap", LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "readback ownership unmap failed");
+    Require(name, "release", LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "readback ownership release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckBgra16Readback() {
     constexpr const char *name = "Bgra16Readback";
     constexpr uintptr_t base = 0x0000000204000000ull;
@@ -45033,6 +45289,17 @@ int main(int argc, char **argv) {
     vulkan.CheckRasterization(false);
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k11_11_10Float);
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);
+    return 0;
+  }
+  if (argc == 2 && (std::strcmp(argv[1], "--image-readback-pending-join-only") == 0 ||
+                    std::strcmp(argv[1], "--image-readback-superseded-only") == 0 ||
+                    std::strcmp(argv[1], "--image-readback-gc-budget-only") == 0 ||
+                    std::strcmp(argv[1], "--image-readback-reenroll-only") == 0)) {
+    const uint32_t scenario = std::strcmp(argv[1], "--image-readback-pending-join-only") == 0 ? 0
+        : std::strcmp(argv[1], "--image-readback-superseded-only") == 0 ? 1
+        : std::strcmp(argv[1], "--image-readback-gc-budget-only") == 0 ? 2 : 3;
+    VulkanHarness vulkan;
+    vulkan.CheckImageReadbackOwnership(scenario);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--htile-clear-only") == 0) {
