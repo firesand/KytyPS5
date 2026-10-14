@@ -2,6 +2,8 @@
 
 #include "common/alignment.h"
 #include "common/virtualMemory.h"
+#include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/hostReadStats.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "kernel/memory.h"
 
@@ -316,6 +318,7 @@ template void PageManager::UpdatePageWatchers<false>(uint64_t, uint64_t);
 
 template <bool track, bool is_read>
 void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask) {
+	BudgetScope budget(BudgetProbe::Protect, GuestGpu::IsGpuThread());
 	if (base_addr % REGION_SIZE != 0 || base_addr >= ADDRESS_SIZE ||
 	    REGION_SIZE > ADDRESS_SIZE - base_addr) {
 		Fatal("invalid tracking region base 0x%016" PRIx64, base_addr);

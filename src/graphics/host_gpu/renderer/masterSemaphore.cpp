@@ -2,6 +2,8 @@
 
 #include "common/assert.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/hostReadStats.h"
 #include "graphics/host_gpu/renderer/gpuDiagnostics.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -57,6 +59,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	if (IsFree(tick)) {
 		return;
 	}
+	BudgetScope budget(BudgetProbe::Wait, GuestGpu::IsGpuThread());
 	Refresh();
 	if (IsFree(tick)) {
 		return;

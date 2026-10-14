@@ -2,7 +2,10 @@
 
 #include "graphics/host_gpu/hostReadStats.h"
 
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <unistd.h>
 #include <fmt/format.h>
 #include <vector>
 #include <string>
@@ -66,6 +69,32 @@ VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 
 // KYTY_PROBE_FAULT_HISTOGRAM=1: lock-free sample of CPU page faults handled by the caches, dumped
 // as a per-MiB histogram from RunGarbageCollector (signal-handler safe: no allocation, no locks).
+CpuTimes CpuTimes::Read() noexcept {
+	CpuTimes   times;
+	const auto read = [](const char* path, uint64_t& user_ms, uint64_t& sys_ms) {
+		FILE* file = std::fopen(path, "r");
+		if (file == nullptr) return;
+		char   buffer[1024];
+		size_t length = std::fread(buffer, 1, sizeof(buffer) - 1, file);
+		std::fclose(file);
+		buffer[length] = 0;
+		// Fields after the parenthesised comm: state(3) ... utime(14) stime(15).
+		const char* close = std::strrchr(buffer, ')');
+		if (close == nullptr) return;
+		unsigned long utime = 0, stime = 0;
+		if (std::sscanf(close + 1, " %*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu", &utime,
+		                &stime) != 2) {
+			return;
+		}
+		static const long ticks = sysconf(_SC_CLK_TCK);
+		user_ms = ticks > 0 ? utime * 1000ull / static_cast<unsigned long>(ticks) : 0;
+		sys_ms  = ticks > 0 ? stime * 1000ull / static_cast<unsigned long>(ticks) : 0;
+	};
+	read("/proc/thread-self/stat", times.thread_user_ms, times.thread_sys_ms);
+	read("/proc/self/stat", times.process_user_ms, times.process_sys_ms);
+	return times;
+}
+
 namespace {
 struct FaultSampler {
 	static constexpr size_t   Slots = 1u << 16;
@@ -87,7 +116,8 @@ struct FaultSampler {
 	template <typename Describe>
 	void Dump(Describe&& describe, const BufferCache::SyncStats& sync,
 	          std::pair<uint64_t, uint64_t> protects, HotPageStats hot,
-	          const HostReadProbe::Snapshot& host_reads, SyncProbe::Snapshot syncs) {
+	          const HostReadProbe::Snapshot& host_reads, SyncProbe::Snapshot syncs,
+	          const BudgetProbe::Snapshot& budget) {
 		if (!enabled) return;
 		static uint64_t last_total = 0;
 		static int      calls      = 0;
@@ -98,6 +128,9 @@ struct FaultSampler {
 		static HotPageStats                   hot_sum {};
 		static HostReadProbe::Snapshot        reads_sum {};
 		static SyncProbe::Snapshot            syncs_sum {};
+		static BudgetProbe::Snapshot          budget_sum {};
+		static CpuTimes                       last_cpu = CpuTimes::Read();
+		static auto                           last_wall = std::chrono::steady_clock::now();
 		sync_sum.obtain_calls += sync.obtain_calls;
 		sync_sum.obtain_bytes += sync.obtain_bytes;
 		sync_sum.obtain_pages += sync.obtain_pages;
@@ -121,12 +154,27 @@ struct FaultSampler {
 		}
 		syncs_sum.calls += syncs.calls;
 		syncs_sum.regions += syncs.regions;
+		for (size_t i = 0; i < budget.categories.size(); ++i) {
+			budget_sum.categories[i].first += budget.categories[i].first;
+			budget_sum.categories[i].second += budget.categories[i].second;
+		}
 		if (++calls % 64 != 0) return;
 		const auto sync_all = std::exchange(sync_sum, {});
 		const auto protects_all = std::exchange(protect_sum, {});
 		const auto hot_all = std::exchange(hot_sum, {});
 		const auto reads_all = std::exchange(reads_sum, {});
 		const auto syncs_all = std::exchange(syncs_sum, {});
+		const auto budget_all = std::exchange(budget_sum, {});
+		const auto cpu_now    = CpuTimes::Read();
+		const auto wall_now   = std::chrono::steady_clock::now();
+		const auto wall_ms    = static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::milliseconds>(wall_now - last_wall).count());
+		const CpuTimes cpu_delta {cpu_now.thread_user_ms - last_cpu.thread_user_ms,
+		                          cpu_now.thread_sys_ms - last_cpu.thread_sys_ms,
+		                          cpu_now.process_user_ms - last_cpu.process_user_ms,
+		                          cpu_now.process_sys_ms - last_cpu.process_sys_ms};
+		last_cpu  = cpu_now;
+		last_wall = wall_now;
 		const auto now = total.load(std::memory_order_relaxed);
 		std::unordered_map<uint64_t, uint32_t> pages;
 		uint32_t sampled = 0;
@@ -174,6 +222,19 @@ struct FaultSampler {
 		                    rs[HostReadProbe::DispatchArgs].second / 1000000,
 		                    rs[HostReadProbe::Predication].first,
 		                    rs[HostReadProbe::Predication].second / 1000000);
+		const auto& bc = budget_all.categories;
+		const auto  ms = [](uint64_t ns) { return ns / 1000000; };
+		line += fmt::format(" | wall {} ms | gpu-thread cpu user {} sys {} ms | process cpu user {} sys {} ms"
+		                    " | gpu-thread budget ms: wait {} ({}) sync {} ({}) draw {} ({}) dispatch {} ({})"
+		                    " protect {} ({}) submit {} ({})",
+		                    wall_ms, cpu_delta.thread_user_ms, cpu_delta.thread_sys_ms,
+		                    cpu_delta.process_user_ms, cpu_delta.process_sys_ms,
+		                    ms(bc[BudgetProbe::Wait].second), bc[BudgetProbe::Wait].first,
+		                    ms(bc[BudgetProbe::Sync].second), bc[BudgetProbe::Sync].first,
+		                    ms(bc[BudgetProbe::Draw].second), bc[BudgetProbe::Draw].first,
+		                    ms(bc[BudgetProbe::Dispatch].second), bc[BudgetProbe::Dispatch].first,
+		                    ms(bc[BudgetProbe::Protect].second), bc[BudgetProbe::Protect].first,
+		                    ms(bc[BudgetProbe::Submit].second), bc[BudgetProbe::Submit].first);
 		LOGF("%s\n", line.c_str());
 		last_total = now;
 	}
@@ -274,6 +335,7 @@ void RenderContext::SyncCpuWrites() {
 		m_bda_synced_epoch = m_bda_sync_epoch;
 	}
 	SyncProbe::NoteCall();
+	BudgetScope budget(BudgetProbe::Sync, true);
 	// KYTY_BDA_SYNC_ALL=1 restores the walk over every cached buffer.
 	static const bool sync_all = [] {
 		const char* value = std::getenv("KYTY_BDA_SYNC_ALL");
@@ -307,7 +369,8 @@ void RenderContext::RunGarbageCollector() {
 		    return text;
 	    },
 	    m_buffer_cache.TakeSyncStats(), PageManager::TakeProtectStats(),
-	    MemoryTracker::TakeHotStats(), HostReadProbe::Take(), SyncProbe::Take());
+	    MemoryTracker::TakeHotStats(), HostReadProbe::Take(), SyncProbe::Take(),
+	    BudgetProbe::Take());
 	m_buffer_cache.FlushWriteFaults(false);
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
