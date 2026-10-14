@@ -1289,6 +1289,108 @@ void TestHotPageSnapshotHash() {
   Release(memory);
 }
 
+// Page-driven range synchronization (BufferCache::SynchronizeBuffersInRange, 177d31c): the tracker
+// lists the CPU-dirty and hot runs of a range and only their owners are synchronized. Synchronizing
+// exactly those runs must upload what one synchronization of the whole range (the historical walk
+// over every buffer) uploads, and must leave nothing behind for it.
+void TestSyncCandidateRunsMatchWholeRangeUpload() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  constexpr uint64_t page = Libs::Graphics::TRACKER_PAGE_SIZE;
+  constexpr uint64_t pages = 64;
+  uint8_t *memory = Allocate(harness.page_manager, pages);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto size = pages * page;
+
+  using Run = std::pair<uint64_t, uint64_t>; // first page, page count
+  auto candidates = [&](uint64_t vaddr, uint64_t bytes) {
+    std::vector<Run> runs;
+    tracker.ForEachSyncCandidateRun(
+        vaddr, bytes, [&](uint64_t run_address, uint64_t run_size) noexcept {
+          runs.emplace_back((run_address - address) / page, run_size / page);
+        });
+    return runs;
+  };
+  // Pages one synchronization of [vaddr, vaddr + bytes) uploads (plain runs and hot snapshots).
+  auto upload = [&](uint64_t vaddr, uint64_t bytes) {
+    std::vector<uint64_t> uploaded;
+    tracker.ForEachUploadRange(
+        vaddr, bytes, false,
+        [&](uint64_t upload_address, uint64_t upload_size, const void *) noexcept {
+          const auto first = (upload_address - address) / page;
+          for (uint64_t p = first; p < first + upload_size / page; ++p) {
+            uploaded.push_back(p);
+          }
+        },
+        []() noexcept {});
+    std::sort(uploaded.begin(), uploaded.end());
+    return uploaded;
+  };
+  // The CPU write-fault path (what the host fault handler runs).
+  auto fault = [&](uint64_t first, uint64_t count) {
+    tracker.InvalidateRegion(address + first * page, count * page, [] {});
+  };
+
+  // Buffer creation synchronizes its bound range (creating the region, which starts fully
+  // CPU-dirty); the rest of the region stays a candidate until one sync drains it.
+  Check(upload(address, page).size() == 1, "first sync did not upload the bound page");
+  Check(candidates(address, size) == std::vector<Run>{{1, pages - 1}},
+        "fresh region remainder was not one candidate run");
+  Check(upload(address, size).size() == pages - 1, "drain did not upload the fresh remainder");
+  Check(candidates(address, size).empty(), "clean range still had sync candidates");
+
+  // Page 10 becomes hot through KYTY_HOT_PAGE_FAULTS (default 8) fault/sync rounds; page 30 is
+  // GPU-owned: neither CPU-dirty nor hot, never a candidate.
+  for (int i = 0; i < 8; i++) {
+    fault(10, 1);
+    (void)upload(address + 10 * page, page);
+  }
+  tracker.MarkRegionAsGpuModified(address + 30 * page, page);
+
+  uint8_t stamp = 0x11;
+  auto arrange = [&] {
+    fault(3, 3);  // pages 3-5 CPU-dirty
+    fault(20, 2); // pages 20-21 CPU-dirty
+    std::memset(memory + 10 * page, stamp++, page); // hot page: writable, new content, no fault
+  };
+  const std::vector<uint64_t> expected = {3, 4, 5, 10, 20, 21};
+
+  // Page-driven: the candidate runs are the dirty and hot runs, clipped to the page-rounded range;
+  // synchronizing only those runs uploads the expected pages and leaves nothing for a whole-range
+  // synchronization. The hot page stays a candidate (it stays CPU-dirty) but is not re-uploaded
+  // while unchanged.
+  arrange();
+  const auto runs = candidates(address, size);
+  Check(runs == std::vector<Run>{{3, 3}, {10, 1}, {20, 2}},
+        "sync candidate runs did not match the dirty and hot pages");
+  Check(candidates(address + 4 * page + 16, 17 * page) ==
+            std::vector<Run>{{4, 2}, {10, 1}, {20, 2}},
+        "sync candidate runs were not clipped to the page-rounded range");
+  std::vector<uint64_t> page_driven;
+  for (const auto [first, count] : runs) {
+    const auto part = upload(address + first * page, count * page);
+    page_driven.insert(page_driven.end(), part.begin(), part.end());
+  }
+  std::sort(page_driven.begin(), page_driven.end());
+  Check(page_driven == expected, "page-driven synchronization did not upload the dirty and hot pages");
+  Check(upload(address, size).empty(),
+        "page-driven synchronization left pages for the whole-range synchronization");
+  Check(candidates(address, size) == std::vector<Run>{{10, 1}},
+        "the hot page did not stay a sync candidate");
+
+  // Buffer walk: the same arrangement synchronized as one range uploads the same page set.
+  arrange();
+  Check(upload(address, size) == expected,
+        "whole-range synchronization uploaded a different page set than the page-driven one");
+  Check(!tracker.IsRegionCpuModified(address + 30 * page, page) &&
+            tracker.IsRegionGpuModified(address + 30 * page, page),
+        "the GPU-owned page was disturbed by the synchronizations");
+
+  tracker.UnmarkRegionAsGpuModified(address + 30 * page, page);
+  tracker.UntrackMemory(address, size);
+  Release(memory);
+}
+
 int main(int argc, char **argv) {
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
@@ -1301,6 +1403,7 @@ int main(int argc, char **argv) {
   TestGuestRange();
   TestRangeSet();
   TestHotPageSnapshotHash();
+  TestSyncCandidateRunsMatchWholeRangeUpload();
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();

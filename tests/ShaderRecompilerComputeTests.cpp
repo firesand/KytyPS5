@@ -9356,6 +9356,67 @@ public:
                 "the page shared by two enrolled images was published with stale bytes");
       }
 
+      // Page-driven range synchronization (177d31c): a range synchronization visits only the
+      // buffers that own CPU-dirty (or hot) pages and uploads exactly those pages; a clean buffer in
+      // the same range is not visited. KYTY_SYNC_PAGE_DRIVEN=0 restores the walk over every buffer.
+      {
+        auto &sync_cache = resources.GetBufferCache();
+        constexpr uint64_t sync_a_offset = 0x2d00000;
+        constexpr uint64_t sync_b_offset = 0x2d40000;
+        constexpr uint64_t sync_owner_size = 0x8000;
+        constexpr uint64_t sync_dirty_page = 0x1000; // B's second tracker page
+        constexpr uint32_t sync_initial = 0x11111111u;
+        constexpr uint32_t sync_written = 0x5eed5eedu;
+        for (uint64_t offset = 0; offset < sync_owner_size; offset += sizeof(sync_initial)) {
+          std::memcpy(memory + sync_a_offset + offset, &sync_initial, sizeof(sync_initial));
+          std::memcpy(memory + sync_b_offset + offset, &sync_initial, sizeof(sync_initial));
+        }
+        const auto sync_a = sync_cache.ObtainBuffer(base + sync_a_offset, sync_owner_size, false);
+        const auto sync_b = sync_cache.ObtainBuffer(base + sync_b_offset, sync_owner_size, false);
+        Require(name, "page-driven sync owners",
+                sync_a.first != nullptr && sync_b.first != nullptr && sync_a.first != sync_b.first &&
+                    !sync_cache.IsRegionCpuModified(base + sync_a_offset, sync_owner_size) &&
+                    !sync_cache.IsRegionCpuModified(base + sync_b_offset, sync_owner_size),
+                "two clean disjoint owners were not created by their bound-range uploads");
+        // One CPU store through the write-fault path dirties B's second page only.
+        auto *sync_store =
+            reinterpret_cast<volatile uint32_t *>(base + sync_b_offset + sync_dirty_page);
+        *sync_store = sync_written;
+        Require(name, "page-driven sync dirty page",
+                sync_cache.IsRegionCpuModified(base + sync_b_offset + sync_dirty_page,
+                                               sizeof(sync_written)) &&
+                    !sync_cache.IsRegionCpuModified(base + sync_b_offset, sync_dirty_page) &&
+                    !sync_cache.IsRegionCpuModified(base + sync_a_offset, sync_owner_size),
+                "the CPU store did not dirty exactly B's second page");
+        (void)sync_cache.TakeSyncStats();
+        sync_cache.SynchronizeBuffersInRange(base + sync_a_offset,
+                                             sync_b_offset + sync_owner_size - sync_a_offset);
+        const auto sync_stats = sync_cache.TakeSyncStats();
+        const char *sync_mode = std::getenv("KYTY_SYNC_PAGE_DRIVEN");
+        const bool sync_page_driven = sync_mode == nullptr || sync_mode[0] != '0';
+        Require(name, "page-driven sync visits",
+                sync_stats.range_calls == (sync_page_driven ? 1u : 2u) &&
+                    sync_stats.range_pages == 1 && sync_stats.range_bytes == 0x1000,
+                sync_page_driven
+                    ? "the page-driven sync visited a clean owner or uploaded more than the dirty page"
+                    : "the buffer walk did not visit both owners or uploaded more than the dirty page");
+        Require(name, "page-driven sync clears dirtiness",
+                !sync_cache.IsRegionCpuModified(base + sync_b_offset, sync_owner_size) &&
+                    !sync_cache.IsRegionCpuModified(base + sync_a_offset, sync_owner_size),
+                "the dirty page stayed CPU-dirty after the range synchronization");
+        // Execute the recorded staging copy and look at the owner's device copy.
+        scheduler.FlushAndWait();
+        uint32_t sync_device_value = 0;
+        if (sync_cache.PeekDeviceCopy(base + sync_b_offset + sync_dirty_page, &sync_device_value,
+                                      sizeof(sync_device_value))) {
+          Require(name, "page-driven sync contents", sync_device_value == sync_written,
+                  "the owning buffer's device copy lacks the CPU bytes after the page-driven sync");
+        } else {
+          std::printf("[host]    %s: page-driven sync contents: device copy not host-visible, skipped\n",
+                      name);
+        }
+      }
+
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
       LibKernel::Memory::InstallGpuResources(nullptr);
