@@ -18,7 +18,15 @@ std::atomic<GpuTimestamps*> g_instances[MaxInstances] {};
 const char* const KindNames[] = {"draw",       "dispatch",   "dispatch-indirect", "barrier-global",
                                  "barrier-buffer", "barrier-image", "copy-upload", "copy-image",
                                  "blit",       "fill",       "clear",            "cache-dispatch",
-                                 "renderpass"};
+                                 "renderpass",
+                                 "cache-dispatch/detile", "cache-dispatch/tile",
+                                 "cache-dispatch/fault", "cache-dispatch/colorclear",
+                                 "copy-image/refresh", "copy-image/upload", "copy-image/download",
+                                 "copy-image/preserve", "copy-image/readback",
+                                 "copy-image/image", "copy-image/resolve",
+                                 "copy-image/via-buffer", "copy-image/depth",
+                                 "copy-upload/staging", "copy-upload/download",
+                                 "copy-upload/texture", "copy-upload/stream"};
 static_assert(sizeof(KindNames) / sizeof(KindNames[0]) ==
               static_cast<size_t>(GpuTimestamps::Kind::Count));
 const char* KindNameOf(uint8_t kind) {
@@ -40,6 +48,11 @@ GpuTimestamps* GpuTimestamps::ForCommand(vk::CommandBuffer command) noexcept {
 		}
 	}
 	return nullptr;
+}
+
+GpuTimestamps::Origin& GpuTimestamps::CurrentOrigin() noexcept {
+	static thread_local Origin origin = Origin::None;
+	return origin;
 }
 
 bool GpuTimestamps::Enabled() noexcept {
@@ -148,22 +161,36 @@ void GpuTimestamps::EndCommand(vk::CommandBuffer command) {
 	m_recording.store(nullptr, std::memory_order_release);
 }
 
-void GpuTimestamps::BeginOp(vk::CommandBuffer command, Kind kind, uint64_t hash, uint64_t hash2) {
-	if (!Valid()) return;
+bool GpuTimestamps::BeginOp(vk::CommandBuffer command, Kind kind, uint64_t hash, uint64_t hash2) {
+	if (!Valid()) return false;
 	std::lock_guard lock(m_mutex);
+	if (kind == Kind::BarrierImage) {
+		// Image layout transitions are ~0.1 us each at tens of thousands per second: pure query
+		// overhead and pool pressure. Count them, do not time them.
+		++m_acc.kinds[static_cast<size_t>(kind)].count;
+		return false;
+	}
 	// Nested scopes (a copy helper that issues its own barrier) fold into the outermost one.
-	if (m_depth++ != 0) return;
+	if (m_depth++ != 0) return true;
 	m_op_open = false;
-	if (m_current < 0) return;
+	if (m_current < 0) return true;
 	auto& slot = m_slots[static_cast<size_t>(m_current)];
 	if (slot.used + 2 > QueriesPerSlot) {
 		++slot.overflow;
-		return;
+		return true;
 	}
 	const uint32_t query = static_cast<uint32_t>(m_current) * QueriesPerSlot + slot.used;
 	command.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, m_pool, query);
-	slot.ops.push_back({hash, hash2, slot.used, kind});
+	slot.ops.push_back({hash, hash2, 0, slot.used, kind});
 	m_op_open = true;
+	return true;
+}
+
+void GpuTimestamps::SetOpBytes(uint64_t bytes) {
+	std::lock_guard lock(m_mutex);
+	if (m_depth == 1 && m_op_open && m_current >= 0) {
+		m_slots[static_cast<size_t>(m_current)].ops.back().bytes = bytes;
+	}
 }
 
 void GpuTimestamps::EndOp(vk::CommandBuffer command) {
@@ -211,6 +238,7 @@ void GpuTimestamps::HarvestLocked(uint64_t completed_tick) {
 			auto& kind = m_acc.kinds[static_cast<size_t>(op.kind)];
 			kind.ns += ns;
 			++kind.count;
+			kind.bytes += op.bytes;
 		}
 		++m_acc.ticks;
 		m_acc.span_ns += span;
@@ -275,6 +303,10 @@ std::string GpuTimestamps::Format(const Snapshot& s) {
 		              KindNameOf(static_cast<uint8_t>(k)), static_cast<double>(entry.ns) / 1e6,
 		              entry.count);
 		line += buffer;
+		if (entry.bytes != 0) {
+			std::snprintf(buffer, sizeof(buffer), " %.1fMB", static_cast<double>(entry.bytes) / 1048576.0);
+			line += buffer;
+		}
 	}
 	for (size_t k = 0; k < s.kinds.size(); ++k) {
 		if (HasShader(static_cast<Kind>(k))) {
@@ -309,8 +341,7 @@ GpuTimestampScope::GpuTimestampScope(CommandScheduler& scheduler, vk::CommandBuf
 	if (!GpuTimestamps::Enabled()) return;
 	auto* timestamps = scheduler.Timestamps();
 	if (timestamps == nullptr || !timestamps->Valid()) return;
-	m_timestamps = timestamps;
-	m_timestamps->BeginOp(command, kind, hash, hash2);
+	if (timestamps->BeginOp(command, kind, hash, hash2)) m_timestamps = timestamps;
 }
 
 GpuTimestampScope::GpuTimestampScope(vk::CommandBuffer command, GpuTimestamps::Kind kind,
@@ -319,8 +350,7 @@ GpuTimestampScope::GpuTimestampScope(vk::CommandBuffer command, GpuTimestamps::K
 	if (!GpuTimestamps::Enabled()) return;
 	auto* timestamps = GpuTimestamps::ForCommand(command);
 	if (timestamps == nullptr) return;
-	m_timestamps = timestamps;
-	m_timestamps->BeginOp(command, kind, hash, hash2);
+	if (timestamps->BeginOp(command, kind, hash, hash2)) m_timestamps = timestamps;
 }
 
 GpuTimestampScope::~GpuTimestampScope() {
