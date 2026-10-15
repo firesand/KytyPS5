@@ -5,6 +5,7 @@
 #include "common/logging/log.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
+#include "gpu_test_shaders/gpu_test_mesh_draw_index_spv.h"
 #include "gpu_test_shaders/gpu_test_ms_depth_spv.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
@@ -45174,6 +45175,295 @@ void CheckPm4CeCompletion(RenderContext &renderer) {
 } // namespace
 } // namespace Libs::Graphics
 
+// Gate 0 of the mesh-stage GPU-indirect design: is the DrawIndex built-in available and correct
+// in MeshEXT shaders on this driver, for multi-draw drawMeshTasksIndirectEXT with zero-group
+// records? Stand-alone device (the shared harness does not enable VK_EXT_mesh_shader).
+void CheckMeshDrawIndexGate0() {
+  using namespace Libs::Graphics;
+  const char *name = "MeshDrawIndexGate0";
+  static vk::detail::DynamicLoader loader;
+  const auto get_proc = loader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr");
+  Require(name, "loader", get_proc != nullptr, "could not load the Vulkan loader");
+  VULKAN_HPP_DEFAULT_DISPATCHER.init(get_proc);
+  vk::ApplicationInfo app{};
+  app.apiVersion = VK_API_VERSION_1_3;
+  vk::InstanceCreateInfo instance_info{};
+  instance_info.pApplicationInfo = &app;
+  vk::Instance instance{};
+  RequireVk(name, "instance", vk::createInstance(&instance_info, nullptr, &instance),
+            "vkCreateInstance");
+  VULKAN_HPP_DEFAULT_DISPATCHER.init(instance);
+  u32 count = 0;
+  RequireVk(name, "devices", instance.enumeratePhysicalDevices(&count, nullptr), "enumerate");
+  std::vector<vk::PhysicalDevice> devices(count);
+  RequireVk(name, "devices", instance.enumeratePhysicalDevices(&count, devices.data()),
+            "enumerate");
+  vk::PhysicalDevice physical{};
+  u32 family = 0;
+  for (const auto candidate : devices) {
+    u32 ext_count = 0;
+    (void)candidate.enumerateDeviceExtensionProperties(nullptr, &ext_count, nullptr);
+    std::vector<vk::ExtensionProperties> exts(ext_count);
+    (void)candidate.enumerateDeviceExtensionProperties(nullptr, &ext_count, exts.data());
+    const bool has_mesh = std::any_of(exts.begin(), exts.end(), [](const auto &e) {
+      return std::strcmp(e.extensionName.data(), VK_EXT_MESH_SHADER_EXTENSION_NAME) == 0;
+    });
+    vk::PhysicalDeviceMeshShaderFeaturesEXT mesh{};
+    vk::PhysicalDeviceFeatures2 features{};
+    features.pNext = &mesh;
+    candidate.getFeatures2(&features);
+    if (!has_mesh || !mesh.meshShader || !features.features.multiDrawIndirect) {
+      continue;
+    }
+    u32 queue_count = 0;
+    candidate.getQueueFamilyProperties(&queue_count, nullptr);
+    std::vector<vk::QueueFamilyProperties> queues(queue_count);
+    candidate.getQueueFamilyProperties(&queue_count, queues.data());
+    for (u32 i = 0; i < queue_count; i++) {
+      if (queues[i].queueFlags & vk::QueueFlagBits::eGraphics) {
+        physical = candidate;
+        family = i;
+        break;
+      }
+    }
+    if (physical) {
+      break;
+    }
+  }
+  if (!physical) {
+    std::printf("%s: SKIPPED no device with meshShader + multiDrawIndirect\n", name);
+    instance.destroy(nullptr);
+    return;
+  }
+
+  vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_props{};
+  vk::PhysicalDeviceProperties2 props{};
+  props.pNext = &mesh_props;
+  physical.getProperties2(&props);
+
+  vk::PhysicalDeviceVulkan13Features f13{};
+  f13.dynamicRendering = true;
+  vk::PhysicalDeviceMeshShaderFeaturesEXT mesh_features{};
+  mesh_features.meshShader = true;
+  mesh_features.multiviewMeshShader = false;
+  mesh_features.pNext = &f13;
+  vk::PhysicalDeviceFeatures features{};
+  features.multiDrawIndirect = true;
+  const float priority = 1.0f;
+  vk::DeviceQueueCreateInfo queue_info{};
+  queue_info.queueFamilyIndex = family;
+  queue_info.queueCount = 1;
+  queue_info.pQueuePriorities = &priority;
+  const char *extension = VK_EXT_MESH_SHADER_EXTENSION_NAME;
+  vk::DeviceCreateInfo device_info{};
+  device_info.pNext = &mesh_features;
+  device_info.queueCreateInfoCount = 1;
+  device_info.pQueueCreateInfos = &queue_info;
+  device_info.enabledExtensionCount = 1;
+  device_info.ppEnabledExtensionNames = &extension;
+  device_info.pEnabledFeatures = &features;
+  vk::Device device{};
+  RequireVk(name, "device", physical.createDevice(&device_info, nullptr, &device),
+            "vkCreateDevice");
+  VULKAN_HPP_DEFAULT_DISPATCHER.init(device);
+  vk::Queue queue{};
+  device.getQueue(family, 0, &queue);
+
+  vk::PhysicalDeviceMemoryProperties memory{};
+  physical.getMemoryProperties(&memory);
+  auto make_buffer = [&](vk::DeviceSize size, vk::BufferUsageFlags usage, vk::Buffer *buffer,
+                         vk::DeviceMemory *mem, void **mapped) {
+    vk::BufferCreateInfo info{};
+    info.size = size;
+    info.usage = usage;
+    RequireVk(name, "buffer", device.createBuffer(&info, nullptr, buffer), "vkCreateBuffer");
+    vk::MemoryRequirements req{};
+    device.getBufferMemoryRequirements(*buffer, &req);
+    u32 type = ~0u;
+    const auto want = vk::MemoryPropertyFlagBits::eHostVisible |
+                      vk::MemoryPropertyFlagBits::eHostCoherent;
+    for (u32 i = 0; i < memory.memoryTypeCount; i++) {
+      if ((req.memoryTypeBits & (1u << i)) && (memory.memoryTypes[i].propertyFlags & want) == want) {
+        type = i;
+        break;
+      }
+    }
+    Require(name, "buffer", type != ~0u, "no host-visible memory type");
+    vk::MemoryAllocateInfo alloc{};
+    alloc.allocationSize = req.size;
+    alloc.memoryTypeIndex = type;
+    RequireVk(name, "buffer", device.allocateMemory(&alloc, nullptr, mem), "vkAllocateMemory");
+    RequireVk(name, "buffer", device.bindBufferMemory(*buffer, *mem, 0), "vkBindBufferMemory");
+    RequireVk(name, "buffer", device.mapMemory(*mem, 0, size, {}, mapped), "vkMapMemory");
+  };
+
+  // Records: draw index -> {x, y, z}; a zero x, a zero y and a multi-instance (y = 2) record.
+  constexpr u32 draws = 5;
+  const u32 commands[draws][3] = {{2, 1, 1}, {0, 1, 1}, {3, 1, 1}, {2, 0, 1}, {1, 2, 1}};
+  vk::Buffer args_buffer{}, out_buffer{};
+  vk::DeviceMemory args_memory{}, out_memory{};
+  void *args_map = nullptr, *out_map = nullptr;
+  make_buffer(sizeof(commands), vk::BufferUsageFlagBits::eIndirectBuffer, &args_buffer,
+              &args_memory, &args_map);
+  make_buffer(draws * 8 * sizeof(u32), vk::BufferUsageFlagBits::eStorageBuffer, &out_buffer,
+              &out_memory, &out_map);
+  std::memcpy(args_map, commands, sizeof(commands));
+  std::memset(out_map, 0, draws * 8 * sizeof(u32));
+
+  vk::DescriptorSetLayoutBinding binding{};
+  binding.descriptorType = vk::DescriptorType::eStorageBuffer;
+  binding.descriptorCount = 1;
+  binding.stageFlags = vk::ShaderStageFlagBits::eMeshEXT;
+  vk::DescriptorSetLayoutCreateInfo set_layout_info{};
+  set_layout_info.bindingCount = 1;
+  set_layout_info.pBindings = &binding;
+  vk::DescriptorSetLayout set_layout{};
+  RequireVk(name, "layout", device.createDescriptorSetLayout(&set_layout_info, nullptr, &set_layout),
+            "vkCreateDescriptorSetLayout");
+  vk::PipelineLayoutCreateInfo layout_info{};
+  layout_info.setLayoutCount = 1;
+  layout_info.pSetLayouts = &set_layout;
+  vk::PipelineLayout layout{};
+  RequireVk(name, "layout", device.createPipelineLayout(&layout_info, nullptr, &layout),
+            "vkCreatePipelineLayout");
+  vk::DescriptorPoolSize pool_size{vk::DescriptorType::eStorageBuffer, 1};
+  vk::DescriptorPoolCreateInfo pool_info{};
+  pool_info.maxSets = 1;
+  pool_info.poolSizeCount = 1;
+  pool_info.pPoolSizes = &pool_size;
+  vk::DescriptorPool pool{};
+  RequireVk(name, "descriptor", device.createDescriptorPool(&pool_info, nullptr, &pool),
+            "vkCreateDescriptorPool");
+  vk::DescriptorSetAllocateInfo set_alloc{};
+  set_alloc.descriptorPool = pool;
+  set_alloc.descriptorSetCount = 1;
+  set_alloc.pSetLayouts = &set_layout;
+  vk::DescriptorSet set{};
+  RequireVk(name, "descriptor", device.allocateDescriptorSets(&set_alloc, &set), "allocate sets");
+  vk::DescriptorBufferInfo buffer_info{out_buffer, 0, VK_WHOLE_SIZE};
+  vk::WriteDescriptorSet write{};
+  write.dstSet = set;
+  write.descriptorCount = 1;
+  write.descriptorType = vk::DescriptorType::eStorageBuffer;
+  write.pBufferInfo = &buffer_info;
+  device.updateDescriptorSets(1, &write, 0, nullptr);
+
+  vk::ShaderModuleCreateInfo module_info{};
+  module_info.codeSize = sizeof(GPU_TEST_MESH_DRAW_INDEX_SPV);
+  module_info.pCode = GPU_TEST_MESH_DRAW_INDEX_SPV;
+  vk::ShaderModule module{};
+  RequireVk(name, "shader", device.createShaderModule(&module_info, nullptr, &module),
+            "vkCreateShaderModule");
+  vk::PipelineShaderStageCreateInfo stage{};
+  stage.stage = vk::ShaderStageFlagBits::eMeshEXT;
+  stage.module = module;
+  stage.pName = "main";
+  vk::PipelineViewportStateCreateInfo viewport{};
+  viewport.viewportCount = 1;
+  viewport.scissorCount = 1;
+  vk::PipelineRasterizationStateCreateInfo raster{};
+  raster.rasterizerDiscardEnable = true;
+  raster.lineWidth = 1.0f;
+  vk::PipelineMultisampleStateCreateInfo multisample{};
+  multisample.rasterizationSamples = vk::SampleCountFlagBits::e1;
+  vk::PipelineColorBlendStateCreateInfo blend{};
+  const vk::DynamicState dynamic_states[] = {vk::DynamicState::eViewport,
+                                             vk::DynamicState::eScissor};
+  vk::PipelineDynamicStateCreateInfo dynamic{};
+  dynamic.dynamicStateCount = 2;
+  dynamic.pDynamicStates = dynamic_states;
+  vk::PipelineRenderingCreateInfo rendering{};
+  vk::GraphicsPipelineCreateInfo pipeline_info{};
+  pipeline_info.pNext = &rendering;
+  pipeline_info.stageCount = 1;
+  pipeline_info.pStages = &stage;
+  pipeline_info.pViewportState = &viewport;
+  pipeline_info.pRasterizationState = &raster;
+  pipeline_info.pMultisampleState = &multisample;
+  pipeline_info.pColorBlendState = &blend;
+  pipeline_info.pDynamicState = &dynamic;
+  pipeline_info.layout = layout;
+  vk::Pipeline pipeline{};
+  RequireVk(name, "pipeline",
+            device.createGraphicsPipelines({}, 1, &pipeline_info, nullptr, &pipeline),
+            "vkCreateGraphicsPipelines");
+
+  vk::CommandPoolCreateInfo cpool_info{};
+  cpool_info.queueFamilyIndex = family;
+  vk::CommandPool cpool{};
+  RequireVk(name, "commands", device.createCommandPool(&cpool_info, nullptr, &cpool), "pool");
+  vk::CommandBufferAllocateInfo cb_alloc{};
+  cb_alloc.commandPool = cpool;
+  cb_alloc.commandBufferCount = 1;
+  vk::CommandBuffer cb{};
+  RequireVk(name, "commands", device.allocateCommandBuffers(&cb_alloc, &cb), "allocate");
+  vk::CommandBufferBeginInfo begin{};
+  RequireVk(name, "commands", cb.begin(&begin), "begin");
+  vk::RenderingInfo render{};
+  render.renderArea = vk::Rect2D{{0, 0}, {1, 1}};
+  render.layerCount = 1;
+  cb.beginRendering(&render);
+  cb.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+  cb.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, layout, 0, 1, &set, 0, nullptr);
+  const vk::Viewport vp{0, 0, 1, 1, 0, 1};
+  const vk::Rect2D scissor{{0, 0}, {1, 1}};
+  cb.setViewport(0, 1, &vp);
+  cb.setScissor(0, 1, &scissor);
+  cb.drawMeshTasksIndirectEXT(args_buffer, 0, draws, 12);
+  cb.endRendering();
+  RequireVk(name, "commands", cb.end(), "end");
+  vk::SubmitInfo submit{};
+  submit.commandBufferCount = 1;
+  submit.pCommandBuffers = &cb;
+  RequireVk(name, "submit", queue.submit(1, &submit, {}), "vkQueueSubmit");
+  RequireVk(name, "submit", queue.waitIdle(), "vkQueueWaitIdle");
+
+  const u32 *out = static_cast<const u32 *>(out_map);
+  std::printf("%s: device=%s maxMeshWorkGroupCount=%u,%u,%u total=%u\n", name,
+              props.properties.deviceName.data(), mesh_props.maxMeshWorkGroupCount[0],
+              mesh_props.maxMeshWorkGroupCount[1], mesh_props.maxMeshWorkGroupCount[2],
+              mesh_props.maxMeshWorkGroupTotalCount);
+  for (u32 d = 0; d < draws; d++) {
+    std::printf("%s: draw %u cmd={%u,%u,%u} slots:", name, d, commands[d][0], commands[d][1],
+                commands[d][2]);
+    for (u32 s = 0; s < 8; s++) {
+      std::printf(" %u", out[d * 8 + s]);
+    }
+    std::printf("\n");
+  }
+  // Expected: value == draw + 1 exactly at slots y*3+x of launched workgroups, else 0.
+  bool ok = true;
+  for (u32 d = 0; d < draws; d++) {
+    for (u32 s = 0; s < 8; s++) {
+      bool launched = false;
+      for (u32 y = 0; y < commands[d][1]; y++) {
+        for (u32 x = 0; x < commands[d][0]; x++) {
+          launched |= (y * 3 + x == s);
+        }
+      }
+      ok &= out[d * 8 + s] == (launched ? d + 1 : 0u);
+    }
+  }
+  Require(name, "DrawIndex", ok,
+          "DrawIndex in MeshEXT is wrong or constant for multi-draw mesh indirect");
+  std::printf("%s: PASS DrawIndex correct in MeshEXT multi-draw indirect, zero-group records "
+              "(x=0 and y=0) accepted\n", name);
+
+  device.waitIdle();
+  device.destroyCommandPool(cpool, nullptr);
+  device.destroyPipeline(pipeline, nullptr);
+  device.destroyShaderModule(module, nullptr);
+  device.destroyDescriptorPool(pool, nullptr);
+  device.destroyPipelineLayout(layout, nullptr);
+  device.destroyDescriptorSetLayout(set_layout, nullptr);
+  device.destroyBuffer(args_buffer, nullptr);
+  device.destroyBuffer(out_buffer, nullptr);
+  device.freeMemory(args_memory, nullptr);
+  device.freeMemory(out_memory, nullptr);
+  device.destroy(nullptr);
+  instance.destroy(nullptr);
+}
+
 int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
@@ -45182,6 +45472,10 @@ int main(int argc, char **argv) {
   CheckLeastRecentlyUsedCacheOrdering();
   if (argc == 3 && std::strcmp(argv[1], "--classify-ordered-shader") == 0)
     return ClassifyOrderedShaderFile(argv[2]) ? 0 : 1;
+  if (argc == 2 && std::strcmp(argv[1], "--mesh-draw-index-only") == 0) {
+    CheckMeshDrawIndexGate0();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--fragment-output-only") == 0) {
     VulkanHarness vulkan;
     for (const auto &test : GraphicsTypedColorExports()) {
