@@ -21,6 +21,7 @@
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/cache/meshIndirectTranslator.h"
 #include "graphics/host_gpu/renderer/cache/hostResidentMemory.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
@@ -40508,6 +40509,22 @@ void CheckMeshRecordEmission() {
               slotted.assembly.find("BuiltIn BaseInstance") == std::string::npos &&
               count(slotted.assembly, "OpConvertUToPtr") > count(record.assembly, "OpConvertUToPtr"),
           "a packet-named SGPR slot must be served from the record scratch");
+  // Prepass ring: the write-after-read barrier is needed once per wrap, not per request.
+  {
+    using Translator = MeshIndirectTranslator;
+    uint64_t cursor = 0;
+    uint32_t wraps = 0;
+    for (uint32_t i = 0; i < 1000; i++) {
+      const auto bytes = Translator::ScratchBytes(1 + (i * 977) % 20000);
+      if (Translator::NeedsWrapBarrier(cursor, bytes)) {
+        cursor = 0;
+        wraps++;
+      }
+      cursor = (cursor + bytes + 255u) & ~uint64_t{255};
+    }
+    Require(name, "ring wrap barrier", wraps >= 1 && wraps < 100 && !Translator::NeedsWrapBarrier(0, 4096),
+            "the prepass WAR barrier must be per wrap, not per request");
+  }
   // SRT guard: the V# in s[8:11] occupies plan bits 8..11 (base 0), so a packet naming slot 0 (s8)
   // must be rejected by the mask check; the unshifted slot bit (bit 0) would not see it.
   ShaderDrawParameters descriptor_slot;

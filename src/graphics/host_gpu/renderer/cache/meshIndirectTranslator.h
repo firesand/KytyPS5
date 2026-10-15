@@ -56,6 +56,11 @@ public:
 		return ((uint64_t {count} * CommandBytes + 15u) & ~uint64_t {15}) +
 		       uint64_t {count} * RecordBytes;
 	}
+	// True when a request of `bytes` at `cursor` wraps the ring (reusing slots earlier passes wrote
+	// and earlier draws may still read): only then does a pass need the write-after-read barrier.
+	[[nodiscard]] static constexpr bool NeedsWrapBarrier(uint64_t cursor, uint64_t bytes) {
+		return cursor + bytes > RingSize;
+	}
 	// A packet needing more than half the ring falls back to the host path.
 	[[nodiscard]] static constexpr bool Fits(uint32_t count) {
 		return count != 0 && ScratchBytes(count) <= RingSize / 2;

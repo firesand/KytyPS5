@@ -94,16 +94,18 @@ MeshIndirectTranslator::Result MeshIndirectTranslator::Translate(vk::CommandBuff
 	        request.primitives_per_group == 0 || request.primitive_step == 0 ||
 	        request.args_buffer == nullptr);
 	const auto bytes = ScratchBytes(request.count);
-	if (m_cursor + bytes > RingSize) {
+	const bool wrapped = NeedsWrapBarrier(m_cursor, bytes);
+	if (wrapped) {
 		m_cursor = 0;
 	}
 	const auto base          = m_cursor;
 	m_cursor                 = Common::AlignUp(m_cursor + bytes, 256);
 	const auto command_bytes = Common::AlignUp(uint64_t {request.count} * CommandBytes, 16);
 
-	// Order the producers of the argument records (when GPU-written), and every earlier reader of
-	// this ring slot (indirect command reads, mesh shader record loads, the previous translate
-	// pass), before the translate pass writes.
+	// Order the producers of the argument records (when GPU-written) before the translate pass, and,
+	// only when the ring wrapped, every earlier reader of the reused slots (indirect command reads,
+	// mesh shader record loads, the previous translate pass) before it writes. Regions are handed
+	// out sequentially, so without a wrap a pass never overlaps an earlier pass's output.
 	{
 		vk::MemoryBarrier2 barriers[2] {};
 		uint32_t           count = 0;
@@ -117,21 +119,25 @@ MeshIndirectTranslator::Result MeshIndirectTranslator::Translate(vk::CommandBuff
 			barriers[count].dstAccessMask = vk::AccessFlagBits2::eShaderRead;
 			count++;
 		}
-		barriers[count].srcStageMask  = vk::PipelineStageFlagBits2::eDrawIndirect |
-		                               vk::PipelineStageFlagBits2::eMeshShaderEXT |
-		                               vk::PipelineStageFlagBits2::eComputeShader;
-		barriers[count].srcAccessMask = vk::AccessFlagBits2::eIndirectCommandRead |
-		                                vk::AccessFlagBits2::eShaderRead |
-		                                vk::AccessFlagBits2::eShaderWrite;
-		barriers[count].dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
-		barriers[count].dstAccessMask = vk::AccessFlagBits2::eShaderRead |
-		                                vk::AccessFlagBits2::eShaderWrite;
-		count++;
-		vk::DependencyInfo dependency {};
-		dependency.memoryBarrierCount = count;
-		dependency.pMemoryBarriers    = barriers;
-		GpuTimestampScope ts_scope(cmd, GpuTimestamps::Kind::BarrierBuffer);
-		cmd.pipelineBarrier2(dependency);
+		if (wrapped) {
+			barriers[count].srcStageMask  = vk::PipelineStageFlagBits2::eDrawIndirect |
+			                               vk::PipelineStageFlagBits2::eMeshShaderEXT |
+			                               vk::PipelineStageFlagBits2::eComputeShader;
+			barriers[count].srcAccessMask = vk::AccessFlagBits2::eIndirectCommandRead |
+			                                vk::AccessFlagBits2::eShaderRead |
+			                                vk::AccessFlagBits2::eShaderWrite;
+			barriers[count].dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+			barriers[count].dstAccessMask = vk::AccessFlagBits2::eShaderRead |
+			                                vk::AccessFlagBits2::eShaderWrite;
+			count++;
+		}
+		if (count != 0) {
+			vk::DependencyInfo dependency {};
+			dependency.memoryBarrierCount = count;
+			dependency.pMemoryBarriers    = barriers;
+			GpuTimestampScope ts_scope(cmd, GpuTimestamps::Kind::BarrierBuffer);
+			cmd.pipelineBarrier2(dependency);
+		}
 	}
 
 	cmd.bindPipeline(vk::PipelineBindPoint::eCompute, m_pipeline);
