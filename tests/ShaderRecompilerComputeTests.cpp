@@ -11703,8 +11703,9 @@ public:
     constexpr uint64_t allocation_size = 0x100000;
     constexpr uint64_t case_size = 0x10000;
     constexpr uint32_t sentinel = 0xa5a5a5a5u;
-    Require(name, "mode", LazyBarrierMode() == 1,
-            "KYTY_LAZY_BARRIERS=1 must be set before the first scheduler is created");
+    // Results are asserted in every mode (KYTY_LAZY_BARRIERS=0/1/2); the barrier counts only where
+    // the tracker is the sole barrier source (mode 1).
+    const bool counted = LazyBarrierMode() == 1;
 
     // store_imm: buffer[desc s0..3] = s12.
     std::vector<u32> store_imm;
@@ -11806,13 +11807,13 @@ public:
       };
       const auto copy = [&](uint64_t from, uint64_t to) {
         set_shader(copy_shader);
-        set_buffer(0, from, 4);
+        set_buffer(0, from, 1, 4);
         set_buffer(4, to, 4);
         processor.DispatchDirect(1, 1, 1, 0x41u);
       };
       const auto read = [&](uint64_t address) {
         set_shader(read_only);
-        set_buffer(0, address, 4);
+        set_buffer(0, address, 1, 4);
         processor.DispatchDirect(1, 1, 1, 0x41u);
       };
       const auto write_args = [&](u32 x) {
@@ -11825,7 +11826,11 @@ public:
       };
       const auto indirect = [&](std::vector<u32> &code, u32 threads, bool tgid) {
         set_shader(code, threads, uint8_t{4}, tgid);
-        set_buffer(0, tgid ? output_address : x_address, tgid ? 16u * sizeof(u32) : 4u);
+        if (tgid) {
+          set_buffer(0, output_address, 16u * sizeof(u32));
+        } else {
+          set_buffer(0, x_address, 1, 4);
+        }
         processor.SetDispatchIndirectArgsBaseAddress(args_base);
         const std::array<u32, 2> packet{
             static_cast<u32>(BufferCache::CACHING_PAGESIZE - 4u), 0x41u};
@@ -11848,11 +11853,16 @@ public:
       };
       const auto expect = [&](const char *what, Probe::Kind kind, uint64_t emitted,
                               uint64_t old) {
+        std::string all;
+        for (u32 i = 0; i < Probe::KindCount; i++) {
+          all += std::string(" ") + Probe::Name(i) + "=" + std::to_string(window.emitted[i]) +
+                 "/" + std::to_string(window.old[i]);
+        }
         Require(name, what, window.emitted[kind] == emitted && window.old[kind] == old,
                 std::string(Probe::Name(kind)) + " emitted " +
                     std::to_string(window.emitted[kind]) + " (expected " +
                     std::to_string(emitted) + "), old " + std::to_string(window.old[kind]) +
-                    " (expected " + std::to_string(old) + ")");
+                    " (expected " + std::to_string(old) + "); window:" + all);
       };
       const auto expect_no_flush = [&](const char *what) {
         Require(name, what,
@@ -11869,11 +11879,14 @@ public:
 
       // Pass 0 warms pipelines and buffer owners; pass 1 is measured on a fresh command buffer.
       for (u32 pass = 0; pass < 2; pass++) {
-        const bool measure = pass == 1;
-        std::memset(reinterpret_cast<void *>(x_address), 0xa5, 4);
-        std::memset(reinterpret_cast<void *>(y_address), 0xa5, 4);
-        std::memset(reinterpret_cast<void *>(output_address), 0xa5, 16u * sizeof(u32));
-        std::memset(reinterpret_cast<void *>(args_address), 0, 12);
+        const bool measure = pass == 1 && counted;
+        if (pass == 0) {
+          // CPU writes after the warm-up would re-upload the buffers inside the measured sequence.
+          std::memset(reinterpret_cast<void *>(x_address), 0xa5, 4);
+          std::memset(reinterpret_cast<void *>(y_address), 0xa5, 4);
+          std::memset(reinterpret_cast<void *>(output_address), 0xa5, 16u * sizeof(u32));
+          std::memset(reinterpret_cast<void *>(args_address), 0, 12);
+        }
         scheduler.Finish();
         scheduler.CheckActive();
         const auto tick = scheduler.CurrentTick();
@@ -11909,6 +11922,7 @@ public:
         cache.ReadMemory(x_address, 4);
         cache.ReadMemory(y_address, 4);
         cache.ReadMemory(output_address, 16u * sizeof(u32));
+        cache.ReadMemory(args_address, 12);
         u32 x = 0, y = 0;
         std::array<u32, 16> actual{};
         Require(name, "readback",
@@ -11926,7 +11940,18 @@ public:
                       Hex(actual[i]));
         }
       }
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
     });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "lazy barrier mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "lazy barrier allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -18696,6 +18721,44 @@ public:
           Require("NativeIndirectDrawOffsets", indexed ? "indexed" : "auto",
                   pixels[component] == (component % 4 == 3 ? 0x3f800000u : 0x3e800000u),
                   "native vertex or instance offset was applied twice");
+        }
+        if (LazyBarrierMode() == 1) {
+          // KYTY_LAZY_BARRIERS: a shader write recorded by an earlier draw (no fixture draw has a
+          // storage write, so the tracker state is set as ExecutePreparedDraw sets it) must be
+          // resolved by one barrier before the next draw, and the draw must still be correct.
+          auto &hazards = scheduler.Current().Hazards();
+          hazards.written_stages |= vk::PipelineStageFlagBits::eFragmentShader;
+          hazards.indirect_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
+          hazards.written_access |= vk::AccessFlagBits::eShaderWrite;
+          const auto before = BarrierProbe::Total();
+          TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
+              {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+          if (indexed) {
+            RenderExecutorTestAccess::DrawIndex(executor, scheduler.Current(),
+                {.index_count = 3, .index_addr = reinterpret_cast<const void *>(index_address),
+                 .instance_count = 1, .index_type_and_size = 1, .base_vertex = 7, .first_instance = 5,
+                 .offset_source = DrawOffsetSource::IndirectArgs});
+          } else {
+            RenderExecutorTestAccess::DrawAuto(executor, scheduler.Current(),
+                {.vertex_count = 3, .instance_count = 1, .first_vertex = 7, .first_instance = 5,
+                 .offset_source = DrawOffsetSource::IndirectArgs});
+          }
+          const auto after = BarrierProbe::Total();
+          uint64_t resolved = 0;
+          for (const auto kind : {BarrierProbe::FlushEndRendering, BarrierProbe::FlushForeign,
+                                  BarrierProbe::FlushDraw}) {
+            resolved += after.emitted[kind] - before.emitted[kind];
+          }
+          Require("LazyBarriers", "pending draw write resolved before the next consumer",
+                  resolved == 1 && !hazards.written_stages && !hazards.indirect_write_stages,
+                  "expected exactly one hazard barrier, got " + std::to_string(resolved));
+          const auto repeated = ReadCachedTexel(name, context, sparse_color.image_id,
+                                                {}, {extent, extent, 1});
+          for (size_t component = 0; component < repeated.size(); component++) {
+            Require("LazyBarriers", "draw after a resolved write",
+                    repeated[component] == (component % 4 == 3 ? 0x3f800000u : 0x3e800000u),
+                    "the draw following a tracked write rendered incorrectly");
+          }
         }
       }
 
@@ -46277,7 +46340,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--lazy-barriers-only") == 0) {
-    setenv("KYTY_LAZY_BARRIERS", "1", 1);
+    setenv("KYTY_LAZY_BARRIERS", "1", 0); // an explicit 0/2 from the caller wins
     VulkanHarness vulkan;
     vulkan.CheckLazyBarriers();
     return 0;
