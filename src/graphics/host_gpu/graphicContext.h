@@ -31,6 +31,8 @@ struct GraphicContext {
 	bool                               sample_rate_shading_enabled           = false;
 	// multiDrawIndirect + drawIndirectFirstInstance + shaderDrawParameters + drawIndirectCount.
 	bool                               gpu_indirect_draw_enabled             = false;
+	// VK_KHR_maintenance5: vkCmdBindIndexBuffer2KHR binds an index range with an explicit size.
+	bool                               maintenance5_enabled                  = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	bool                               attachment_feedback_loop_enabled      = false;

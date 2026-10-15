@@ -623,6 +623,11 @@ struct PipelineCache::ProgramCache {
 				return permutation->handle;
 			}
 		}
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			if (stage == ShaderType::Vertex) {
+				vertex_user_data_masks[params.hash] |= entry->second.resource_plan.user_data_mask;
+			}
+		}
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
 		    entry->second.FunctionCode()));
@@ -663,7 +668,18 @@ struct PipelineCache::ProgramCache {
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
+	// Vertex-stage shader hash -> user-data registers its resource plan evaluates on the host.
+	std::unordered_map<uint64_t, uint64_t>                      vertex_user_data_masks;
 };
+
+bool PipelineCache::GetVertexUserDataMask(uint64_t shader_hash, uint64_t& mask) const {
+	const auto found = m_program_cache->vertex_user_data_masks.find(shader_hash);
+	if (found == m_program_cache->vertex_user_data_masks.end()) {
+		return false;
+	}
+	mask = found->second;
+	return true;
+}
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {

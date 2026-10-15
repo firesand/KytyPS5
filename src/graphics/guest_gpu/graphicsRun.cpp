@@ -1219,10 +1219,15 @@ bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_c
 	}
 
 	auto& executor = m_renderer.GetRenderExecutor();
-	bool  mesh     = false;
+	RenderExecutor::GpuIndirectBlock block = RenderExecutor::GpuIndirectBlock::Other;
 	if (!executor.CanDrawIndirectOnGpu(CurrentBuffer(), indexed, m_index_type_and_size,
-	                                   max_count_or_count, &mesh)) {
-		if (mesh) {
+	                                   max_count_or_count, parameters, &block)) {
+		if (block == RenderExecutor::GpuIndirectBlock::Srt) {
+			// The vertex shader's resource plan reads an offset SGPR (or is not compiled yet).
+			HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackSrt);
+			return false;
+		}
+		if (block == RenderExecutor::GpuIndirectBlock::Mesh) {
 			HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackMesh);
 		}
 		return fallback();

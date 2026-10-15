@@ -1127,6 +1127,15 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	}
 	if (capture_indirect_reads || !plan.source_reads.empty())
 		plan.resource_tracking_complete &= !program.has_address_writes;
+	for (const auto& inst: plan.value_storage) {
+		if (inst.GetOpcode() != ValueOpcode::GetUserData) continue;
+		const auto reg = RegIndex(inst.Arg(0).ScalarRegister());
+		if (reg >= plan.user_data_base) {
+			const auto bit = reg - plan.user_data_base;
+			// Registers beyond the mask width cannot be tracked; mark them all consumed.
+			plan.user_data_mask |= bit < 64u ? uint64_t {1} << bit : ~uint64_t {0};
+		}
+	}
 	return plan;
 }
 

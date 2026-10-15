@@ -178,9 +178,13 @@ public:
 	// True when an indirect draw can be issued with GPU-resident arguments: the device supports it
 	// and nothing about the bound state needs the argument values on the host (mesh/NGG or
 	// tessellation shaders, quad lists, 8-bit indices, custom primitive-restart values).
+	// `parameters` names the user-data slots the packet patches; a vertex shader whose resource plan
+	// evaluates one of them on the host (or one not compiled yet) keeps the host path (Srt).
+	enum class GpuIndirectBlock { None, Mesh, Srt, Other };
 	[[nodiscard]] bool CanDrawIndirectOnGpu(CommandBuffer& buffer, bool indexed,
 	                                        uint32_t index_type_and_size, uint32_t draw_count,
-	                                        bool* mesh_blocked = nullptr);
+	                                        const ShaderDrawParameters& parameters,
+	                                        GpuIndirectBlock* block = nullptr);
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	void                           FindBuffers(std::span<PreparedBindings* const> stages);

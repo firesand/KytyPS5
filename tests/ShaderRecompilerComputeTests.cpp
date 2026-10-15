@@ -17454,6 +17454,22 @@ public:
                   sizeof(auto_record));
       std::memcpy(reinterpret_cast<void *>(indirect_base + 0x20), indexed_record.data(),
                   sizeof(indexed_record));
+      // firstIndex != 0 and the INDEX_BUFFER_SIZE clamp share one index array: the first triangle
+      // is degenerate (all index 0), the second (indices 3..5) covers the target.
+      constexpr std::array<uint32_t, 6> split_indices{0, 0, 0, 0, 1, 2};
+      constexpr std::array<uint32_t, 5> first_index_record{3, 1, 3, 7, 5};
+      constexpr std::array<uint32_t, 5> clamp_record{6, 1, 0, 7, 5};
+      std::memcpy(reinterpret_cast<void *>(indirect_base + 0x40), split_indices.data(),
+                  sizeof(split_indices));
+      std::memcpy(reinterpret_cast<void *>(indirect_base + 0x60), first_index_record.data(),
+                  sizeof(first_index_record));
+      std::memcpy(reinterpret_cast<void *>(indirect_base + 0x80), clamp_record.data(),
+                  sizeof(clamp_record));
+      // Per-instance constant table for the SRT-dependent vertex shader: table[s9] is compared
+      // with 5, so base instances 5 and 6 both pass and 0 (a stale slot) does not.
+      constexpr std::array<uint32_t, 8> srt_table{0, 0, 0, 0, 0, 5, 5, 0};
+      std::memcpy(reinterpret_cast<void *>(indirect_base + 0x6000), srt_table.data(),
+                  sizeof(srt_table));
       *reinterpret_cast<uint32_t *>(indirect_base + 0x3000) = 1;
       *reinterpret_cast<uint32_t *>(indirect_base + 0x3004) = 0;
     }
@@ -18394,7 +18410,7 @@ public:
             indirect.parameters.base_instance_slot = 1;
             Require(gpu_name, "eligibility",
                     executor.CanDrawIndirectOnGpu(scheduler.Current(), indexed, 1,
-                                                  indirect.draw_count),
+                                                  indirect.draw_count, indirect.parameters),
                     "a plain vertex-stage triangle list must be eligible");
             TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
                 {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
@@ -18421,8 +18437,134 @@ public:
             }
           }
         }
+        // firstIndex != 0 and the INDEX_BUFFER_SIZE clamp. Both read the same index array
+        // {0,0,0,0,1,2}: only indices 3..5 form a visible triangle.
+        const auto split_case = [&](const char *label, uint64_t record_src, uint64_t record_dst,
+                                    u32 index_buffer_size, bool expect_drawn) {
+          (void)buffer_cache.ObtainBuffer(record_dst, 0x20, true);
+          buffer_cache.CopyBuffer(record_dst, record_src, 0x20, false, false);
+          GpuIndirectDraw indirect{};
+          indirect.args_addr = record_dst;
+          indirect.draw_count = 1;
+          indirect.stride = 20;
+          indirect.index_base = indirect_base + 0x40;
+          indirect.index_buffer_size = index_buffer_size;
+          indirect.parameters.active = true;
+          indirect.parameters.base_vertex_slot = 0;
+          indirect.parameters.base_instance_slot = 1;
+          TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
+              {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+          RenderExecutorTestAccess::DrawIndex(executor, scheduler.Current(),
+              {.index_count = index_buffer_size,
+               .index_addr = reinterpret_cast<const void *>(indirect_base + 0x40),
+               .instance_count = 1, .index_type_and_size = 1,
+               .offset_source = DrawOffsetSource::IndirectArgs, .gpu_indirect = &indirect});
+          const auto pixels = ReadCachedTexel(name, context, sparse_color.image_id,
+                                              {}, {extent, extent, 1});
+          for (size_t component = 0; component < pixels.size(); component++) {
+            const u32 expected =
+                expect_drawn ? (component % 4 == 3 ? 0x3f800000u : 0x3e800000u) : 0u;
+            Require("GpuIndirectDraw", label, pixels[component] == expected,
+                    expect_drawn ? "the record's firstIndex did not select indices 3..5"
+                                 : "indices past INDEX_BUFFER_SIZE were fetched");
+          }
+        };
+        split_case("firstIndex != 0", indirect_base + 0x60, indirect_base + 0x4000, 6, true);
+        if (m_maintenance5_supported) {
+          split_case("INDEX_BUFFER_SIZE clamp", indirect_base + 0x80, indirect_base + 0x5000, 3,
+                     false);
+        } else {
+          std::printf("[gpu]     %-32s SKIP INDEX_BUFFER_SIZE clamp: VK_KHR_maintenance5 "
+                      "unavailable\n", "GpuIndirectDraw");
+        }
+
+        // A vertex shader whose resource plan walks the base-instance SGPR (s_lshl/s_add/s_load
+        // through the per-instance table) must keep the host path: the GPU variant never patches
+        // the SGPR, so the host would pick table[stale].
+        {
+          static const auto srt_vertex = [&] {
+            auto code = indirect_vertex;
+            code.erase(code.begin() + 1); // instance prolog: the table, not v8, carries s9
+            const auto compare = std::ranges::find(code, EncodeVopc(0xc2, InlineU32(5), 8));
+            *compare = EncodeVopc(0xc2, 13, 9); // s13 == v9
+            std::vector<u32> five;
+            AppendVMovU32(&five, 9, 5);
+            code.insert(compare, five.begin(), five.end());
+            code.insert(code.begin(),
+                        {EncodeSop2(0x1e, 12, 9, InlineU32(2)), EncodeSop2(0x00, 10, 10, 12),
+                         EncodeSmem0(0, 13, 5), EncodeSmem1(0, 125),
+                         EncodeSopp(0x0c, 0xc07f)});
+            return code;
+          }();
+          const auto srt_vs = reinterpret_cast<uint64_t>(srt_vertex.data());
+          ShaderMapUserData(srt_vs,
+              {.type = Prospero::ShaderBinaryType::kGs, .user_data = &native_user_data,
+               .code_size_bytes = static_cast<uint32_t>(srt_vertex.size() * sizeof(u32))});
+          shaders.SetEsShaderBase(srt_vs);
+          shaders.SetGsShaderResource2({.user_sgpr = 4});
+          shaders.SetGsUserSgpr(2, static_cast<u32>(indirect_base + 0x6000), HW::UserSgprType::Unknown);
+          shaders.SetGsUserSgpr(3, static_cast<u32>((indirect_base + 0x6000) >> 32u),
+                                HW::UserSgprType::Unknown);
+          GpuIndirectDraw indirect{};
+          indirect.args_addr = indirect_base + 0x4000;
+          indirect.draw_count = 1;
+          indirect.stride = 20;
+          indirect.index_base = index_address;
+          indirect.index_buffer_size = 3;
+          indirect.parameters.active = true;
+          indirect.parameters.base_vertex_slot = 0;
+          indirect.parameters.base_instance_slot = 1;
+          const auto draw_host_route = [&](u32 first_instance) {
+            shaders.SetGsUserSgpr(0, 7, HW::UserSgprType::Unknown);
+            shaders.SetGsUserSgpr(1, first_instance, HW::UserSgprType::Unknown);
+            TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
+                {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+            RenderExecutorTestAccess::DrawIndex(executor, scheduler.Current(),
+                {.index_count = 3, .index_addr = reinterpret_cast<const void *>(index_address),
+                 .instance_count = 1, .index_type_and_size = 1, .base_vertex = 7,
+                 .first_instance = first_instance,
+                 .offset_source = DrawOffsetSource::IndirectArgs});
+            return ReadCachedTexel(name, context, sparse_color.image_id, {}, {extent, extent, 1});
+          };
+          // Host route for base instances 5 and 6 (the second record of the same packet): the
+          // patched SGPR indexes the table, both reach 5, the target is covered.
+          for (const u32 first_instance : {5u, 6u}) {
+            const auto pixels = draw_host_route(first_instance);
+            for (size_t component = 0; component < pixels.size(); component++) {
+              Require("GpuIndirectSrt", "host route through the patched SGPR",
+                      pixels[component] == (component % 4 == 3 ? 0x3f800000u : 0x3e800000u),
+                      "the per-instance table lookup through s9 failed on the host path");
+            }
+          }
+          Require("GpuIndirectSrt", "fallback",
+              !executor.CanDrawIndirectOnGpu(scheduler.Current(), true, 1, 1, indirect.parameters),
+              "a shader whose resource plan reads the base-instance SGPR was made eligible");
+          // Forcing the GPU variant shows what the fallback prevents: slot 1 is stale (0), so the
+          // host evaluates table[0] and the target stays clear.
+          shaders.SetGsUserSgpr(1, 0, HW::UserSgprType::Unknown);
+          (void)buffer_cache.ObtainBuffer(indirect_base + 0x4000, 0x20, true);
+          buffer_cache.CopyBuffer(indirect_base + 0x4000, indirect_base + 0x20, 0x20, false, false);
+          TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
+              {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+          RenderExecutorTestAccess::DrawIndex(executor, scheduler.Current(),
+              {.index_count = 3, .index_addr = reinterpret_cast<const void *>(index_address),
+               .instance_count = 1, .index_type_and_size = 1,
+               .offset_source = DrawOffsetSource::IndirectArgs, .gpu_indirect = &indirect});
+          const auto stale = ReadCachedTexel(name, context, sparse_color.image_id,
+                                             {}, {extent, extent, 1});
+          for (size_t component = 0; component < stale.size(); component++) {
+            Require("GpuIndirectSrt", "stale snapshot hazard", stale[component] == 0u,
+                    "the forced GPU variant is expected to evaluate the stale table slot");
+          }
+          shaders.SetEsShaderBase(indirect_vs);
+          shaders.SetGsShaderResource2({.user_sgpr = 2});
+        }
         shaders.SetGsUserSgpr(0, 7, HW::UserSgprType::Unknown);
         shaders.SetGsUserSgpr(1, 5, HW::UserSgprType::Unknown);
+      } else {
+        std::printf("[gpu]     %-32s SKIP GPU-side indirect draws: device lacks "
+                    "multiDrawIndirect/drawIndirectFirstInstance/shaderDrawParameters/"
+                    "drawIndirectCount\n", "GpuIndirectDraw");
       }
 
       // A fourth VS invocation reads beyond the descriptor instead of reconstructing the corner.
@@ -19861,6 +20003,7 @@ public:
 private:
   bool m_rasterization_supported = true;
   bool m_gpu_indirect_supported = false;
+  bool m_maintenance5_supported = false;
   bool m_conditional_rendering_supported = false;
   bool m_host_memory_ext = false;
   uint64_t m_host_pointer_alignment = 0;
@@ -19903,6 +20046,7 @@ private:
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
     m_runtime_context.gpu_indirect_draw_enabled = m_gpu_indirect_supported;
+    m_runtime_context.maintenance5_enabled = m_maintenance5_supported;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
         .type = vk::ImageType::e2D,
@@ -20049,9 +20193,11 @@ private:
     available_min_lod.pNext = &available_provoking_vertex;
     vk::PhysicalDeviceConditionalRenderingFeaturesEXT available_conditional{};
     available_conditional.pNext = &available_min_lod;
+    vk::PhysicalDeviceMaintenance5FeaturesKHR available_maintenance5{};
+    available_maintenance5.pNext = &available_conditional;
     vk::PhysicalDeviceFeatures2 available_features2{};
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
-    available_features2.pNext = &available_conditional;
+    available_features2.pNext = &available_maintenance5;
     m_physical_device.getFeatures2(&available_features2);
     u32 extension_count = 0;
     RequireVk("VulkanHarness", "conditional rendering capability",
@@ -20117,6 +20263,12 @@ private:
             "image view minimum LOD is not supported");
     Require("VulkanHarness", "graphics", available_features12.shaderOutputLayer == true,
             "vertex layer output is not supported");
+    m_maintenance5_supported = available_maintenance5.maintenance5 &&
+        std::any_of(available_extensions.begin(), available_extensions.end(),
+            [](const auto &extension) {
+              return std::strcmp(extension.extensionName.data(),
+                                 VK_KHR_MAINTENANCE_5_EXTENSION_NAME) == 0;
+            });
     m_gpu_indirect_supported = available_features.multiDrawIndirect &&
                                available_features.drawIndirectFirstInstance &&
                                available_features11.shaderDrawParameters &&
@@ -20205,6 +20357,12 @@ private:
     device_info.pNext = m_conditional_rendering_supported
                            ? static_cast<void *>(&conditional)
                            : static_cast<void *>(&min_lod);
+    vk::PhysicalDeviceMaintenance5FeaturesKHR maintenance5{};
+    if (m_maintenance5_supported) {
+      maintenance5.maintenance5 = true;
+      maintenance5.pNext = const_cast<void *>(device_info.pNext);
+      device_info.pNext = &maintenance5;
+    }
     vk::PhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = true;
     device_features.shaderImageGatherExtended = true;
@@ -20226,6 +20384,9 @@ private:
         VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME};
     if (m_conditional_rendering_supported) {
       device_extensions.push_back(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+    }
+    if (m_maintenance5_supported) {
+      device_extensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
     }
     if (m_host_memory_ext) {
       device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
@@ -40192,7 +40353,8 @@ void CheckEmbeddedFetchVertexOffset() {
 
   const auto Compile = [&](const char *name, const std::vector<u32> &code,
                            u32 slot10, ShaderType stage = ShaderType::Vertex,
-                           Prospero::BufferFormat format = Prospero::BufferFormat::k32_32_32_32Float) {
+                           Prospero::BufferFormat format = Prospero::BufferFormat::k32_32_32_32Float,
+                           const ShaderDrawParameters &draw = {}) {
     std::array<u32, 11> user_data{};
     user_data[10] = slot10;
     ShaderVertexInputInfo vertex;
@@ -40201,6 +40363,7 @@ void CheckEmbeddedFetchVertexOffset() {
                    .ls_stride = 124, .hs_stride = 128, .domain = 1,
                    .partitioning = 2, .output_topology = 2};
     vertex.fetch_embedded = true;
+    vertex.draw_parameters = draw;
     vertex.fetch_buffer_reg = 0;
     vertex.fetch_attrib_reg = 2;
     vertex.resources_num = 1;
@@ -40290,6 +40453,27 @@ void CheckEmbeddedFetchVertexOffset() {
       valid.program.info.vertex_offset_sgpr == 18 && Resolve(valid, 0) == 7 &&
           Resolve(valid, 5) == 5,
       "canonical fetch offset or register index-offset precedence is wrong");
+
+  {
+    // GPU-side indirect draws with embedded fetch: Vulkan's vertexOffset drives the attribute fetch
+    // (rebase_ids stays off) and the vertex-offset SGPR reads gl_BaseVertex. Module-level check;
+    // there is no pixel readback for embedded fetch in this harness.
+    ShaderDrawParameters draw;
+    draw.active = true;
+    draw.base_vertex_slot = 10; // register 8 + 10 = s18
+    const auto gpu = Compile("EmbeddedFetchGpuIndirect", MakeFetch({{18, 0}}), 7,
+                             ShaderType::Vertex, Prospero::BufferFormat::k32_32_32_32Float, draw);
+    ValidateSpirv("EmbeddedFetchGpuIndirect", gpu.spirv);
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+    std::string assembly;
+    Require("EmbeddedFetchGpuIndirect", "disassembly", tools.Disassemble(gpu.spirv, &assembly),
+            "failed to disassemble the draw-parameter fetch variant");
+    Require("EmbeddedFetchGpuIndirect", "draw parameter built-ins",
+            assembly.find("BuiltIn BaseVertex") != std::string::npos &&
+                assembly.find("BuiltIn BaseInstance") == std::string::npos &&
+                assembly.find("OpCapability DrawParameters") != std::string::npos,
+            "embedded fetch must declare only gl_BaseVertex and must not rebase the ids");
+  }
 
   const auto ngg_code = MakeFetch({{18, 5}}, {}, 5, true);
   Require("EmbeddedFetchNggVertexOffset", "encoding",
