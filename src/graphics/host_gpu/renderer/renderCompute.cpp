@@ -623,23 +623,27 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const char* ordered_rejection = program.info.has_ordered_gds
 	    ? OrderedGdsSerialRejection(input_info, bindings, thread_group_x, thread_group_y, thread_group_z)
 	    : "no_ordered_gds";
-	if (ordered_rejection == nullptr) {
-		static std::atomic<uint32_t> applied_count {0};
-		if (applied_count.fetch_add(1, std::memory_order_relaxed) < 16u)
-			LOGF("OrderedGds: serialized shader=0x%016" PRIx64 " groups=%ux1x1 guest_local=%ux%ux%u\n",
-			     program.shader_hash, thread_group_x, input_info.threads_num[0],
-			     input_info.threads_num[1], input_info.threads_num[2]);
-		// Preserve the logical WorkgroupId while ordering each wave's reservation.
-		// No host wait or shader spin is needed; one guest wave is one native group.
-		for (uint32_t group = 0; group < thread_group_x; ++group) {
-			vk_buffer.dispatchBase(group, 0, 0, 1, 1, 1);
-			if (group + 1u < thread_group_x)
-				ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	{
+		GpuTimestampScope ts_scope(m_context.GetCommandScheduler(), vk_buffer,
+		                           GpuTimestamps::Kind::Dispatch, program.shader_hash);
+		if (ordered_rejection == nullptr) {
+			static std::atomic<uint32_t> applied_count {0};
+			if (applied_count.fetch_add(1, std::memory_order_relaxed) < 16u)
+				LOGF("OrderedGds: serialized shader=0x%016" PRIx64 " groups=%ux1x1 guest_local=%ux%ux%u\n",
+				     program.shader_hash, thread_group_x, input_info.threads_num[0],
+				     input_info.threads_num[1], input_info.threads_num[2]);
+			// Preserve the logical WorkgroupId while ordering each wave's reservation.
+			// No host wait or shader spin is needed; one guest wave is one native group.
+			for (uint32_t group = 0; group < thread_group_x; ++group) {
+				vk_buffer.dispatchBase(group, 0, 0, 1, 1, 1);
+				if (group + 1u < thread_group_x)
+					ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+			}
+		} else {
+			if (program.info.has_ordered_gds)
+				LogOrderedGdsApproximation(program.shader_hash, ordered_rejection);
+			vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 		}
-	} else {
-		if (program.info.has_ordered_gds)
-			LogOrderedGdsApproximation(program.shader_hash, ordered_rejection);
-		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 	}
 	if (GpuDiagnostics::Enabled()) {
 		if (persistent_group_probe) {
@@ -742,7 +746,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	if (program.info.has_ordered_gds)
 		LogOrderedGdsApproximation(program.shader_hash, "indirect_dispatch");
-	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	{
+		GpuTimestampScope ts_scope(m_context.GetCommandScheduler(), vk_buffer,
+		                           GpuTimestamps::Kind::DispatchIndirect, program.shader_hash);
+		vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	}
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
 	m_context.GetCommandScheduler().DiagnosticOperationComplete();

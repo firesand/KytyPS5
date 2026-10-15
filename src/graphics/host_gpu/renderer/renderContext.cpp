@@ -362,6 +362,7 @@ void RenderContext::SyncCpuWrites() {
 }
 
 void RenderContext::RunGarbageCollector() {
+	GetCommandScheduler().DumpGpuTimestamps();
 	g_fault_sampler.Dump(
 	    [this](uint64_t vaddr) {
 		    auto text = m_buffer_cache.DescribeBufferAt(vaddr);

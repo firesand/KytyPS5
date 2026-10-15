@@ -1382,9 +1382,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			CommandScheduler::Checkpoint(vk_buffer,
 			                             m_context.GetCommandScheduler().RecordGpuOperation(diagnostic));
 		}
-		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
-	} else {
-		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit, m_context.GetCommandScheduler(), diagnostic);
+	}
+	{
+		const uint64_t ts_vs_hash = vertex_stages.empty() ? 0 : vertex_stages[0].stage.program->shader_hash;
+		const uint64_t ts_ps_hash = state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0;
+		GpuTimestampScope ts_scope(m_context.GetCommandScheduler(), vk_buffer,
+		                           GpuTimestamps::Kind::Draw, ts_ps_hash, ts_vs_hash);
+		if (mesh_active) {
+			vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+		} else {
+			EmitDrawPrimitives(ucfg, vk_buffer, draw, emit, m_context.GetCommandScheduler(), diagnostic);
+		}
 	}
 
 	if (!draw.IsIndexed()) {

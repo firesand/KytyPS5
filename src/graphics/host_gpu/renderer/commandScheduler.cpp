@@ -97,7 +97,11 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
     : m_master(graphics), m_context(context), m_graphics(graphics),
       m_command_pool(graphics, m_master), m_command(*this),
-      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
+      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
+	if (GpuTimestamps::Enabled()) {
+		m_timestamps = std::make_unique<GpuTimestamps>(graphics);
+	}
+}
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
@@ -335,6 +339,9 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
+	if (m_timestamps) {
+		m_timestamps->BeginCommand(m_command.m_buffer, CurrentTick(), m_master.KnownGpuTick());
+	}
 	return m_command;
 }
 
@@ -344,6 +351,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
+	if (m_timestamps) {
+		m_timestamps->EndCommand(m_command.m_buffer);
+	}
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;
@@ -413,6 +423,13 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 	m_command.m_buffer = nullptr;
 	return tick;
+}
+
+void CommandScheduler::DumpGpuTimestamps() {
+	if (m_timestamps) {
+		m_master.Refresh();
+		m_timestamps->Dump(m_master.KnownGpuTick());
+	}
 }
 
 void CommandScheduler::BeginNext() {

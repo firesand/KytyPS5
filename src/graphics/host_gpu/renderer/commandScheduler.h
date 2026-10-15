@@ -5,9 +5,11 @@
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/gpuDiagnostics.h"
+#include "graphics/host_gpu/renderer/gpuTimestamps.h"
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 
 #include <queue>
@@ -49,6 +51,10 @@ public:
 			command.setCheckpointNV(reinterpret_cast<const void*>(static_cast<uintptr_t>(sequence)));
 		}
 	}
+	// Opt-in (KYTY_GPU_TIMESTAMPS=1) per-op GPU timing; null when disabled.
+	[[nodiscard]] GpuTimestamps* Timestamps() noexcept { return m_timestamps.get(); }
+	// Reads back completed ticks and, once per interval, logs the GpuTime line.
+	void DumpGpuTimestamps();
 	void DiagnosticOperationComplete() {
 		if (GpuDiagnostics::Serialize()) FlushAndWait();
 	}
@@ -108,6 +114,7 @@ private:
 	RenderContext&               m_context;
 	GraphicContext&              m_graphics;
 	CommandPool                  m_command_pool;
+	std::unique_ptr<GpuTimestamps> m_timestamps;
 	CommandBuffer                m_command;
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;

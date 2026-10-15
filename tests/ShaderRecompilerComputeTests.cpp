@@ -5220,6 +5220,45 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckGpuTimestamps() {
+    constexpr const char *name = "GpuTimestamps";
+    Require(name, "enabled", GpuTimestamps::Enabled(),
+            "KYTY_GPU_TIMESTAMPS=1 must be set before the first scheduler is created");
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    auto *timestamps = scheduler.Timestamps();
+    Require(name, "pool", timestamps != nullptr && timestamps->Valid(),
+            "scheduler did not create a timestamp pool");
+    constexpr uint32_t op_count = 3;
+    auto target = CreateHostBuffer(name, 1u << 20, vk::BufferUsageFlagBits::eTransferDst, {});
+    for (uint32_t i = 0; i < op_count; ++i) {
+      GpuTimestampScope scope(scheduler, scheduler.Current().Handle(),
+                              GpuTimestamps::Kind::Dispatch, 0x1234u + (i & 1u));
+      scheduler.Current().Handle().fillBuffer(target.buffer, 0, target.size, 0xa5a5a5a5u + i);
+    }
+    scheduler.Finish();
+    const auto snapshot = timestamps->Take(scheduler.GetMasterSemaphore().KnownGpuTick());
+    Require(name, "ops seen", snapshot.ops >= op_count && snapshot.ticks >= 1,
+            "completed tick did not report its tagged ops");
+    Require(name, "hashes", snapshot.shaders.size() == 2, "per-shader accumulation lost a key");
+    Require(name, "monotonic", snapshot.violations == 0,
+            "an end timestamp was earlier than its begin timestamp");
+    Require(name, "span", snapshot.span_ns > 0 &&
+                snapshot.attributed_ns <= snapshot.span_ns + 1000,
+            "attributed time must not exceed the tick span");
+    const auto line = GpuTimestamps::Format(snapshot);
+    Require(name, "line", line.rfind("GpuTime: ticks ", 0) == 0 && line.size() < 1536,
+            "summary line has the wrong shape");
+    std::printf("[gpu]     %s", line.c_str());
+    DestroyBuffer(&target);
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckUnifiedTextureCacheFlow() {
     constexpr const char *name = "UnifiedTextureCacheFlow";
     constexpr uintptr_t base = 0x0000000200600000ull;
@@ -45390,6 +45429,12 @@ int main(int argc, char **argv) {
         : std::strcmp(argv[1], "--image-readback-gc-budget-only") == 0 ? 2 : 3;
     VulkanHarness vulkan;
     vulkan.CheckImageReadbackOwnership(scenario);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--gpu-timestamps-only") == 0) {
+    setenv("KYTY_GPU_TIMESTAMPS", "1", 1);
+    VulkanHarness vulkan;
+    vulkan.CheckGpuTimestamps();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--htile-clear-only") == 0) {
