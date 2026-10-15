@@ -835,7 +835,7 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 		// KYTY_HOST_RESIDENT=1: a range the GPU has not modified is read in place from the imported
 		// guest memory (no VRAM copy, no upload); GPU-modified or unresolvable ranges fall back.
 		if (auto* resident = cache.GetHostResident(); resident != nullptr) {
-			if (!cache.IsRegionGpuModified(range.base_address, size) &&
+			if (cache.HostResidentEligible(range.base_address, size) &&
 			    resident->Resolve(range.base_address, size, range.host_buffer, range.host_offset)) {
 				HostResidentProbe::NoteBind(size);
 				continue;
@@ -1078,7 +1078,7 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 			// Index data read in place. Vulkan needs the offset aligned to the index size; 8-bit
 			// indices never reach here (they are widened on the host into host_data).
 			uint64_t host_offset = 0;
-			if (!cache.IsRegionGpuModified(source.address, source.size) &&
+			if (cache.HostResidentEligible(source.address, source.size) &&
 			    resident->Resolve(source.address, source.size, prepared.buffer, host_offset) &&
 			    host_offset % source.guest_element_size == 0) {
 				prepared.offset = host_offset;

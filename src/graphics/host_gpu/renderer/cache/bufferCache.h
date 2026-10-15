@@ -129,6 +129,15 @@ public:
 		return it != m_gpu_write_ticks.end() ? it->second : 0;
 	}
 	// Unbounded-heap GPU writes recorded or in flight whose pages are not yet marked GPU-dirty.
+	// Host-resident eligibility (review 2026-10-16 F1): tracker-only ownership query; a range inside a
+	// declared unbounded-write heap with records pending falls back, because only the drain in
+	// PrepareHostRead would make its GPU ownership current, and that drain must not run per bind.
+	[[nodiscard]] bool HostResidentEligible(uint64_t vaddr, uint64_t size) {
+		if (HasPendingUnboundedWrites() && InUnboundedWriteRange(vaddr, size)) {
+			return false;
+		}
+		return !IsLabelRegionGpuModified(vaddr, size);
+	}
 	[[nodiscard]] bool HasPendingUnboundedWrites() const noexcept {
 		return m_write_faults_dirty || m_write_fault_tick != 0;
 	}
