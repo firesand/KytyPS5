@@ -43,6 +43,7 @@ public:
 		CacheDispatchTile,
 		CacheDispatchFault,
 		CacheDispatchColorClear,
+		CacheDispatchMeshPrepass,
 		CopyImageRefresh,
 		CopyImageUpload,
 		CopyImageDownload,

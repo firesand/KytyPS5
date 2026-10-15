@@ -616,6 +616,10 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		key.push_back(info.draw_parameters.base_vertex_slot);
 		key.push_back(info.draw_parameters.base_instance_slot);
 		key.push_back(static_cast<uint32_t>(info.draw_parameters.rebase_ids));
+		key.push_back(static_cast<uint32_t>(info.draw_parameters.mesh_record));
+		if (info.draw_parameters.mesh_record) {
+			key.push_back(info.draw_parameters.first_index_slot);
+		}
 	}
 	key.push_back(static_cast<uint32_t>(info.fetch_attrib_reg));
 	key.push_back(static_cast<uint32_t>(info.fetch_buffer_reg));
@@ -746,7 +750,7 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	auto        params = GetShaderParams(
 	    regs.es_regs.data_addr, hash,
 	    std::span<const uint32_t>(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr), data,
-	    merged || native_ngg ? 8u : 0u);
+	    merged || native_ngg ? kMeshUserSgprBase : 0u);
 	if (!merged && !native_ngg) {
 		if (!ShaderGetStaticVertexInputInfo(regs.es_regs.data_addr, regs.gs_user_sgpr,
 		                                    regs.gs_regs.rsrc2.user_sgpr, sh, data, info)) {

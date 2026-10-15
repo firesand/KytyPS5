@@ -20,7 +20,7 @@ const char* const KindNames[] = {"draw",       "dispatch",   "dispatch-indirect"
                                  "blit",       "fill",       "clear",            "cache-dispatch",
                                  "renderpass",
                                  "cache-dispatch/detile", "cache-dispatch/tile",
-                                 "cache-dispatch/fault", "cache-dispatch/colorclear",
+                                 "cache-dispatch/fault", "cache-dispatch/colorclear", "cache-dispatch/mesh-prepass",
                                  "copy-image/refresh", "copy-image/upload", "copy-image/download",
                                  "copy-image/preserve", "copy-image/readback",
                                  "copy-image/image", "copy-image/resolve",

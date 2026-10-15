@@ -225,7 +225,8 @@ struct FaultSampler {
 		const auto& rs = reads_all.sites;
 		line += fmt::format(" | cpu-sync {} calls {} regions {} copy-batches {} copy-buffers"
 		                    " | cp reads: args {} ({} ms) count {} ({} ms) dispatch {} ({} ms) pred {} ({} ms)"
-		                    " | gpu-indirect {} draws {} fallback(index_offset) {} fallback(other) ({} of which mesh) {} fallback(srt) {} ms waited",
+		                    " | gpu-indirect {} draws {} fallback(index_offset) {} fallback(other) ({} of which mesh) {} fallback(srt)"
+		                    " {} ms waited | mesh-gpu {} draws {} fallback(mesh-srt) {} stale(mesh-state)",
 		                    syncs_all.calls, syncs_all.regions, sync_all.copy_batches, sync_all.copy_buffers,
 		                    rs[HostReadProbe::DrawArgs].first,
 		                    rs[HostReadProbe::DrawArgs].second / 1000000,
@@ -239,7 +240,10 @@ struct FaultSampler {
 		                    reads_all.gpu_indirect[HostReadProbe::FallbackOther],
 		                    reads_all.gpu_indirect[HostReadProbe::FallbackMesh],
 		                    reads_all.gpu_indirect[HostReadProbe::FallbackSrt],
-		                    reads_all.gpu_indirect_wait_ns / 1000000);
+		                    reads_all.gpu_indirect_wait_ns / 1000000,
+		                    reads_all.gpu_indirect[HostReadProbe::GpuMeshDraws],
+		                    reads_all.gpu_indirect[HostReadProbe::FallbackMeshSrt],
+		                    reads_all.gpu_indirect[HostReadProbe::StaleMeshState]);
 		line += fmt::format(" | host-resident binds {} bytes {} KiB fallbacks {}", resident_all.binds,
 		                    resident_all.bytes >> 10, resident_all.fallbacks);
 		// Lazy hazard-tracked barriers (KYTY_LAZY_BARRIERS). Mode 1: per site `emitted/elided`

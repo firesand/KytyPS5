@@ -325,6 +325,21 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${color_clear_check_header}")
+
+set(mesh_indirect_translate_source "${gpu_tiler_shader_dir}/mesh_indirect_translate.comp")
+set(mesh_indirect_translate_spv "${gpu_tiler_generated_dir}/mesh_indirect_translate.spv")
+set(mesh_indirect_translate_header "${gpu_tiler_generated_dir}/mesh_indirect_translate_spv.h")
+add_custom_command(
+	OUTPUT "${mesh_indirect_translate_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${mesh_indirect_translate_spv}" "${mesh_indirect_translate_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${mesh_indirect_translate_spv} -DOUTPUT=${mesh_indirect_translate_header}
+	        -DSYMBOL=MESH_INDIRECT_TRANSLATE_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${mesh_indirect_translate_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${mesh_indirect_translate_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
@@ -641,6 +656,48 @@ add_custom_command(
 )
 target_sources(shader_recompiler_compute_tests PRIVATE
 	"${gpu_test_ms_depth_header}")
+
+set(gpu_test_mesh_draw_index_source
+	"${gpu_tiler_shader_dir}/gpu_test_mesh_draw_index.mesh")
+set(gpu_test_mesh_draw_index_spv
+	"${gpu_test_generated_dir}/gpu_test_mesh_draw_index.spv")
+set(gpu_test_mesh_draw_index_header
+	"${gpu_test_generated_dir}/gpu_test_mesh_draw_index_spv.h")
+add_custom_command(
+	OUTPUT "${gpu_test_mesh_draw_index_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_test_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${gpu_test_mesh_draw_index_spv}" "${gpu_test_mesh_draw_index_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${gpu_test_mesh_draw_index_spv}
+	        -DOUTPUT=${gpu_test_mesh_draw_index_header}
+	        -DSYMBOL=GPU_TEST_MESH_DRAW_INDEX_SPV
+	        -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${gpu_test_mesh_draw_index_source}"
+	VERBATIM
+)
+target_sources(shader_recompiler_compute_tests PRIVATE
+	"${gpu_test_mesh_draw_index_header}")
+
+set(gpu_test_mesh_record_source
+	"${gpu_tiler_shader_dir}/gpu_test_mesh_record.mesh")
+set(gpu_test_mesh_record_spv
+	"${gpu_test_generated_dir}/gpu_test_mesh_record.spv")
+set(gpu_test_mesh_record_header
+	"${gpu_test_generated_dir}/gpu_test_mesh_record_spv.h")
+add_custom_command(
+	OUTPUT "${gpu_test_mesh_record_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_test_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${gpu_test_mesh_record_spv}" "${gpu_test_mesh_record_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${gpu_test_mesh_record_spv}
+	        -DOUTPUT=${gpu_test_mesh_record_header}
+	        -DSYMBOL=GPU_TEST_MESH_RECORD_SPV
+	        -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${gpu_test_mesh_record_source}"
+	VERBATIM
+)
+target_sources(shader_recompiler_compute_tests PRIVATE
+	"${gpu_test_mesh_record_header}")
 
 add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/VirtualMemoryAllocationTests.cpp")
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE

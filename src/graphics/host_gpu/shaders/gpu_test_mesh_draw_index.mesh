@@ -1,0 +1,14 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+
+// Gate 0 probe: records the DrawIndex built-in seen by every launched mesh workgroup.
+layout(local_size_x = 1) in;
+layout(triangles, max_vertices = 3, max_primitives = 1) out;
+layout(std430, set = 0, binding = 0) buffer Out { uint value[]; } out_buffer;
+
+void main() {
+	SetMeshOutputsEXT(0, 0);
+	// 8 slots per draw: y * 3 + x. The stored value is DrawIndex + 1 so that untouched slots read 0.
+	const uint slot = uint(gl_DrawID) * 8u + gl_WorkGroupID.y * 3u + gl_WorkGroupID.x;
+	out_buffer.value[slot] = uint(gl_DrawID) + 1u;
+}

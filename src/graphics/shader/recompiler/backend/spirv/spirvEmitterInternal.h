@@ -376,6 +376,10 @@ uint32_t EmitSubgroupLocalInvocationId(EmitterState& state);
 
 uint32_t InputVariableForKind(const EmitterState& state, IR::StageInputKind kind);
 
+// Mesh stage compiled for a GPU-side indirect draw: batch SGPRs and draw dwords come from the
+// per-record scratch (ShaderDrawParameters::mesh_record).
+bool MeshRecordActive(const EmitterState& state);
+
 const InputBinding* InputBindingForParameter(const EmitterState& state, uint32_t location);
 
 uint32_t EmitVertexParameterComponentU32(EmitterState& state, const InputBinding& input,

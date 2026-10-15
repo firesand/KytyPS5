@@ -10,6 +10,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/hostReadStats.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -241,6 +242,7 @@ void CommandProcessor::Reset() {
 	m_index_buffer_size                = 0;
 	m_index_base_addr                  = 0;
 	m_num_instances                    = 1;
+	m_mesh_state_stale                 = false;
 	m_predicate_skip                   = false;
 	m_user_data_marker                 = HW::UserSgprType::Unknown;
 	m_draw_indirect_args_base_addr     = 0;
@@ -1055,6 +1057,7 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 	}
 
 	m_num_instances = num_instances;
+	m_mesh_state_stale = false;
 }
 
 void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t wait_op,
@@ -1119,6 +1122,9 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	args.index_type_and_size = m_index_type_and_size;
 	if (args.instance_count == 0) {
 		args.instance_count = m_num_instances;
+		if (m_mesh_state_stale) {
+			HostReadProbe::CountGpuIndirect(HostReadProbe::StaleMeshState);
+		}
 	}
 	if (GraphicsRunDebugDumpEnabled() && (args.base_vertex != 0 || args.first_instance != 0)) {
 		LOGF("\t draw indexed offsets: base_vertex = %" PRId32 ", first_instance = %" PRIu32 "\n",
@@ -1181,8 +1187,12 @@ bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_c
                                             const volatile uint32_t* count_addr,
                                             uint32_t stride_in_bytes, IndirectDrawRegisters registers,
                                             bool indexed) {
-	// The first-index SGPR has no draw-parameter built-in.
-	if (registers.index_offset != Pm4::SH_NOP) {
+	auto& executor = m_renderer.GetRenderExecutor();
+	// NGG / mesh vertex stages: the translation prepass serves every batch SGPR (including the
+	// first-index one) from the record, but only for indexed draws without a count buffer.
+	const bool mesh = executor.DrawUsesMeshVertexStage(CurrentBuffer());
+	// The vertex variant has no first-index draw-parameter built-in.
+	if (!mesh && registers.index_offset != Pm4::SH_NOP) {
 		HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackIndexOffset);
 		return false;
 	}
@@ -1190,8 +1200,13 @@ bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_c
 		HostReadProbe::CountGpuIndirect(kind);
 		return false;
 	};
+	if (mesh && (!indexed || count_addr != nullptr)) {
+		HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackMesh);
+		return fallback();
+	}
 	ShaderDrawParameters parameters;
-	parameters.active = true;
+	parameters.active      = true;
+	parameters.mesh_record = mesh;
 	const auto slot_of = [](uint32_t location, uint32_t& slot) {
 		if (location == Pm4::SH_NOP) {
 			slot = ShaderDrawParameters::kNoSlot;
@@ -1204,7 +1219,8 @@ bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_c
 		return true;
 	};
 	if (!slot_of(registers.vertex_offset, parameters.base_vertex_slot) ||
-	    !slot_of(registers.instance_offset, parameters.base_instance_slot)) {
+	    !slot_of(registers.instance_offset, parameters.base_instance_slot) ||
+	    (mesh && !slot_of(registers.index_offset, parameters.first_index_slot))) {
 		return fallback();
 	}
 
@@ -1218,19 +1234,53 @@ bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_c
 		return fallback();
 	}
 
-	auto& executor = m_renderer.GetRenderExecutor();
 	RenderExecutor::GpuIndirectBlock block = RenderExecutor::GpuIndirectBlock::Other;
 	if (!executor.CanDrawIndirectOnGpu(CurrentBuffer(), indexed, m_index_type_and_size,
 	                                   max_count_or_count, parameters, &block)) {
 		if (block == RenderExecutor::GpuIndirectBlock::Srt) {
-			// The vertex shader's resource plan reads an offset SGPR (or is not compiled yet).
-			HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackSrt);
+			// The shader's resource plan reads an offset SGPR (or is not compiled yet).
+			HostReadProbe::CountGpuIndirect(mesh ? HostReadProbe::FallbackMeshSrt
+			                                     : HostReadProbe::FallbackSrt);
 			return false;
 		}
 		if (block == RenderExecutor::GpuIndirectBlock::Mesh) {
 			HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackMesh);
 		}
 		return fallback();
+	}
+
+	if (mesh) {
+		// The placeholder draw registers, prepares and syncs the whole INDEX_BUFFER_SIZE range at
+		// the index base on every packet (the mesh shader reads indices through BDA). A huge or
+		// partly unmapped range would EXIT in the cache or sync megabytes per packet: keep those on
+		// the host path, which only touches each record's own range.
+		constexpr uint64_t MeshIndexRangeCap = 64ull << 20;
+		const uint64_t     element_size      = m_index_type_and_size == 0 ? 2u : 4u;
+		const uint64_t     range             = uint64_t {m_index_buffer_size} * element_size;
+		{
+			static std::mutex          seen_mutex;
+			static std::array<uint32_t, 16> seen {};
+			static uint32_t            seen_count = 0;
+			std::lock_guard            lock(seen_mutex);
+			if (seen_count < seen.size() &&
+			    std::find(seen.begin(), seen.begin() + seen_count, m_index_buffer_size) ==
+			        seen.begin() + seen_count) {
+				seen[seen_count++] = m_index_buffer_size;
+				LOGF("GpuIndirect(mesh): INDEX_BUFFER_SIZE %" PRIu32 " elements (%" PRIu64
+				     " bytes) at 0x%" PRIx64 "\n",
+				     m_index_buffer_size, range, m_index_base_addr);
+			}
+		}
+		// The prepass binds the records as one storage buffer range (128 MiB is the guaranteed
+		// minimum of maxStorageBufferRange).
+		constexpr uint64_t MeshArgsRangeCap = 128ull << 20;
+		const uint64_t     args_span =
+		    uint64_t {max_count_or_count - 1u} * stride_in_bytes + sizeof(DrawIndexedIndirectArgs);
+		if (args_span > MeshArgsRangeCap || range > MeshIndexRangeCap || !GuestRange {m_index_base_addr, range}.Valid() ||
+		    !m_renderer.IsMapped(m_index_base_addr, range)) {
+			HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackMesh);
+			return fallback();
+		}
 	}
 
 	GpuIndirectDraw draw;
@@ -1256,6 +1306,10 @@ bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_c
 		               .gpu_indirect   = &draw});
 	}
 	HostReadProbe::CountGpuIndirect(HostReadProbe::GpuDraws);
+	if (mesh) {
+		m_mesh_state_stale = true;
+		HostReadProbe::CountGpuIndirect(HostReadProbe::GpuMeshDraws);
+	}
 	return true;
 }
 
@@ -1321,6 +1375,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 			PatchIndirectDrawOffsets(*this, registers, args->start_vertex_location,
 			                         args->start_instance_location, 0);
 			m_num_instances = args->instance_count;
+			m_mesh_state_stale = false;
 			DrawIndexAuto({.vertex_count   = args->vertex_count_per_instance,
 			               .instance_count = args->instance_count,
 			               .first_vertex   = args->start_vertex_location,
@@ -1350,6 +1405,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		}
 
 		m_num_instances = args->instance_count;
+		m_mesh_state_stale = false;
 		DrawIndex({.index_count    = index_count,
 		           .index_addr     = index_addr,
 		           .instance_count = args->instance_count,
@@ -1414,6 +1470,9 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	if (args.instance_count == 0) {
 		args.instance_count = m_num_instances;
+		if (m_mesh_state_stale) {
+			HostReadProbe::CountGpuIndirect(HostReadProbe::StaleMeshState);
+		}
 	}
 	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
 }

@@ -216,6 +216,8 @@ enum class StageInputKind {
 	// VK_KHR_shader_draw_parameters; only the emitter adds them (GPU-side indirect draws).
 	BaseVertex,
 	BaseInstance,
+	// Mesh-stage GPU-side indirect draws: index of the record within the multi-draw.
+	DrawIndex,
 };
 
 enum class StageOutputKind {
@@ -320,6 +322,18 @@ enum class DescriptorBindingKind : uint32_t {
 
 static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 49u);
 static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 56u);
+
+// Per-record scratch layout written by the mesh indirect translation prepass (dwords). Push dwords
+// 0/1 of a mesh_record program hold the scratch device address and dword MeshRecordPushElementSize
+// the guest index size; everything else of the host mesh draw data comes from the scratch.
+inline constexpr uint32_t MeshRecordDwords           = 8;
+inline constexpr uint32_t MeshRecordIndexCount       = 0; // clamped to INDEX_BUFFER_SIZE
+inline constexpr uint32_t MeshRecordBaseVertex       = 1;
+inline constexpr uint32_t MeshRecordStartInstance    = 2;
+inline constexpr uint32_t MeshRecordStartIndex       = 3;
+inline constexpr uint32_t MeshRecordIndexAddressLow  = 4; // index base + start_index * element size
+inline constexpr uint32_t MeshRecordIndexAddressHigh = 5;
+inline constexpr uint32_t MeshRecordPushElementSize  = 2;
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;

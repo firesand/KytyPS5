@@ -136,7 +136,33 @@ struct ShaderDrawParameters {
 	// Native (non-embedded) fetch expects the guest vertex / instance id without the draw's base:
 	// Vulkan adds firstVertex / firstInstance to the built-ins, so the emitter subtracts them.
 	bool     rebase_ids         = false;
+	// Mesh-stage GPU-side indirect draws: the batch SGPRs (vertex / instance / first-index slots) and
+	// the draw dwords of the host mesh path come from a per-record scratch the translation prepass
+	// writes, keyed by DrawIndex (see MeshIndirectTranslator). base_vertex_slot / base_instance_slot
+	// hold the packet's registers like the vertex variant; first_index_slot is mesh-only.
+	bool     mesh_record        = false;
+	uint32_t first_index_slot   = kNoSlot;
 };
+
+// First IR scalar register of the GS user-data dwords in merged / native NGG (mesh) programs: the
+// GS user SGPR k is copied to params.user_data[kMeshUserSgprBase + k] (PrepareProgram) and mesh
+// programs compile with user_data_base 0, so packet slot k is register s(kMeshUserSgprBase + k) and
+// bit kMeshUserSgprBase + k of ResourcePlan::user_data_mask. Vertex programs compile with
+// user_data_base 8 and params base 0: register 8 + k, mask bit k.
+inline constexpr uint32_t kMeshUserSgprBase = 8;
+
+// Mask of the ResourcePlan::user_data_mask bits the packet's named slots occupy; `bit_offset` is
+// kMeshUserSgprBase for mesh programs, 0 for vertex programs.
+[[nodiscard]] constexpr uint64_t DrawParameterSlotMask(const ShaderDrawParameters& draw,
+                                                       uint32_t bit_offset) {
+	const auto bit = [bit_offset](uint32_t slot) {
+		if (slot == ShaderDrawParameters::kNoSlot) {
+			return uint64_t {0};
+		}
+		return slot + bit_offset < 64u ? uint64_t {1} << (slot + bit_offset) : ~uint64_t {0};
+	};
+	return bit(draw.base_vertex_slot) | bit(draw.base_instance_slot) | bit(draw.first_index_slot);
+}
 
 struct ShaderVertexInputInfo {
 	static constexpr int RES_MAX = 32;
