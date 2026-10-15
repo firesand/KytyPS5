@@ -10,6 +10,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/hostReadStats.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -1241,6 +1242,35 @@ bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_c
 			HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackMesh);
 		}
 		return fallback();
+	}
+
+	if (mesh) {
+		// The placeholder draw registers, prepares and syncs the whole INDEX_BUFFER_SIZE range at
+		// the index base on every packet (the mesh shader reads indices through BDA). A huge or
+		// partly unmapped range would EXIT in the cache or sync megabytes per packet: keep those on
+		// the host path, which only touches each record's own range.
+		constexpr uint64_t MeshIndexRangeCap = 64ull << 20;
+		const uint64_t     element_size      = m_index_type_and_size == 0 ? 2u : 4u;
+		const uint64_t     range             = uint64_t {m_index_buffer_size} * element_size;
+		{
+			static std::mutex          seen_mutex;
+			static std::array<uint32_t, 16> seen {};
+			static uint32_t            seen_count = 0;
+			std::lock_guard            lock(seen_mutex);
+			if (seen_count < seen.size() &&
+			    std::find(seen.begin(), seen.begin() + seen_count, m_index_buffer_size) ==
+			        seen.begin() + seen_count) {
+				seen[seen_count++] = m_index_buffer_size;
+				LOGF("GpuIndirect(mesh): INDEX_BUFFER_SIZE %" PRIu32 " elements (%" PRIu64
+				     " bytes) at 0x%" PRIx64 "\n",
+				     m_index_buffer_size, range, m_index_base_addr);
+			}
+		}
+		if (range > MeshIndexRangeCap || !GuestRange {m_index_base_addr, range}.Valid() ||
+		    !m_renderer.IsMapped(m_index_base_addr, range)) {
+			HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackMesh);
+			return fallback();
+		}
 	}
 
 	GpuIndirectDraw draw;
