@@ -45389,8 +45389,12 @@ void CheckMeshDrawIndexGate0() {
 
   vk::PhysicalDeviceVulkan12Features f12{};
   f12.bufferDeviceAddress = true;
+  vk::PhysicalDeviceVulkan11Features f11{};
+  f11.shaderDrawParameters = true; // gl_DrawID
+  f12.pNext = &f11;
   vk::PhysicalDeviceVulkan13Features f13{};
   f13.dynamicRendering = true;
+  f13.synchronization2 = true; // phase 2 records pipelineBarrier2
   f13.pNext = &f12;
   vk::PhysicalDeviceMeshShaderFeaturesEXT mesh_features{};
   mesh_features.meshShader = true;

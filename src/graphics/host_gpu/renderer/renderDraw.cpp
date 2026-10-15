@@ -1354,6 +1354,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		// vkCmdDispatch is illegal inside dynamic rendering: close it (BeginRendering reopens). The
 		// prepass orders the producers of the records (when GPU-written) before its reads and its
 		// writes before the indirect command / mesh shader record reads.
+		// TODO(merge onto lazy barriers, 972d42a): place this block after PrepareForDraw, take
+		// producer_barrier from the lazily finalized indirect_barrier (hazards.indirect_write_stages /
+		// transfer_wrote, then clear them as the vertex branch does), and record the prepass's compute
+		// read of the arguments with hazards.read_stages |= eComputeShader.
 		m_context.GetCommandScheduler().EndRendering();
 		if (m_mesh_indirect == nullptr) {
 			m_mesh_indirect = std::make_unique<MeshIndirectTranslator>(
