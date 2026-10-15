@@ -38,6 +38,13 @@ struct GpuTileInfo {
 	uint32_t        tiled_width         = 0;
 	uint32_t        tiled_height        = 0;
 	uint32_t        surface_z           = 0;
+	// Optional partial refresh: only rows [row_begin, row_begin + row_count) (0 = all rows) and, when
+	// window_hi != 0, only elements whose tiled byte range lies inside [window_lo, window_hi), both
+	// relative to tiled_offset.
+	uint32_t        row_begin           = 0;
+	uint32_t        row_count           = 0;
+	uint32_t        window_lo           = 0;
+	uint32_t        window_hi           = 0;
 };
 
 class TileManager final {
@@ -67,6 +74,17 @@ public:
 	[[nodiscard]] Result Detile(vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
 	                            uint64_t linear_capacity, std::span<const GpuTileInfo> infos,
 	                            ColorTransform transform = ColorTransform::None);
+	// Windowed refresh: downloads the image rectangles `rects` into the scratch buffer, detiles only
+	// the elements inside each info's window over them, and returns the scratch so the same
+	// rectangles can be uploaded. Untouched texels of the rectangles round-trip unchanged.
+	[[nodiscard]] Result DetileWindows(Image& image, std::span<const vk::BufferImageCopy> rects,
+	                                   vk::Buffer tiled, uint64_t tiled_offset,
+	                                   uint64_t tiled_capacity, uint64_t linear_capacity,
+	                                   std::span<const GpuTileInfo> infos);
+	// Maps a tiled byte window [lo, hi) (relative to info.tiled_offset) to the element rows whose
+	// blocks it touches. False when the info is not a plain 2D block layout.
+	[[nodiscard]] static bool WindowRows(const GpuTileInfo& info, uint64_t lo, uint64_t hi,
+	                                     uint32_t& row_begin, uint32_t& row_count);
 	void Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity, vk::Buffer tiled,
 	          uint64_t tiled_offset, uint64_t tiled_capacity, std::span<const GpuTileInfo> infos);
 	void TileImage(Image& image, std::span<const vk::BufferImageCopy> regions, vk::Buffer tiled,
@@ -103,6 +121,10 @@ private:
 		uint32_t tail;
 		uint32_t color_transform;
 		uint32_t to_host;
+		uint32_t y_begin;
+		uint32_t y_end;
+		uint32_t win_lo;
+		uint32_t win_hi;
 	};
 	struct Dispatch {
 		Push     push {};

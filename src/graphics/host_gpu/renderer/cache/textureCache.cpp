@@ -1100,6 +1100,46 @@ struct TextureCache::ImageDownload {
 	bool                valid        = false;
 };
 
+namespace {
+
+std::atomic<int>      g_partial_override {-1};
+std::atomic<uint64_t> g_partial_windows {0};
+std::atomic<uint64_t> g_partial_whole {0};
+std::atomic<uint64_t> g_partial_bytes {0};
+std::atomic<uint64_t> g_partial_whole_bytes {0};
+
+bool PartialRefreshEnabled() {
+	static const bool environment = [] {
+		const char* value = std::getenv("KYTY_PARTIAL_REFRESH");
+		return value != nullptr && value[0] == '1' && value[1] == '\0'; // default off
+	}();
+	const int override_mode = g_partial_override.load(std::memory_order_relaxed);
+	return override_mode >= 0 ? override_mode != 0 : environment;
+}
+
+} // namespace
+
+TextureCache::PartialRefreshStats TextureCache::GetPartialRefreshStats() {
+	return {g_partial_windows.load(std::memory_order_relaxed),
+	        g_partial_whole.load(std::memory_order_relaxed),
+	        g_partial_bytes.load(std::memory_order_relaxed),
+	        g_partial_whole_bytes.load(std::memory_order_relaxed)};
+}
+
+void TextureCache::SetPartialRefreshOverride(int mode) {
+	g_partial_override.store(mode, std::memory_order_relaxed);
+}
+
+// Rectangles of an image to refresh from the buffer after partial writes, with the tiler infos
+// (tiled images) that detile only the written elements inside them.
+struct TextureCache::WindowPlan {
+	std::vector<vk::BufferImageCopy> copies;
+	std::vector<GpuTileInfo>         infos;
+	uint64_t                         linear_capacity = 0;
+	uint64_t                         rect_bytes      = 0;
+	bool                             tiled           = false;
+};
+
 TextureCache::TextureTransfer
 TextureCache::BuildTextureTransfer(const Image& image, BindingType binding,
                                     TransferDirection direction) const {
@@ -1172,6 +1212,227 @@ TextureCache::ImageDownload TextureCache::BuildDownload(const Image& image) cons
 	transfer.texture = BuildTextureTransfer(image, binding, TransferDirection::Download);
 	transfer.valid   = transfer.texture.valid;
 	return transfer;
+}
+
+// Window rule. `windows` are byte ranges relative to the image's guest memory that the buffer owns.
+//  - Linear: each range becomes up to three image rectangles (partial first row, whole middle rows,
+//    partial last row); the rectangles are copied straight from the source buffer.
+//  - Tiled: per mip/layer info, the part of each range inside [tiled_offset, tiled_offset+tiled_size)
+//    maps to block index = offset / block_size, block row = block index / blocks_per_row, and the
+//    texel rows of those block rows (whole mip for packed tail mips). The tiler detiles only the
+//    elements whose bytes lie inside the range, over an image download of the same rectangle, so every
+//    other texel of the rectangle round-trips unchanged.
+// Anything not covered (depth, volumes, colour transforms, block depth > 1, unaligned ranges, plans
+// touching more than half the image) is declined and the caller keeps the whole-image path.
+bool TextureCache::BuildWindowPlan(const Image& image, std::span<const Image::PendingWindow> windows,
+                                   WindowPlan& plan) const {
+	const auto& info = image.info;
+	plan             = {};
+	if (windows.empty() || image.depth_id || info.data.Empty() || info.samples != 1 ||
+	    image.backing.samples != 1 || info.IsDepth() || info.IsVolume() ||
+	    info.resources.layers == 0 ||
+	    info.metadata.compression != VideoOutCompression::Uncompressed) {
+		return false;
+	}
+	const auto binding = UploadBinding(image);
+	if (binding == BindingType::DepthTarget) {
+		return false;
+	}
+	auto transfer = BuildTextureTransfer(image, binding, TransferDirection::Upload);
+	if (!transfer.valid || transfer.color_transform != ColorTransform::None ||
+	    transfer.regions.empty()) {
+		return false;
+	}
+	const uint64_t size = info.data.size;
+	for (const auto& [lo, hi]: windows) {
+		if (lo >= hi || hi > size) {
+			return false;
+		}
+	}
+	if (transfer.tiles.empty()) {
+		TileTextureElementLayout element {};
+		if (!TileGetTextureElementLayout(info.guest_format, element) || element.bytes == 0 ||
+		    element.texel_width != 1 || element.texel_height != 1) {
+			return false;
+		}
+		const uint64_t bpe = element.bytes;
+		for (const auto& region: transfer.regions) {
+			if (region.imageExtent.depth != 1 || region.imageOffset.x != 0 ||
+			    region.imageOffset.y != 0 || region.bufferOffset % bpe != 0) {
+				return false;
+			}
+			const uint64_t w         = region.imageExtent.width;
+			const uint64_t h         = region.imageExtent.height;
+			const uint64_t row_bytes = (region.bufferRowLength != 0 ? region.bufferRowLength : w) * bpe;
+			const uint64_t begin     = region.bufferOffset;
+			const uint64_t end       = begin + (h - 1u) * row_bytes + w * bpe;
+			const auto     emit = [&](uint64_t row, uint64_t x0, uint64_t x1, uint64_t rows) {
+				if (x0 >= x1 || rows == 0) {
+					return;
+				}
+				auto copy               = region;
+				copy.bufferOffset       = begin + row * row_bytes + x0 * bpe;
+				copy.imageOffset        = vk::Offset3D {static_cast<int32_t>(x0),
+				                                        static_cast<int32_t>(row), 0};
+				copy.imageExtent        = vk::Extent3D {static_cast<uint32_t>(x1 - x0),
+				                                        static_cast<uint32_t>(rows), 1};
+				plan.copies.push_back(copy);
+				plan.rect_bytes += (x1 - x0) * rows * bpe;
+			};
+			for (const auto& [lo, hi]: windows) {
+				const uint64_t a = std::max(lo, begin);
+				const uint64_t b = std::min(hi, end);
+				if (a >= b) {
+					continue;
+				}
+				if ((a | b) % bpe != 0) {
+					return false;
+				}
+				const uint64_t from = a - begin, to = b - begin;
+				const uint64_t r0 = from / row_bytes, x0 = (from % row_bytes) / bpe;
+				const uint64_t r1 = (to - 1u) / row_bytes, x1 = ((to - 1u) % row_bytes) / bpe + 1u;
+				if (r0 == r1) {
+					emit(r0, x0, std::min(x1, w), 1);
+				} else {
+					emit(r0, x0, w, 1);
+					emit(r0 + 1u, 0, w, r1 - r0 - 1u);
+					emit(r1, 0, std::min(x1, w), 1);
+				}
+			}
+		}
+	} else {
+		if (transfer.tiles.size() != transfer.regions.size()) {
+			return false;
+		}
+		const auto&    texture = transfer.layout.surface.texture;
+		const uint64_t bpe     = transfer.tiles.front().bytes_per_element;
+		if (bpe == 0 || texture.texel_height == 0) {
+			return false;
+		}
+		for (size_t index = 0; index < transfer.tiles.size(); ++index) {
+			const auto& tile   = transfer.tiles[index];
+			const auto& region = transfer.regions[index];
+			if (tile.depth != 1 || tile.bytes_per_element != bpe || tile.tiled_offset % bpe != 0 ||
+			    tile.tiled_size % bpe != 0 || tile.tiled_size > UINT32_MAX) {
+				return false;
+			}
+			for (const auto& [lo, hi]: windows) {
+				const uint64_t a = std::max(lo, tile.tiled_offset);
+				const uint64_t b = std::min(hi, tile.tiled_offset + tile.tiled_size);
+				if (a >= b) {
+					continue;
+				}
+				if ((a | b) % bpe != 0) {
+					return false;
+				}
+				uint32_t row_begin = 0, row_count = 0;
+				if (!TileManager::WindowRows(tile, a - tile.tiled_offset, b - tile.tiled_offset,
+				                             row_begin, row_count)) {
+					return false;
+				}
+				const uint64_t first_row = uint64_t {row_begin} * texture.texel_height;
+				if (row_count == 0 || first_row >= region.imageExtent.height) {
+					continue; // only padding blocks
+				}
+				auto window         = tile;
+				window.row_begin    = row_begin;
+				window.row_count    = row_count;
+				window.window_lo    = static_cast<uint32_t>(a - tile.tiled_offset);
+				window.window_hi    = static_cast<uint32_t>(b - tile.tiled_offset);
+				plan.infos.push_back(window);
+				const uint64_t pitch_bytes = uint64_t {tile.pitch} * bpe;
+				auto           copy        = region;
+				copy.bufferOffset += row_begin * pitch_bytes;
+				copy.imageOffset.y += static_cast<int32_t>(first_row);
+				copy.imageExtent.height = static_cast<uint32_t>(std::min<uint64_t>(
+				    region.imageExtent.height - first_row, uint64_t {row_count} * texture.texel_height));
+				plan.copies.push_back(copy);
+				plan.rect_bytes += uint64_t {row_count} * pitch_bytes;
+			}
+		}
+		plan.tiled           = true;
+		plan.linear_capacity = transfer.LinearSize();
+		if (!plan.copies.empty() && plan.linear_capacity == 0) {
+			return false;
+		}
+	}
+	return plan.rect_bytes * 2u <= size;
+}
+
+bool TextureCache::UploadImageWindows(Image& image, Buffer& source, uint64_t source_offset) {
+	WindowPlan plan;
+	if (!BuildWindowPlan(image, image.PendingWindows(), plan)) {
+		return false;
+	}
+	ZeroCompanyImageLifecycle::Record(m_scheduler, "upload-windows-begin", {}, image,
+	    {.address = source.CpuAddress(), .size = source.Size(),
+	     .value0 = GpuDiagnostics::HandleValue(source.Handle()), .value1 = source_offset});
+	g_partial_windows.fetch_add(1, std::memory_order_relaxed);
+	g_partial_bytes.fetch_add(plan.rect_bytes, std::memory_order_relaxed);
+	g_partial_whole_bytes.fetch_add(image.info.data.size, std::memory_order_relaxed);
+	if (plan.copies.empty()) {
+		return true;
+	}
+	TileManager::Result linear {source.Handle(), source_offset, image.info.data.size};
+	if (plan.tiled) {
+		linear = m_tiler.DetileWindows(image, plan.copies, source.Handle(), source_offset,
+		                               image.info.data.size, plan.linear_capacity, plan.infos);
+	}
+	for (auto& copy: plan.copies) {
+		copy.bufferOffset += linear.offset;
+	}
+	image.Upload(plan.copies, linear.buffer, linear.offset, linear.size);
+	return true;
+}
+
+// GPU-write half of the partial refresh: record the written bytes of an image instead of handing the
+// whole image back to the buffer. Only exact partial writes (DMA fill/copy) of images that are not
+// CPU-dirty qualify; the plan must be buildable now so the later refresh can never decline.
+bool TextureCache::TryWindowInvalidate(Image& image, uint64_t address, uint64_t size,
+                                       bool write_pending,
+                                       std::span<const std::pair<uint64_t, uint64_t>> recorded,
+                                       bool partial) {
+	if (!partial || image.depth_id || image.IsCpuDirty() ||
+	    (image.IsBufferModified() && !image.HasPendingWindows())) {
+		return false;
+	}
+	const uint64_t base = image.info.data.address;
+	const uint64_t end  = image.info.data.End();
+	std::vector<Image::PendingWindow> set(image.PendingWindows().begin(),
+	                                      image.PendingWindows().end());
+	const auto add = [&](uint64_t from, uint64_t length) {
+		const uint64_t lo = std::max(from, base);
+		const uint64_t hi = std::min(from + length, end);
+		if (hi > lo) {
+			set.emplace_back(lo - base, hi - base);
+		}
+	};
+	add(address, size);
+	if (!write_pending) {
+		for (const auto& [from, length]: recorded) {
+			add(from, length);
+		}
+	}
+	std::sort(set.begin(), set.end());
+	size_t out = 0;
+	for (size_t index = 0; index < set.size(); ++index) {
+		if (out != 0 && set[index].first <= set[out - 1].second) {
+			set[out - 1].second = std::max(set[out - 1].second, set[index].second);
+		} else {
+			set[out++] = set[index];
+		}
+	}
+	set.resize(out);
+	if (set.empty() || set.size() > Image::MaxPendingWindows) {
+		return false;
+	}
+	WindowPlan plan;
+	if (!BuildWindowPlan(image, set, plan)) {
+		return false;
+	}
+	image.ClearGpuModified();
+	image.SetPendingWindows(set);
+	return true;
 }
 
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
@@ -1323,7 +1584,18 @@ void TextureCache::InitializeImage(ImageId id) {
 		if (source == nullptr) {
 			EXIT("TextureCache: failed to obtain image upload source\n");
 		}
-		UploadImage(image, *source, source_offset);
+		const bool window_candidate = image.HasPendingWindows() && !image.IsCpuDirty();
+		if (!(window_candidate && PartialRefreshEnabled() &&
+		      UploadImageWindows(image, *source, source_offset))) {
+			if (window_candidate && PartialRefreshEnabled()) {
+				LOGF("PartialRefresh: window plan declined at refresh, uploading whole %s\n",
+				     DescribeImageInfo(image.info).c_str());
+			}
+			UploadImage(image, *source, source_offset);
+			g_partial_whole.fetch_add(1, std::memory_order_relaxed);
+			g_partial_bytes.fetch_add(image.info.data.size, std::memory_order_relaxed);
+			g_partial_whole_bytes.fetch_add(image.info.data.size, std::memory_order_relaxed);
+		}
 		image.ClearBufferModified();
 	}
 	if (image.IsCpuDirty()) {
@@ -2062,8 +2334,11 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 bool TextureCache::PreserveGpuPixels(ImageId id, Image& image,
                                      std::span<const std::pair<uint64_t, uint64_t>> excluded) {
 	const auto& info = image.info;
-	if (image.depth_id || info.samples != 1 || info.data.Empty() || !image.IsGpuModified() ||
-	    image.IsBufferModified() || image.IsDefinitelyCpuDirty()) {
+	// Pending windows mean the image's own pixels outside them are still authoritative.
+	const bool windows = image.HasPendingWindows();
+	if (image.depth_id || info.samples != 1 || info.data.Empty() ||
+	    (!windows && (!image.IsGpuModified() || image.IsBufferModified())) ||
+	    image.IsDefinitelyCpuDirty()) {
 		return false;
 	}
 	if (image.IsMaybeCpuDirty()) {
@@ -2562,7 +2837,13 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, bool
 			}
 			continue;
 		}
-		if (image.IsGpuModified()) {
+		if (merge && coverage == GpuWriteCoverage::Exact && PartialRefreshEnabled() &&
+		    TryWindowInvalidate(image, address, size, write_pending, recorded, partial)) {
+			ZeroCompanyImageLifecycle::Record(m_scheduler, "invalidate-gpu-windowed", id, image,
+			    {.address = address, .size = size});
+			continue;
+		}
+		if (image.IsGpuModified() || image.HasPendingWindows()) {
 			// Rendering-defect forensics (2026-10-13): a GPU buffer write starting at this image's
 			// base hands authority back to guest memory; the image's own GPU pixels are then
 			// replaced by the buffer contents at the next bind (ng-58: scene targets re-uploaded
@@ -2585,7 +2866,12 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, bool
 			if (merge && (partial || coverage == GpuWriteCoverage::Conservative)) {
 				static uint64_t merged = 0;
 				static uint64_t failed = 0;
-				if (PreserveGpuPixels(id, image, excluded)) {
+				// Windows pending from earlier partial writes hold newer buffer bytes too.
+				auto local_excluded = excluded;
+				for (const auto& [lo, hi]: image.PendingWindows()) {
+					local_excluded.emplace_back(image.info.data.address + lo, hi - lo);
+				}
+				if (PreserveGpuPixels(id, image, local_excluded)) {
 					if (++merged == 1 || merged % 1000 == 0) {
 						LOGF("PartialWriteMerge: preserved GPU pixels around 0x%" PRIx64 " bytes in %s "
 						     "(merged=%" PRIu64 " unmergeable=%" PRIu64 ")\n",

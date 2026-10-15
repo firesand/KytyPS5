@@ -106,10 +106,19 @@ public:
 	// Diagnostics: images overlapping [address, address+size) as "img[...]" text, or "none".
 	[[nodiscard]] std::string DescribeImagesIn(uint64_t address, uint64_t size);
 
+	// KYTY_PARTIAL_REFRESH=1: refresh only the written window of an image after a partial GPU buffer
+	// write. Counters are process-wide; the override (-1 = environment) lets tests run both modes.
+	struct PartialRefreshStats {
+		uint64_t windows = 0, whole = 0, bytes = 0, whole_bytes = 0;
+	};
+	[[nodiscard]] static PartialRefreshStats GetPartialRefreshStats();
+	static void SetPartialRefreshOverride(int mode);
+
 private:
 	enum class TransferDirection { Upload, Download };
 	struct TextureTransfer;
 	struct ImageDownload;
+	struct WindowPlan;
 
 	struct MetaDataInfo {
 		enum class Type : uint8_t { CMask, FMask, HTile };
@@ -190,6 +199,14 @@ private:
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
 	[[nodiscard]] ImageDownload BuildDownload(const Image& image) const;
 	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
+	[[nodiscard]] bool BuildWindowPlan(const Image& image,
+	                                   std::span<const Image::PendingWindow> windows,
+	                                   WindowPlan& plan) const;
+	[[nodiscard]] bool UploadImageWindows(Image& image, Buffer& source, uint64_t source_offset);
+	[[nodiscard]] bool TryWindowInvalidate(Image& image, uint64_t address, uint64_t size,
+	                                       bool write_pending,
+	                                       std::span<const std::pair<uint64_t, uint64_t>> recorded,
+	                                       bool partial);
 	bool PreserveGpuPixels(ImageId id, Image& image,
 	                       std::span<const std::pair<uint64_t, uint64_t>> excluded);
 	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,

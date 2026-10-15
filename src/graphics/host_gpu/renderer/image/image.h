@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
+#include <array>
 #include <compare>
 #include <limits>
 #include <optional>
@@ -133,8 +134,35 @@ public:
 		m_buffer_modified = true;
 		// Buffer contents supersede these pixels; a host read must use the buffer owner.
 		cpu_readback_pending = false;
+		// A whole-image mark supersedes any narrower pending windows.
+		m_window_count = 0;
 	}
-	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
+	void ClearBufferModified() noexcept {
+		m_buffer_modified = false;
+		m_window_count    = 0;
+	}
+
+	// Partial refresh (KYTY_PARTIAL_REFRESH): byte ranges, relative to info.data.address, of the
+	// buffer-owned bytes since the last refresh. While present, the image's own pixels outside these
+	// ranges are authoritative and only the ranges need to be re-uploaded. Empty means "whole image".
+	static constexpr uint32_t MaxPendingWindows = 8;
+	using PendingWindow                         = std::pair<uint64_t, uint64_t>;
+	[[nodiscard]] bool HasPendingWindows() const noexcept {
+		return m_buffer_modified && m_window_count != 0;
+	}
+	[[nodiscard]] std::span<const PendingWindow> PendingWindows() const noexcept {
+		return {m_windows.data(), HasPendingWindows() ? m_window_count : 0u};
+	}
+	void SetPendingWindows(std::span<const PendingWindow> windows) noexcept {
+		m_buffer_modified    = true;
+		cpu_readback_pending = false;
+		m_window_count       = 0;
+		for (const auto& window: windows) {
+			if (m_window_count < MaxPendingWindows) {
+				m_windows[m_window_count++] = window;
+			}
+		}
+	}
 
 	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size,
 	                            bool pages = false) const noexcept {
@@ -186,6 +214,8 @@ private:
 	bool              m_maybe_hash_valid = false;
 	bool              m_gpu_modified     = false;
 	bool              m_buffer_modified  = false;
+	uint32_t          m_window_count     = 0;
+	std::array<PendingWindow, MaxPendingWindows> m_windows {};
 };
 
 namespace ImageOps {

@@ -253,6 +253,11 @@ struct FaultSampler {
 		                    cpu_delta.process_user_ms, cpu_delta.process_sys_ms, cat(BudgetProbe::Wait),
 		                    cat(BudgetProbe::Sync), cat(BudgetProbe::Draw), cat(BudgetProbe::Dispatch),
 		                    cat(BudgetProbe::Protect), cat(BudgetProbe::Submit));
+		{
+			const auto pr = TextureCache::GetPartialRefreshStats();
+			line += fmt::format(" | partial-refresh {} windows {} whole (bytes refreshed {} MiB vs {} MiB whole)",
+			                    pr.windows, pr.whole, pr.bytes >> 20, pr.whole_bytes >> 20);
+		}
 		LOGF("%s\n", line.c_str());
 		last_total = now;
 	}

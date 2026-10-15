@@ -18,6 +18,12 @@ layout(set = 0, binding = 2, std140) uniform Push {
 	uint tail_y;
 	uint tail;
 	uint color_transform;
+	uint to_host;
+	// Row window [y_begin, y_end) and, when win_hi != 0, a source/destination tiled byte window.
+	uint y_begin;
+	uint y_end;
+	uint win_lo;
+	uint win_hi;
 } params;
 
 #include "gpu_tiler_color.inc"
@@ -44,7 +50,8 @@ void copy_element(uint src, uint dst) {
 
 void main() {
 	uvec3 p = gl_GlobalInvocationID;
-	if (p.x >= params.width || p.y >= params.height || p.z >= params.depth) {
+	p.y += params.y_begin;
+	if (p.x >= params.width || p.y >= params.y_end || p.z >= params.depth) {
 		return;
 	}
 
@@ -61,6 +68,9 @@ void main() {
 	                   block.y * params.blocks_per_row + block.x;
 	uint tiled = block_index * BLOCK_BYTES +
 	             block_offset(uvec3(swizzle.xy, swizzle.z + params.surface_z));
+	if (params.win_hi != 0u && (tiled < params.win_lo || tiled + ELEMENT_BYTES > params.win_hi)) {
+		return;
+	}
 	uint linear = p.z * params.slice_bytes + p.y * params.pitch_bytes +
 	              p.x * ELEMENT_BYTES;
 	if (TILE == 0) {

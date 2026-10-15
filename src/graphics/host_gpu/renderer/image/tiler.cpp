@@ -32,7 +32,7 @@ TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler,
                          StreamBuffer& stream_buffer)
     : m_graphics(graphics), m_scheduler(scheduler), m_stream_buffer(stream_buffer) {
 	static_assert(FamilyCount == 9);
-	static_assert(sizeof(Push) == 60);
+	static_assert(sizeof(Push) == 76);
 	std::array<vk::DescriptorSetLayoutBinding, 3> bindings {};
 	for (uint32_t index = 0; index < 2; index++) {
 		bindings[index] = {index, vk::DescriptorType::eStorageBuffer, 1,
@@ -198,6 +198,13 @@ void TileManager::Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_ca
 		dispatch.push.tail_y           = info.tail_y;
 		dispatch.push.tail             = info.tail;
 		dispatch.push.color_transform  = static_cast<uint32_t>(transform);
+		EXIT_NOT_IMPLEMENTED(info.row_begin > info.height ||
+		                     info.row_count > info.height - info.row_begin ||
+		                     (info.window_hi != 0 && info.window_lo >= info.window_hi));
+		dispatch.push.y_begin = info.row_begin;
+		dispatch.push.y_end   = info.row_count != 0 ? info.row_begin + info.row_count : info.height;
+		dispatch.push.win_lo  = info.window_lo;
+		dispatch.push.win_hi  = info.window_hi;
 		dispatches.push_back(dispatch);
 	}
 
@@ -330,13 +337,15 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
 		                             static_cast<uint32_t>(writes.size()), writes.data());
 		command.bindPipeline(vk::PipelineBindPoint::eCompute, GetPipeline(dispatch.pipeline_slot));
-		{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::CacheDispatch); command.dispatch((dispatch.push.width + 7u) / 8u, (dispatch.push.height + 7u) / 8u,
+		{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::CacheDispatch); command.dispatch((dispatch.push.width + 7u) / 8u,
+		                 (dispatch.push.y_end - dispatch.push.y_begin + 7u) / 8u,
 		                 dispatch.push.depth); }
 		if (GpuDiagnostics::Enabled()) {
 			GpuDiagnosticEvent event;
 			event.kind = "utility-tiler";
 			event.pipeline = GpuDiagnostics::HandleValue(GetPipeline(dispatch.pipeline_slot));
-			event.args = {(dispatch.push.width + 7u) / 8u, (dispatch.push.height + 7u) / 8u,
+			event.args = {(dispatch.push.width + 7u) / 8u,
+			              (dispatch.push.y_end - dispatch.push.y_begin + 7u) / 8u,
 			              dispatch.push.depth, static_cast<uint64_t>(dispatch.pipeline_slot),
 			              GpuDiagnostics::HandleValue(source), GpuDiagnostics::HandleValue(target)};
 			m_scheduler.RecordGpuOperation(event);
@@ -396,6 +405,56 @@ void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> r
 	image.Download(regions, linear.buffer, 0, linear.size);
 	Record(linear.buffer, 0, linear_capacity, tiled, tiled_offset, tiled_capacity,
 	       dispatches, false);
+}
+
+TileManager::Result TileManager::DetileWindows(Image& image,
+                                               std::span<const vk::BufferImageCopy> rects,
+                                               vk::Buffer tiled, uint64_t tiled_offset,
+                                               uint64_t tiled_capacity, uint64_t linear_capacity,
+                                               std::span<const GpuTileInfo> infos) {
+	EXIT_IF(rects.empty());
+	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
+	const uint64_t descriptor_alignment =
+	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
+	const uint64_t        source_base = tiled_offset & (descriptor_alignment - 1);
+	std::vector<Dispatch> dispatches;
+	// Reserve stream parameters before recording the image download.
+	Prepare(false, tiled_capacity, linear_capacity, infos, source_base, 0, dispatches);
+	auto scratch = GetScratchBuffer(linear_capacity, tiled);
+	image.Download(rects, scratch.buffer, 0, scratch.size);
+	Record(tiled, tiled_offset, tiled_capacity, scratch.buffer, 0, scratch.size, dispatches, false);
+	return {scratch.buffer, 0, linear_capacity};
+}
+
+bool TileManager::WindowRows(const GpuTileInfo& info, uint64_t lo, uint64_t hi,
+                             uint32_t& row_begin, uint32_t& row_count) {
+	TileBlockLayout block {};
+	if (lo >= hi || !TileGetBlockLayout(info.family, info.bytes_per_element, block) ||
+	    block.block_depth != 1 || info.depth != 1 || info.height == 0) {
+		return false;
+	}
+	if (info.tail) {
+		row_begin = 0;
+		row_count = info.height;
+		return true;
+	}
+	const uint32_t tiled_width = info.tiled_width != 0 ? info.tiled_width : info.pitch;
+	const uint64_t columns     = (static_cast<uint64_t>(tiled_width) + block.block_width - 1u) /
+	                         block.block_width;
+	if (columns == 0) {
+		return false;
+	}
+	const uint64_t first_row = (lo / block.block_size) / columns * block.block_height;
+	const uint64_t last_row  = ((hi - 1u) / block.block_size) / columns;
+	const uint64_t end_row   = std::min<uint64_t>((last_row + 1u) * block.block_height, info.height);
+	if (first_row >= end_row) {
+		row_begin = 0;
+		row_count = 0; // the window lies in padding blocks below the image
+		return true;
+	}
+	row_begin = static_cast<uint32_t>(first_row);
+	row_count = static_cast<uint32_t>(end_row - first_row);
+	return true;
 }
 
 TileManager::Result TileManager::GetScratchBuffer(uint64_t size, vk::Buffer input) {
