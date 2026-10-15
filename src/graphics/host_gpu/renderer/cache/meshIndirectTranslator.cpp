@@ -119,7 +119,6 @@ MeshIndirectTranslator::Result MeshIndirectTranslator::Translate(vk::CommandBuff
 		}
 		barriers[count].srcStageMask  = vk::PipelineStageFlagBits2::eDrawIndirect |
 		                               vk::PipelineStageFlagBits2::eMeshShaderEXT |
-		                               vk::PipelineStageFlagBits2::eTaskShaderEXT |
 		                               vk::PipelineStageFlagBits2::eComputeShader;
 		barriers[count].srcAccessMask = vk::AccessFlagBits2::eIndirectCommandRead |
 		                                vk::AccessFlagBits2::eShaderRead |
