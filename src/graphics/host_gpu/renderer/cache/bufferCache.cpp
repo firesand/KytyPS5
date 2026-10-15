@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/gpuTimestamps.h"
 
 #include "graphics/host_gpu/renderer/gpuDiagnostics.h"
 
@@ -59,16 +60,16 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* 
 		dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
 		dependency.bufferMemoryBarrierCount = 1;
 		dependency.pBufferMemoryBarriers    = &before;
-		command.pipelineBarrier2(dependency);
+		{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::BarrierBuffer); command.pipelineBarrier2(dependency); }
 		const vk::BufferCopy copy {offset, destination_offset, chunk};
-		command.copyBuffer(m_staging_buffer.Handle(), buffer.Handle(), 1, &copy);
+		{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::CopyUpload); command.copyBuffer(m_staging_buffer.Handle(), buffer.Handle(), 1, &copy); }
 		auto after          = before;
 		after.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
 		after.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
 		after.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
 		after.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
 		dependency.pBufferMemoryBarriers = &after;
-		command.pipelineBarrier2(dependency);
+		{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::BarrierBuffer); command.pipelineBarrier2(dependency); }
 		bytes += chunk;
 		address += chunk;
 		size -= chunk;
@@ -197,11 +198,11 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	before.buffer              = buffer.Handle();
 	before.offset              = 0;
 	before.size                = buffer.Size();
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	{ GpuTimestampScope ts_scope(native, GpuTimestamps::Kind::BarrierBuffer); native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
-	                       nullptr);
-	native.copyBuffer(buffer.Handle(), download.Handle(),
-	                  static_cast<uint32_t>(copies.size()), copies.data());
+	                       nullptr); }
+	{ GpuTimestampScope ts_scope(native, GpuTimestamps::Kind::CopyUpload); native.copyBuffer(buffer.Handle(), download.Handle(),
+	                  static_cast<uint32_t>(copies.size()), copies.data()); }
 	if (GpuDiagnostics::Enabled()) {
 		for (const auto& copy : copies) {
 			GpuDiagnosticEvent event;
@@ -219,10 +220,10 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	after.buffer        = download.Handle();
 	after.offset        = offset;
 	after.size          = total_size;
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	{ GpuTimestampScope ts_scope(native, GpuTimestamps::Kind::BarrierBuffer); native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 	                       vk::PipelineStageFlagBits::eAllCommands |
 	                           vk::PipelineStageFlagBits::eHost,
-	                       {}, 0, nullptr, 1, &after, 0, nullptr);
+	                       {}, 0, nullptr, 1, &after, 0, nullptr); }
 	auto publish = [this, mapped, offset, total_size, buffer_address,
 	                copies = std::move(copies), owner = std::move(temporary)] {
 		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
@@ -593,17 +594,17 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		before.buffer              = buffer.Handle();
 		before.offset              = 0;
 		before.size                = buffer.Size();
-		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		{ GpuTimestampScope ts_scope(native, GpuTimestamps::Kind::BarrierBuffer); native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 		                       vk::PipelineStageFlagBits::eTransfer,
-		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &before, 0, nullptr);
-		native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
-		                  copies.data());
+		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &before, 0, nullptr); }
+		{ GpuTimestampScope ts_scope(native, GpuTimestamps::Kind::CopyUpload); native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
+		                  copies.data()); }
 		auto after          = before;
 		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 		after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
-		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		{ GpuTimestampScope ts_scope(native, GpuTimestamps::Kind::BarrierBuffer); native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 		                       vk::PipelineStageFlagBits::eAllCommands,
-		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
+		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr); }
 	}
 	if (is_texel_buffer && !is_written) {
 		return SynchronizeBufferFromImage(buffer, vaddr, size);
@@ -1031,17 +1032,17 @@ void BufferCache::EndUploadBatch() {
 	before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
 	                       vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
 	before.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer,
-	                       vk::DependencyFlagBits::eByRegion, 1, &before, 0, nullptr, 0, nullptr);
+	{ GpuTimestampScope ts_scope(native, GpuTimestamps::Kind::BarrierGlobal); native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer,
+	                       vk::DependencyFlagBits::eByRegion, 1, &before, 0, nullptr, 0, nullptr); }
 	for (const auto& upload: m_pending_uploads) {
-		native.copyBuffer(upload.source, upload.destination, static_cast<uint32_t>(upload.copies.size()),
-		                  upload.copies.data());
+		{ GpuTimestampScope ts_scope(native, GpuTimestamps::Kind::CopyUpload); native.copyBuffer(upload.source, upload.destination, static_cast<uint32_t>(upload.copies.size()),
+		                  upload.copies.data()); }
 	}
 	vk::MemoryBarrier after {};
 	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands,
-	                       vk::DependencyFlagBits::eByRegion, 1, &after, 0, nullptr, 0, nullptr);
+	{ GpuTimestampScope ts_scope(native, GpuTimestamps::Kind::BarrierGlobal); native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::DependencyFlagBits::eByRegion, 1, &after, 0, nullptr, 0, nullptr); }
 	m_sync_stats.copy_batches++;
 	m_pending_uploads.clear();
 }

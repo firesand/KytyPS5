@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/gpuTimestamps.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -412,9 +413,9 @@ bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
 		              std::max(destination.backing.extent.height >> range.base_level, 1u)}),
 		    1u};
 	}
-	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+	{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::CopyImage); command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
 	                  destination.backing.image, vk::ImageLayout::eTransferDstOptimal,
-	                  count, regions.data());
+	                  count, regions.data()); }
 	return true;
 }
 

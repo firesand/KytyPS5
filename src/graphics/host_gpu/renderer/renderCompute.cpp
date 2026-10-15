@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "graphics/host_gpu/renderer/gpuTimestamps.h"
 #include "common/common.h"
 #include "graphics/host_gpu/hostReadStats.h"
 #include "common/emulatorConfig.h"
@@ -723,11 +724,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	vk::MemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
-	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
+	{ GpuTimestampScope ts_scope(vk_buffer, GpuTimestamps::Kind::BarrierGlobal); vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
 	                              vk::PipelineStageFlagBits::eComputeShader |
 	                              vk::PipelineStageFlagBits::eTransfer,
 	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
-	                          1, &barrier, 0, nullptr, 0, nullptr);
+	                          1, &barrier, 0, nullptr, 0, nullptr); }
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	if (program.info.uses_write_faults) {
 		m_context.GetBufferCache().MarkWriteFaultsDirty();

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
+#include "graphics/host_gpu/renderer/gpuTimestamps.h"
 
 #include "common/assert.h"
 #include "gpu_blit_shaders/gpu_blit_color_to_ms_depth_spv.h"
@@ -166,6 +167,7 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	rendering.renderArea.extent = {destination_info.extent.width, destination_info.extent.height};
 	rendering.layerCount        = 1;
 	rendering.pDepthAttachment  = &depth_attachment;
+	GpuTimestampScope blit_scope(command, GpuTimestamps::Kind::Blit);
 	command.beginRendering(&rendering);
 
 	vk::DescriptorImageInfo descriptor_image {};

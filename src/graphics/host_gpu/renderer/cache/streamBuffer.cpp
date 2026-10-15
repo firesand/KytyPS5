@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/gpuTimestamps.h"
 #include <cstdlib>
 #include <atomic>
 
@@ -240,10 +241,10 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 		before_stage |= vk::PipelineStageFlagBits::eHost;
 	}
 	const auto native = command.Handle();
-	native.pipelineBarrier(before_stage, vk::PipelineStageFlagBits::eTransfer,
-	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, before, 0, nullptr);
+	{ GpuTimestampScope ts_scope(native, GpuTimestamps::Kind::BarrierBuffer); native.pipelineBarrier(before_stage, vk::PipelineStageFlagBits::eTransfer,
+	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, before, 0, nullptr); }
 	const vk::BufferCopy copy {source_offset, destination_offset, size};
-	native.copyBuffer(source.Handle(), Handle(), 1, &copy);
+	{ GpuTimestampScope ts_scope(native, GpuTimestamps::Kind::CopyUpload); native.copyBuffer(source.Handle(), Handle(), 1, &copy); }
 	const vk::BufferMemoryBarrier after[] = {
 	    source.Barrier(source_offset, size, vk::AccessFlagBits::eTransferRead, source_after),
 	    Barrier(destination_offset, size, vk::AccessFlagBits::eTransferWrite, destination_after),
@@ -252,8 +253,8 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	if (static_cast<bool>((source_after | destination_after) & host_access)) {
 		after_stage |= vk::PipelineStageFlagBits::eHost;
 	}
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, after_stage,
-	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, after, 0, nullptr);
+	{ GpuTimestampScope ts_scope(native, GpuTimestamps::Kind::BarrierBuffer); native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, after_stage,
+	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, after, 0, nullptr); }
 }
 
 void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
@@ -266,15 +267,15 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 	    Barrier(offset, size, vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
 	            vk::AccessFlagBits::eTransferWrite);
 	const auto native = command.Handle();
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	{ GpuTimestampScope ts_scope(native, GpuTimestamps::Kind::BarrierBuffer); native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
-	                       0, nullptr, 1, &before, 0, nullptr);
-	native.fillBuffer(Handle(), offset, size, value);
+	                       0, nullptr, 1, &before, 0, nullptr); }
+	{ GpuTimestampScope ts_scope(native, GpuTimestamps::Kind::Fill); native.fillBuffer(Handle(), offset, size, value); }
 	const auto after = Barrier(offset, size, vk::AccessFlagBits::eTransferWrite,
 	                           vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite);
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	{ GpuTimestampScope ts_scope(native, GpuTimestamps::Kind::BarrierBuffer); native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 	                       vk::PipelineStageFlagBits::eAllCommands,
-	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
+	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr); }
 }
 
 StreamBuffer::StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,

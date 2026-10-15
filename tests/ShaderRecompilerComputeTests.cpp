@@ -5282,8 +5282,26 @@ public:
                               GpuTimestamps::Kind::Dispatch, 0x1234u + (i & 1u));
       scheduler.Current().Handle().fillBuffer(target.buffer, 0, target.size, 0xa5a5a5a5u + i);
     }
+    {
+      // Non-shader kinds use the command-buffer-only form; a nested scope folds into the outer one.
+      GpuTimestampScope outer(scheduler.Current().Handle(), GpuTimestamps::Kind::Fill);
+      GpuTimestampScope inner(scheduler.Current().Handle(), GpuTimestamps::Kind::BarrierGlobal);
+      scheduler.Current().Handle().fillBuffer(target.buffer, 0, target.size, 0x5a5a5a5au);
+    }
+    {
+      GpuTimestampScope barrier(scheduler.Current().Handle(), GpuTimestamps::Kind::BarrierGlobal);
+      vk::MemoryBarrier memory{};
+      memory.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      memory.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+      scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+          vk::PipelineStageFlagBits::eTransfer, {}, 1, &memory, 0, nullptr, 0, nullptr);
+    }
     scheduler.Finish();
     const auto snapshot = timestamps->Take(scheduler.GetMasterSemaphore().KnownGpuTick());
+    Require(name, "other kinds",
+            snapshot.kinds[static_cast<size_t>(GpuTimestamps::Kind::Fill)].count == 1 &&
+                snapshot.kinds[static_cast<size_t>(GpuTimestamps::Kind::BarrierGlobal)].count == 1,
+            "nested scope was not folded into the outer one or a non-shader kind was lost");
     Require(name, "ops seen", snapshot.ops >= op_count && snapshot.ticks >= 1,
             "completed tick did not report its tagged ops");
     Require(name, "hashes", snapshot.shaders.size() == 2, "per-shader accumulation lost a key");
@@ -5293,7 +5311,7 @@ public:
                 snapshot.attributed_ns <= snapshot.span_ns + 1000,
             "attributed time must not exceed the tick span");
     const auto line = GpuTimestamps::Format(snapshot);
-    Require(name, "line", line.rfind("GpuTime: ticks ", 0) == 0 && line.size() < 1536,
+    Require(name, "line", line.rfind("GpuTime: ticks ", 0) == 0 && line.find("| other:") != std::string::npos && line.find("barrier-global") != std::string::npos && line.size() < 1536,
             "summary line has the wrong shape");
     std::printf("[gpu]     %s", line.c_str());
     DestroyBuffer(&target);

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "graphics/host_gpu/renderer/gpuTimestamps.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -1959,8 +1960,11 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 		rendering.layerCount           = range.layerCount;
 		rendering.colorAttachmentCount = 1;
 		rendering.pColorAttachments    = &attachment;
-		command.Handle().beginRendering(&rendering);
-		command.Handle().endRendering();
+		{
+			GpuTimestampScope clear_scope(command.Handle(), GpuTimestamps::Kind::Clear);
+			command.Handle().beginRendering(&rendering);
+			command.Handle().endRendering();
+		}
 		CommitGpuWrite(image);
 		return;
 	}
@@ -1972,12 +1976,12 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 		native_range.layerCount     = 1;
 	}
 	if (range.aspectMask == vk::ImageAspectFlagBits::eColor) {
-		command.Handle().clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
-		                                 &clear.color, 1, &native_range);
+		{ GpuTimestampScope ts_scope(command.Handle(), GpuTimestamps::Kind::Clear); command.Handle().clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
+		                                 &clear.color, 1, &native_range); }
 	} else {
-		command.Handle().clearDepthStencilImage(image.backing.image,
+		{ GpuTimestampScope ts_scope(command.Handle(), GpuTimestamps::Kind::Clear); command.Handle().clearDepthStencilImage(image.backing.image,
 		                                        vk::ImageLayout::eTransferDstOptimal,
-		                                        &clear.depthStencil, 1, &native_range);
+		                                        &clear.depthStencil, 1, &native_range); }
 	}
 	CommitGpuWrite(image);
 }
@@ -2155,15 +2159,15 @@ bool TextureCache::PreserveGpuPixels(ImageId id, Image& image,
 		before[1].dstAccessMask = vk::AccessFlagBits::eTransferWrite;
 		before[1].buffer        = buffer->Handle();
 		before[1].offset        = offset;
-		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		{ GpuTimestampScope ts_scope(native, GpuTimestamps::Kind::BarrierBuffer); native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 		                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
-		                       0, nullptr, 2, before.data(), 0, nullptr);
+		                       0, nullptr, 2, before.data(), 0, nullptr); }
 		for (auto& run: runs) {
 			run.srcOffset += scratch.offset;
 			run.dstOffset += offset;
 		}
-		native.copyBuffer(scratch.buffer, buffer->Handle(), static_cast<uint32_t>(runs.size()),
-		                  runs.data());
+		{ GpuTimestampScope ts_scope(native, GpuTimestamps::Kind::CopyUpload); native.copyBuffer(scratch.buffer, buffer->Handle(), static_cast<uint32_t>(runs.size()),
+		                  runs.data()); }
 	}
 	vk::BufferMemoryBarrier after {};
 	after.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eShaderWrite |
@@ -2174,9 +2178,9 @@ bool TextureCache::PreserveGpuPixels(ImageId id, Image& image,
 	after.buffer              = buffer->Handle();
 	after.offset              = offset;
 	after.size                = size;
-	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	{ GpuTimestampScope ts_scope(m_scheduler.Current().Handle(), GpuTimestamps::Kind::BarrierBuffer); m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::PipelineStageFlagBits::eAllCommands, vk::DependencyFlagBits::eByRegion,
-	                       0, nullptr, 1, &after, 0, nullptr);
+	                       0, nullptr, 1, &after, 0, nullptr); }
 	const auto tick             = m_scheduler.CurrentTick();
 	buffer->last_gpu_write_tick = tick;
 	m_buffer_cache.NoteGpuWrite(base, size, tick);
@@ -2324,9 +2328,9 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	barrier.offset              = offset;
 	barrier.size                = range.size;
 	m_scheduler.EndRendering();
-	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	{ GpuTimestampScope ts_scope(m_scheduler.Current().Handle(), GpuTimestamps::Kind::BarrierBuffer); m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
-	                                               1, &barrier, 0, nullptr);
+	                                               1, &barrier, 0, nullptr); }
 	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
 		download.Invalidate(offset, range.size);
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
