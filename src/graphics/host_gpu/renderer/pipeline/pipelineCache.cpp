@@ -30,6 +30,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
+#include <string>
 #include <limits>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
@@ -329,6 +330,12 @@ struct PipelineCache::ProgramCache {
 			return enabled;
 		}
 		enum class MemoMiss { None, Hit, Empty, Base, UserData, Workgroups, Read, PushData };
+		// First mismatching used register per user-data miss (GPU thread only): tells the next
+		// KYTY_SRT_MEMO=1 run which registers (the SRT pointer pair?) defeat the memo.
+		static std::array<uint64_t, 64>& RegisterMisses() {
+			static std::array<uint64_t, 64> misses {};
+			return misses;
+		}
 		static void CountMemo(MemoMiss outcome) {
 			static std::array<uint64_t, 8> counts {}; // GPU thread only
 			counts[static_cast<size_t>(outcome)]++;
@@ -338,6 +345,43 @@ struct PipelineCache::ProgramCache {
 				LOGF("SrtMemo: hits=%" PRIu64 " empty=%" PRIu64 " base=%" PRIu64 " userdata=%" PRIu64
 				     " workgroups=%" PRIu64 " read=%" PRIu64 " pushdata=%" PRIu64 "\n",
 				     counts[1], counts[2], counts[3], counts[4], counts[5], counts[6], counts[7]);
+				std::string registers;
+				for (size_t reg = 0; reg < RegisterMisses().size(); ++reg) {
+					if (RegisterMisses()[reg] != 0) {
+						registers += " r" + std::to_string(reg) + "=" +
+						             std::to_string(RegisterMisses()[reg]);
+					}
+				}
+				LOGF("SrtMemo: first mismatching user-data register:%s\n", registers.c_str());
+			}
+		}
+		// Diagnostic only (KYTY_SRT_MEMO=1): when exactly one used register changed (an SRT pointer
+		// low word), would the recorded reads, shifted by that delta, still hold the same words?
+		// A "yes" rate bounds what a pointer-relative memo key could hit; the memo itself still
+		// treats the lookup as a miss.
+		void CountRelativeReplay(const ShaderRecompiler::IR::SrtRuntime& runtime, size_t reg) const {
+			static uint64_t tested = 0;
+			static uint64_t equal  = 0;
+			const int64_t   delta  = static_cast<int64_t>(runtime.user_data[reg]) -
+			                       static_cast<int64_t>(memo.user_data[reg]);
+			thread_local std::vector<uint32_t> scratch;
+			bool                               same = true;
+			for (const auto& read: memo.reads) {
+				scratch.resize(read.dwords);
+				if (!LibKernel::Memory::TryReadBufferBacking(
+				        static_cast<uint64_t>(static_cast<int64_t>(read.address) + delta),
+				        scratch.data(), read.dwords * sizeof(uint32_t)) ||
+				    std::memcmp(scratch.data(), memo.words.data() + read.offset,
+				                read.dwords * sizeof(uint32_t)) != 0) {
+					same = false;
+					break;
+				}
+			}
+			++tested;
+			equal += same ? 1 : 0;
+			if (tested % 20000 == 0) {
+				LOGF("SrtMemo: single-register shift replay equal=%" PRIu64 " of %" PRIu64 "\n", equal,
+				     tested);
 			}
 		}
 		[[nodiscard]] MemoMiss MemoCheck(const ShaderRecompiler::IR::SrtRuntime& runtime) const {
@@ -351,11 +395,20 @@ struct PipelineCache::ProgramCache {
 			if (runtime.user_data.size() != memo.user_data.size()) {
 				return MemoMiss::UserData;
 			}
+			size_t mismatches = 0;
+			size_t first_bad  = 0;
 			for (auto mask = memo.used_user_data; mask != 0; mask &= mask - 1) {
 				const auto index = static_cast<size_t>(std::countr_zero(mask));
 				if (index >= runtime.user_data.size() || runtime.user_data[index] != memo.user_data[index]) {
-					return MemoMiss::UserData;
+					if (mismatches++ == 0) first_bad = index;
 				}
+			}
+			if (mismatches != 0) {
+				RegisterMisses()[first_bad & 63u]++;
+				if (mismatches == 1 && first_bad < runtime.user_data.size()) {
+					CountRelativeReplay(runtime, first_bad);
+				}
+				return MemoMiss::UserData;
 			}
 			if (memo.used_workgroup_counts &&
 			    !std::ranges::equal(runtime.workgroup_counts, memo.workgroup_counts)) {
