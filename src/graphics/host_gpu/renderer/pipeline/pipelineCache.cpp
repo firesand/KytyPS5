@@ -677,7 +677,7 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
-			if (stage == ShaderType::Vertex) {
+			if (stage == ShaderType::Vertex || stage == ShaderType::Mesh) {
 				vertex_user_data_masks[params.hash] |= entry->second.resource_plan.user_data_mask;
 			}
 		}
@@ -958,12 +958,14 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (draw_parameters != nullptr && draw_parameters->active) {
-		// The command processor only requests this for plain vertex shaders (see
-		// RenderExecutor::CanDrawIndirectOnGpu); anything else has no draw-parameter variant.
-		EXIT_NOT_IMPLEMENTED(tess_active || mesh_active);
+		// The command processor requests this for plain vertex shaders and, with mesh_record, for
+		// indexed mesh shaders (see RenderExecutor::CanDrawIndirectOnGpu); tessellation has no
+		// draw-parameter variant, and a mesh shader needs mesh_record.
+		EXIT_NOT_IMPLEMENTED(tess_active || mesh_active != draw_parameters->mesh_record);
 		vertex_info[0].draw_parameters = *draw_parameters;
 		// Native fetch consumes the SGPRs the host path patched and expects ids without the base.
-		vertex_info[0].draw_parameters.rebase_ids = !vertex_info[0].fetch_embedded;
+		// MeshEXT has no BaseVertex / BaseInstance built-ins; its ids are rebuilt in the prologue.
+		vertex_info[0].draw_parameters.rebase_ids = !mesh_active && !vertex_info[0].fetch_embedded;
 	}
 	if (mesh_active) {
 		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);

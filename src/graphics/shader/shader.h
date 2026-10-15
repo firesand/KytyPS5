@@ -136,6 +136,12 @@ struct ShaderDrawParameters {
 	// Native (non-embedded) fetch expects the guest vertex / instance id without the draw's base:
 	// Vulkan adds firstVertex / firstInstance to the built-ins, so the emitter subtracts them.
 	bool     rebase_ids         = false;
+	// Mesh-stage GPU-side indirect draws: the batch SGPRs (vertex / instance / first-index slots) and
+	// the draw dwords of the host mesh path come from a per-record scratch the translation prepass
+	// writes, keyed by DrawIndex (see MeshIndirectTranslator). base_vertex_slot / base_instance_slot
+	// hold the packet's registers like the vertex variant; first_index_slot is mesh-only.
+	bool     mesh_record        = false;
+	uint32_t first_index_slot   = kNoSlot;
 };
 
 struct ShaderVertexInputInfo {

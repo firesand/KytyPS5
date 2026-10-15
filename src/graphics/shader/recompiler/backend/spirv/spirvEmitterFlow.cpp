@@ -682,14 +682,17 @@ uint32_t EmitLaneId(EmitterState& state) {
 	           : EmitSubgroupLocalInvocationId(state);
 }
 
-uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
-	auto&      state  = ctx.state;
-	const auto result = state.builder.AllocateId();
-	const auto index  = inst.Arg(0).U32();
-	if (state.program.stage != ShaderType::Mesh || index >= IR::PushData::MeshDrawDwordCount) {
-		ctx.Fail(inst, "invalid mesh draw parameter");
-	}
+bool MeshRecordActive(const EmitterState& state) {
+	const auto* vertex = state.input_info.vertex;
+	return state.program.stage == ShaderType::Mesh && vertex != nullptr &&
+	       vertex->draw_parameters.active && vertex->draw_parameters.mesh_record;
+}
+
+namespace {
+
+uint32_t PushConstantDword(EmitterState& state, uint32_t index) {
 	const auto pointer = state.builder.AllocateId();
+	const auto result  = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer,
 	                          state.push_constant_variable, ConstantU32(state, 0),
 	                          ConstantU32(state, index));
@@ -697,7 +700,70 @@ uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return result;
 }
 
+// Dword `field` of this draw's record in the translation prepass scratch: push dwords 0/1 hold the
+// scratch device address, records are MeshRecordDwords apart, indexed by the DrawIndex built-in.
+uint32_t MeshRecordDword(EmitterState& state, uint32_t field) {
+	const auto base = PackU64(state, PushConstantDword(state, 0), PushConstantDword(state, 1));
+	const auto draw = Unary(state, spv::OpBitcast, TypeU32(state),
+	                        Unary(state, spv::OpLoad, TypeI32(state),
+	                              InputVariableForKind(state, IR::StageInputKind::DrawIndex)));
+	const auto byte_offset = Binary(
+	    state, spv::OpIAdd, TypeU32(state),
+	    Binary(state, spv::OpIMul, TypeU32(state), draw,
+	           ConstantU32(state, IR::MeshRecordDwords * sizeof(uint32_t))),
+	    ConstantU32(state, field * sizeof(uint32_t)));
+	const auto address = Binary(state, spv::OpIAdd, TypeU64(state), base,
+	                            Unary(state, spv::OpUConvert, TypeU64(state), byte_offset));
+	const auto pointer = Unary(state, spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), address);
+	const auto value   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
+	                          spv::MemoryAccessAlignedMask, uint32_t {sizeof(uint32_t)});
+	return value;
+}
+
+} // namespace
+
+uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state  = ctx.state;
+	const auto index  = inst.Arg(0).U32();
+	if (state.program.stage != ShaderType::Mesh || index >= IR::PushData::MeshDrawDwordCount) {
+		ctx.Fail(inst, "invalid mesh draw parameter");
+	}
+	if (MeshRecordActive(state)) {
+		// Same dwords the host path pushes. 1 / 2 are zero there too (native indirect fetch: the
+		// patched SGPRs carry the record's base vertex / instance, see EmitGetUserData); 3 is the
+		// packet's guest index size.
+		switch (index) {
+			case 0: return MeshRecordDword(state, IR::MeshRecordIndexCount);
+			case 1:
+			case 2: return ConstantU32(state, 0);
+			case 3: return PushConstantDword(state, IR::MeshRecordPushElementSize);
+			case 4: return MeshRecordDword(state, IR::MeshRecordIndexAddressLow);
+			default: return MeshRecordDword(state, IR::MeshRecordIndexAddressHigh);
+		}
+	}
+	return PushConstantDword(state, index);
+}
+
 uint32_t EmitGetUserData(EmitterState& state, IR::ScalarReg reg) {
+	if (MeshRecordActive(state)) {
+		const auto& draw  = state.input_info.vertex->draw_parameters;
+		const auto  index = IR::RegIndex(reg);
+		const auto  base  = state.program.user_data_base;
+		const auto  slot  = [&](uint32_t packet_slot, uint32_t field, uint32_t& result) {
+			if (packet_slot == ShaderDrawParameters::kNoSlot || index != base + packet_slot) {
+				return false;
+			}
+			result = MeshRecordDword(state, field);
+			return true;
+		};
+		uint32_t value = 0;
+		if (slot(draw.base_vertex_slot, IR::MeshRecordBaseVertex, value) ||
+		    slot(draw.base_instance_slot, IR::MeshRecordStartInstance, value) ||
+		    slot(draw.first_index_slot, IR::MeshRecordStartIndex, value)) {
+			return value;
+		}
+	}
 	// GPU-side indirect draws: the packet's vertex / instance offset SGPRs come from the draw
 	// parameters built-ins instead of the (unpatched) shader-data dword.
 	if (const auto* vertex = state.input_info.vertex;

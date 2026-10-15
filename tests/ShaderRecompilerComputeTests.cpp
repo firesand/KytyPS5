@@ -40392,6 +40392,118 @@ void CheckTessellationPrograms() {
   CheckTessellationProgram("TessellationMultipliedStride", 108, 112);
 }
 
+// Mesh-stage GPU-side indirect draws (ShaderDrawParameters::mesh_record): the program reads the
+// per-record scratch through the DrawIndex built-in and a PhysicalStorageBuffer pointer instead of
+// the push draw dwords, and a packet-named SGPR slot is served from the record.
+void CheckMeshRecordEmission() {
+  using namespace Libs::Graphics;
+  const char *name = "MeshRecordEmission";
+  const u32 front[] = {
+      EncodeSMovB32(12, 255), 0x1003u,
+      EncodeSop1(0x20, 0, 6),
+  };
+  const u32 back[] = {
+      EncodeSMovB32(124, 12), EncodeSopp(0x10, 9),
+      EncodeVop1(0x01, 0, 128),
+      EncodeVop1(0x01, 9, 13), // user s13 (register 8 + slot 5)
+      EncodeMubuf0(0x1c), EncodeMubuf1(9, 2, 5),
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 0, 0, 0),
+      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0),
+      EncodeSopp(0x01),
+  };
+  struct Compiled {
+    std::string assembly;
+    bool valid = false;
+  };
+  const auto compile = [&](const ShaderDrawParameters &draw) {
+    ShaderVertexInputInfo input{};
+    input.logical_stage = ShaderType::Mesh;
+    input.pa_cl_vs_out_cntl = 0x00c0f00fu;
+    auto &mesh = input.mesh;
+    mesh.input_primitive = static_cast<u32>(Prospero::PrimitiveType::kTriList);
+    mesh.threads_num[0] = 192;
+    mesh.threads_num[1] = mesh.threads_num[2] = 1;
+    mesh.lds_size_dwords = 3840;
+    mesh.primitives_per_group = 62;
+    mesh.vertices_per_group = 64;
+    mesh.max_vertices = 192;
+    mesh.max_primitives = 176;
+    mesh.wave_size = 64;
+    mesh.host_subgroup_size = 32;
+    input.draw_parameters = draw;
+    std::array<u32, 14> user_data{};
+    user_data[8] = 0x10000008u;
+    user_data[9] = 4u << 16u;
+    user_data[10] = 64u;
+    user_data[11] = 0x00027000u;
+    user_data[13] = 0x3f800000u;
+    ShaderRecompiler::CompileOptions options{};
+    options.stage = ShaderType::Mesh;
+    options.input_info.vertex = &input;
+    options.user_data = user_data;
+    options.user_data_base = 8;
+    options.back_code = back;
+    auto translated = ShaderRecompiler::TranslateProgram(front, options);
+    auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+    ShaderRecompiler::IR::ResourceSnapshot resources;
+    ShaderRecompiler::IR::ResourceSpecialization specialization;
+    const ShaderRecompiler::IR::SrtRuntime runtime{
+        .user_data = options.user_data,
+        .shader_base = reinterpret_cast<uint64_t>(front),
+    };
+    Require(name, "resource materialization",
+            ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization),
+            "mesh test resources did not materialize");
+    auto result = ShaderRecompiler::CompileProgram(
+        std::move(translated), options, specialization,
+        ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
+    ValidateSpirv(name, result.spirv);
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+    Compiled compiled;
+    compiled.valid = tools.Disassemble(result.spirv, &compiled.assembly);
+    Require(name, "disassembly", compiled.valid, "failed to disassemble the mesh variant");
+    return compiled;
+  };
+  const auto count = [](const std::string &text, const char *needle) {
+    size_t n = 0;
+    for (size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1)) {
+      n++;
+    }
+    return n;
+  };
+
+  const auto plain = compile({});
+  Require(name, "plain mesh", plain.assembly.find("BuiltIn DrawIndex") == std::string::npos &&
+              plain.assembly.find("OpCapability DrawParameters") == std::string::npos,
+          "an ordinary mesh program must not declare DrawIndex");
+
+  ShaderDrawParameters draw;
+  draw.active = true;
+  draw.mesh_record = true;
+  const auto record = compile(draw);
+  Require(name, "built-ins",
+          record.assembly.find("BuiltIn DrawIndex") != std::string::npos &&
+              record.assembly.find("OpCapability DrawParameters") != std::string::npos &&
+              record.assembly.find("OpCapability PhysicalStorageBufferAddresses") !=
+                  std::string::npos &&
+              record.assembly.find("BuiltIn BaseVertex") == std::string::npos &&
+              record.assembly.find("BuiltIn BaseInstance") == std::string::npos,
+          "mesh_record must declare DrawIndex (and no BaseVertex / BaseInstance) with "
+          "PhysicalStorageBufferAddresses");
+  // Draw dwords 0, 4 and 5 are record loads (the guest function is emitted once).
+  const auto base_loads = count(record.assembly, "OpConvertUToPtr") -
+                          count(plain.assembly, "OpConvertUToPtr");
+  Require(name, "draw dwords", base_loads >= 3,
+          "index count and index address dwords were not loaded from the record scratch");
+
+  draw.base_vertex_slot = 5; // register 8 + 5 = s13, read by the back shader
+  const auto slotted = compile(draw);
+  Require(name, "sgpr slot",
+          count(slotted.assembly, "OpConvertUToPtr") > count(record.assembly, "OpConvertUToPtr"),
+          "a packet-named SGPR slot must be served from the record scratch");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckEmbeddedFetchVertexOffset() {
   const auto MakeFetch = [](std::initializer_list<std::pair<u32, u32>> adds,
                             std::optional<std::pair<u32, u32>> late_add = {},
@@ -46302,6 +46414,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--draw-offset-only") == 0) {
     CheckEmbeddedFetchVertexOffset();
+    CheckMeshRecordEmission();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--depth-feedback-only") == 0) {

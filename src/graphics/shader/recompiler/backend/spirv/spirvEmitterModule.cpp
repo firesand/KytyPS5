@@ -486,6 +486,7 @@ uint32_t BuiltInForInput(IR::StageInputKind kind) {
 		case IR::StageInputKind::GlobalInvocationId: return spv::BuiltInGlobalInvocationId;
 		case IR::StageInputKind::BaseVertex: return spv::BuiltInBaseVertex;
 		case IR::StageInputKind::BaseInstance: return spv::BuiltInBaseInstance;
+		case IR::StageInputKind::DrawIndex: return spv::BuiltInDrawIndex;
 		default: return UINT32_MAX;
 	}
 }
@@ -516,6 +517,9 @@ void DefineInputs(EmitterState& state) {
 		if (draw.base_instance_slot != ShaderDrawParameters::kNoSlot || draw.rebase_ids) {
 			add_builtin(IR::StageInputKind::BaseInstance, 1, "gl_BaseInstance");
 		}
+	}
+	if (MeshRecordActive(state)) {
+		add_builtin(IR::StageInputKind::DrawIndex, 1, "gl_DrawID");
 	}
 	if (state.lane_count == 2) {
 		add_builtin(IR::StageInputKind::LocalInvocationIndex, 1, "gl_LocalInvocationIndex");
@@ -548,6 +552,7 @@ void DefineInputs(EmitterState& state) {
 			case IR::StageInputKind::Layer:
 			case IR::StageInputKind::BaseVertex:
 			case IR::StageInputKind::BaseInstance:
+			case IR::StageInputKind::DrawIndex:
 			case IR::StageInputKind::SampleId: type = TypeI32(state); break;
 			case IR::StageInputKind::WorkgroupId:
 			case IR::StageInputKind::NumWorkgroups:
@@ -582,7 +587,8 @@ void DefineInputs(EmitterState& state) {
 			state.builder.AddAnnotation(spv::OpDecorate, input.variable_id, spv::DecorationFlat);
 		}
 		if (input.kind == IR::StageInputKind::BaseVertex ||
-		    input.kind == IR::StageInputKind::BaseInstance) {
+		    input.kind == IR::StageInputKind::BaseInstance ||
+		    input.kind == IR::StageInputKind::DrawIndex) {
 			state.builder.RequireExtension("SPV_KHR_shader_draw_parameters");
 			state.builder.RequireCapability(spv::CapabilityDrawParameters);
 		}
@@ -766,7 +772,7 @@ void DefineModule(EmitterState& state) {
 	if (state.program.info.buffer_u16) {
 		state.builder.RequireCapability(spv::CapabilityStorageBuffer16BitAccess);
 	}
-	if (state.program.info.uses_dma) {
+	if (state.program.info.uses_dma || MeshRecordActive(state)) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);
 		state.builder.RequireExtension("SPV_KHR_physical_storage_buffer");
@@ -827,7 +833,7 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireExtension("SPV_KHR_fragment_shader_barycentric");
 	}
 	state.builder.RequireExtension("SPV_KHR_float_controls");
-	state.builder.AddMemoryModel(state.program.info.uses_dma
+	state.builder.AddMemoryModel(state.program.info.uses_dma || MeshRecordActive(state)
 	                                 ? spv::AddressingModelPhysicalStorageBuffer64
 	                                 : spv::AddressingModelLogical,
 	                             spv::MemoryModelGLSL450);
