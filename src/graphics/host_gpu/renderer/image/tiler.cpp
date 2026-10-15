@@ -679,9 +679,9 @@ void TileManager::TransformColor(Result input, Result output, ColorTransform tra
 		m_scheduler.RecordGpuOperation(event);
 	}
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eShaderWrite;
-	barriers[1].dstAccessMask = vk::AccessFlagBits::eTransferRead;
+	barriers[1].dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
 	{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::BarrierGlobal); command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
-	                        vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &barriers[1],
+	                        vk::PipelineStageFlagBits::eAllCommands, {}, 0, nullptr, 1, &barriers[1],
 	                        0, nullptr); }
 }
 
