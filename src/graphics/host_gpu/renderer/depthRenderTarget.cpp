@@ -413,7 +413,7 @@ bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
 		              std::max(destination.backing.extent.height >> range.base_level, 1u)}),
 		    1u};
 	}
-	{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::CopyImage); command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+	{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::CopyImageDepth); command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
 	                  destination.backing.image, vk::ImageLayout::eTransferDstOptimal,
 	                  count, regions.data()); }
 	return true;

@@ -244,7 +244,7 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	{ GpuTimestampScope ts_scope(native, GpuTimestamps::Kind::BarrierBuffer); native.pipelineBarrier(before_stage, vk::PipelineStageFlagBits::eTransfer,
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, before, 0, nullptr); }
 	const vk::BufferCopy copy {source_offset, destination_offset, size};
-	{ GpuTimestampScope ts_scope(native, GpuTimestamps::Kind::CopyUpload); native.copyBuffer(source.Handle(), Handle(), 1, &copy); }
+	{ GpuTimestampScope ts_scope(native, GpuTimestamps::Kind::CopyUploadStream); ts_scope.SetBytes(size); native.copyBuffer(source.Handle(), Handle(), 1, &copy); }
 	const vk::BufferMemoryBarrier after[] = {
 	    source.Barrier(source_offset, size, vk::AccessFlagBits::eTransferRead, source_after),
 	    Barrier(destination_offset, size, vk::AccessFlagBits::eTransferWrite, destination_after),

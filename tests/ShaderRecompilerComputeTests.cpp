@@ -5314,12 +5314,31 @@ public:
       scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
           vk::PipelineStageFlagBits::eTransfer, {}, 1, &memory, 0, nullptr, 0, nullptr);
     }
+    {
+      GpuTimestampScope staging(scheduler.Current().Handle(),
+                                GpuTimestamps::Kind::CopyUploadStaging);
+      staging.SetBytes(target.size);
+      scheduler.Current().Handle().fillBuffer(target.buffer, 0, target.size, 0x11u);
+    }
+    {
+      // Image layout transitions are counted but never timed.
+      GpuTimestampScope image_barrier(scheduler.Current().Handle(),
+                                      GpuTimestamps::Kind::BarrierImage);
+      Require(name, "barrier-image untimed", !image_barrier.Active(),
+              "barrier-image must not take timestamp queries");
+    }
     scheduler.Finish();
     const auto snapshot = timestamps->Take(scheduler.GetMasterSemaphore().KnownGpuTick());
     Require(name, "other kinds",
             snapshot.kinds[static_cast<size_t>(GpuTimestamps::Kind::Fill)].count == 1 &&
                 snapshot.kinds[static_cast<size_t>(GpuTimestamps::Kind::BarrierGlobal)].count == 1,
             "nested scope was not folded into the outer one or a non-shader kind was lost");
+    Require(name, "sub-kind bytes",
+            snapshot.kinds[static_cast<size_t>(GpuTimestamps::Kind::CopyUploadStaging)].count == 1 &&
+                snapshot.kinds[static_cast<size_t>(GpuTimestamps::Kind::CopyUploadStaging)].bytes ==
+                    target.size &&
+                snapshot.kinds[static_cast<size_t>(GpuTimestamps::Kind::BarrierImage)].count == 1,
+            "copy-upload/staging bytes or the untimed barrier-image count were lost");
     Require(name, "ops seen", snapshot.ops >= op_count && snapshot.ticks >= 1,
             "completed tick did not report its tagged ops");
     Require(name, "hashes", snapshot.shaders.size() == 2, "per-shader accumulation lost a key");
@@ -5329,7 +5348,7 @@ public:
                 snapshot.attributed_ns <= snapshot.span_ns + 1000,
             "attributed time must not exceed the tick span");
     const auto line = GpuTimestamps::Format(snapshot);
-    Require(name, "line", line.rfind("GpuTime: ticks ", 0) == 0 && line.find("| other:") != std::string::npos && line.find("barrier-global") != std::string::npos && line.size() < 1536,
+    Require(name, "line", line.rfind("GpuTime: ticks ", 0) == 0 && line.find("| other:") != std::string::npos && line.find("barrier-global") != std::string::npos && line.find("copy-upload/staging") != std::string::npos && line.find("1.0MB") != std::string::npos && line.size() < 1536,
             "summary line has the wrong shape");
     std::printf("[gpu]     %s", line.c_str());
     DestroyBuffer(&target);

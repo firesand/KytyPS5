@@ -330,7 +330,7 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
 		                             static_cast<uint32_t>(writes.size()), writes.data());
 		command.bindPipeline(vk::PipelineBindPoint::eCompute, GetPipeline(dispatch.pipeline_slot));
-		{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::CacheDispatch); command.dispatch((dispatch.push.width + 7u) / 8u, (dispatch.push.height + 7u) / 8u,
+		{ GpuTimestampScope ts_scope(command, clear_target ? GpuTimestamps::Kind::CacheDispatchDetile : GpuTimestamps::Kind::CacheDispatchTile); command.dispatch((dispatch.push.width + 7u) / 8u, (dispatch.push.height + 7u) / 8u,
 		                 dispatch.push.depth); }
 		if (GpuDiagnostics::Enabled()) {
 			GpuDiagnosticEvent event;

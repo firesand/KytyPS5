@@ -149,7 +149,7 @@ void ColorClearResolver::Resolve(CommandBuffer& command, const Request& request)
 	cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0, writes);
 	const CheckPush push {request.slice_bytes / 4u, request.slice_count, request.valid_mask, 0u};
 	cmd.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
-	{ GpuTimestampScope ts_scope(cmd, GpuTimestamps::Kind::CacheDispatch); cmd.dispatch(request.slice_count, 1, 1); }
+	{ GpuTimestampScope ts_scope(cmd, GpuTimestamps::Kind::CacheDispatchColorClear); cmd.dispatch(request.slice_count, 1, 1); }
 
 	// Flags feed the predicates; the expanded metadata is visible to everything after.
 	{

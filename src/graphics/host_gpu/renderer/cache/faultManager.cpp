@@ -154,7 +154,7 @@ void FaultManager::Process(bool write_faults) {
 	const auto num_threads    = (write_faults ? BufferCache::WRITE_FAULT_NUMPAGES
 	                                          : BufferCache::CACHING_NUMPAGES) / 32;
 	const auto num_workgroups = (num_threads + 63) / 64;
-	{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::CacheDispatch); command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1); }
+	{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::CacheDispatchFault); command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1); }
 	if (GpuDiagnostics::Enabled()) {
 		GpuDiagnosticEvent event;
 		event.kind = "utility-fault-process";

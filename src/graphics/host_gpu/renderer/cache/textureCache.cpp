@@ -1175,6 +1175,7 @@ TextureCache::ImageDownload TextureCache::BuildDownload(const Image& image) cons
 }
 
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
+	GpuTimestampOrigin ts_origin(GpuTimestamps::Origin::Refresh);
 	ZeroCompanyImageLifecycle::Record(m_scheduler, "upload-begin", {}, image,
 	    {.address = source.CpuAddress(), .size = source.Size(),
 	     .value0 = GpuDiagnostics::HandleValue(source.Handle()), .value1 = source_offset});
@@ -2061,6 +2062,7 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 // recorded on the GPU timeline ahead of a pending write; no CPU wait.
 bool TextureCache::PreserveGpuPixels(ImageId id, Image& image,
                                      std::span<const std::pair<uint64_t, uint64_t>> excluded) {
+	GpuTimestampOrigin ts_origin(GpuTimestamps::Origin::Preserve);
 	const auto& info = image.info;
 	if (image.depth_id || info.samples != 1 || info.data.Empty() || !image.IsGpuModified() ||
 	    image.IsBufferModified() || image.IsDefinitelyCpuDirty()) {
@@ -2166,7 +2168,7 @@ bool TextureCache::PreserveGpuPixels(ImageId id, Image& image,
 			run.srcOffset += scratch.offset;
 			run.dstOffset += offset;
 		}
-		{ GpuTimestampScope ts_scope(native, GpuTimestamps::Kind::CopyUpload); native.copyBuffer(scratch.buffer, buffer->Handle(), static_cast<uint32_t>(runs.size()),
+		{ GpuTimestampScope ts_scope(native, GpuTimestamps::Kind::CopyUploadTexture); if (ts_scope.Active()) ts_scope.SetBytes(SumCopySizes(runs)); native.copyBuffer(scratch.buffer, buffer->Handle(), static_cast<uint32_t>(runs.size()),
 		                  runs.data()); }
 	}
 	vk::BufferMemoryBarrier after {};
@@ -2191,6 +2193,7 @@ bool TextureCache::PreserveGpuPixels(ImageId id, Image& image,
 
 void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
                                      uint64_t destination_size, ImageDownload transfer) {
+	GpuTimestampOrigin ts_origin(GpuTimestamps::Origin::Download);
 	ZeroCompanyImageLifecycle::Record(m_scheduler, "download-begin", {}, image,
 	    {.address = destination.CpuAddress(), .size = destination_size,
 	     .value0 = GpuDiagnostics::HandleValue(destination.Handle()), .value1 = destination_offset});

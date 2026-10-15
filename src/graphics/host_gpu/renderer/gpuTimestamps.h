@@ -38,6 +38,24 @@ public:
 		Clear,
 		CacheDispatch,
 		RenderPass,
+		// Sub-kinds: where a cache dispatch / copy came from (printed as kind/sub).
+		CacheDispatchDetile,
+		CacheDispatchTile,
+		CacheDispatchFault,
+		CacheDispatchColorClear,
+		CopyImageRefresh,
+		CopyImageUpload,
+		CopyImageDownload,
+		CopyImagePreserve,
+		CopyImageReadback,
+		CopyImageImage,
+		CopyImageResolve,
+		CopyImageViaBuffer,
+		CopyImageDepth,
+		CopyUploadStaging,
+		CopyUploadDownload,
+		CopyUploadTexture,
+		CopyUploadStream,
 		Count
 	};
 	// Kinds that carry a shader hash and appear in the "top" list.
@@ -49,13 +67,18 @@ public:
 	static GpuTimestamps* ForCommand(vk::CommandBuffer command) noexcept;
 
 	static constexpr uint32_t SlotCount      = 32;
-	static constexpr uint32_t QueriesPerSlot = 16384;
+	static constexpr uint32_t QueriesPerSlot = 32768;
 	static constexpr uint32_t TopEntries     = 12;
 
 	struct Entry {
 		uint64_t ns    = 0;
 		uint64_t count = 0;
+		uint64_t bytes = 0;
 	};
+	// Calling context for copies that are issued deep inside Image::Upload/Download: set by the
+	// texture cache entry points (thread-local, only touched when profiling is enabled).
+	enum class Origin : uint8_t { None, Refresh, Download, Preserve };
+	static Origin& CurrentOrigin() noexcept;
 	struct Snapshot {
 		uint64_t ticks           = 0;
 		uint64_t span_ns         = 0;
@@ -84,7 +107,9 @@ public:
 	void EndCommand(vk::CommandBuffer command);
 
 	// Per-op bracket, called through GpuTimestampScope.
-	void BeginOp(vk::CommandBuffer command, Kind kind, uint64_t hash, uint64_t hash2);
+	// Returns true when the op is being timed (the caller must then call EndOp).
+	bool BeginOp(vk::CommandBuffer command, Kind kind, uint64_t hash, uint64_t hash2);
+	void SetOpBytes(uint64_t bytes);
 	void EndOp(vk::CommandBuffer command);
 
 	// Read back every completed slot into the accumulators.
@@ -101,6 +126,7 @@ private:
 	struct Op {
 		uint64_t hash;
 		uint64_t hash2;
+		uint64_t bytes;
 		uint32_t query;
 		Kind     kind;
 	};
@@ -131,6 +157,14 @@ private:
 
 class CommandScheduler;
 
+// Total bytes of a vk::BufferCopy-like range (only evaluate it when a scope is active).
+template <class Range>
+inline uint64_t SumCopySizes(const Range& copies) {
+	uint64_t total = 0;
+	for (const auto& copy: copies) total += copy.size;
+	return total;
+}
+
 // RAII bracket for one draw/dispatch. Costs one static bool check when profiling is off.
 class GpuTimestampScope {
 public:
@@ -140,6 +174,10 @@ public:
 	GpuTimestampScope(vk::CommandBuffer command, GpuTimestamps::Kind kind, uint64_t hash = 0,
 	                  uint64_t hash2 = 0) noexcept;
 	~GpuTimestampScope();
+	[[nodiscard]] bool Active() const noexcept { return m_timestamps != nullptr; }
+	void SetBytes(uint64_t bytes) const {
+		if (m_timestamps != nullptr) m_timestamps->SetOpBytes(bytes);
+	}
 	GpuTimestampScope(const GpuTimestampScope&)            = delete;
 	GpuTimestampScope& operator=(const GpuTimestampScope&) = delete;
 
@@ -148,6 +186,29 @@ private:
 	vk::CommandBuffer m_command;
 };
 
+} // namespace Libs::Graphics
+
+namespace Libs::Graphics {
+// Sets the thread's copy origin for the lifetime of the object (no-op when profiling is off).
+class GpuTimestampOrigin {
+public:
+	explicit GpuTimestampOrigin(GpuTimestamps::Origin origin) noexcept {
+		if (GpuTimestamps::Enabled()) {
+			m_previous                     = GpuTimestamps::CurrentOrigin();
+			GpuTimestamps::CurrentOrigin() = origin;
+			m_active                       = true;
+		}
+	}
+	~GpuTimestampOrigin() {
+		if (m_active) GpuTimestamps::CurrentOrigin() = m_previous;
+	}
+	GpuTimestampOrigin(const GpuTimestampOrigin&)            = delete;
+	GpuTimestampOrigin& operator=(const GpuTimestampOrigin&) = delete;
+
+private:
+	GpuTimestamps::Origin m_previous = GpuTimestamps::Origin::None;
+	bool                  m_active   = false;
+};
 } // namespace Libs::Graphics
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_GPUTIMESTAMPS_H_
