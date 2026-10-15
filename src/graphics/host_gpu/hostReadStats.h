@@ -42,8 +42,11 @@ struct HostReadProbe {
 	enum Site : uint32_t { DrawArgs = 0, DrawCount, DispatchArgs, Predication, SiteCount };
 	// KYTY_CP_GPU_INDIRECT accounting: draws issued with GPU-side arguments, and the indirect draws
 	// that stayed on the host path (first-index SGPR named, or any other reason; "mesh" is the
-	// subset of "other" caused by NGG/mesh vertex shaders).
-	enum GpuIndirect : uint32_t { GpuDraws = 0, FallbackIndexOffset, FallbackOther, FallbackMesh, FallbackSrt, GpuIndirectCount };
+	// subset of "other" caused by NGG/mesh vertex shaders). GpuMeshDraws is the subset of GpuDraws
+	// issued through the mesh translation prepass; FallbackMeshSrt counts mesh packets kept on the
+	// host path because the mesh program's resource plan reads a batch SGPR (or is not compiled yet).
+	enum GpuIndirect : uint32_t { GpuDraws = 0, FallbackIndexOffset, FallbackOther, FallbackMesh, FallbackSrt,
+	                              GpuMeshDraws, FallbackMeshSrt, GpuIndirectCount };
 	struct Snapshot {
 		std::array<std::pair<uint64_t, uint64_t>, SiteCount> sites {}; // calls, nanoseconds
 		std::array<uint64_t, GpuIndirectCount>               gpu_indirect {};
