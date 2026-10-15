@@ -141,8 +141,13 @@ MeshIndirectTranslator::Result MeshIndirectTranslator::Translate(vk::CommandBuff
 	}
 
 	cmd.bindPipeline(vk::PipelineBindPoint::eCompute, m_pipeline);
+	// Bind the records, not the whole cache buffer below them: the range stays within
+	// maxStorageBufferRange, and the offset is rounded down to minStorageBufferOffsetAlignment with
+	// the remainder passed in args_dword.
+	const auto bind_offset = Common::AlignDown(request.args_offset, m_graphics.StorageMinAlignment());
+	const auto bind_skip   = request.args_offset - bind_offset;
 	const vk::DescriptorBufferInfo infos[] {
-	    {request.args_buffer, 0, request.args_range},
+	    {request.args_buffer, bind_offset, bind_skip + request.args_bytes},
 	    {m_scratch.Handle(), 0, RingSize},
 	};
 	std::array<vk::WriteDescriptorSet, 2> writes {};
@@ -154,7 +159,7 @@ MeshIndirectTranslator::Result MeshIndirectTranslator::Translate(vk::CommandBuff
 	}
 	cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0, writes);
 	const TranslatePush push {
-	    .args_dword        = static_cast<uint32_t>(request.args_offset / 4u),
+	    .args_dword        = static_cast<uint32_t>(bind_skip / 4u),
 	    .stride_dwords     = request.stride / 4u,
 	    .count             = request.count,
 	    .index_buffer_size = request.index_buffer_size,

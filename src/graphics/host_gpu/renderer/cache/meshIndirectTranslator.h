@@ -26,7 +26,7 @@ public:
 	struct Request {
 		vk::Buffer args_buffer;
 		uint64_t   args_offset = 0; // bytes into args_buffer, 4-aligned
-		uint64_t   args_range  = 0; // bytes from the start of args_buffer through the last record
+		uint64_t   args_bytes  = 0; // bytes from args_offset through the end of the last record
 		uint32_t   count       = 0;
 		uint32_t   stride      = 0; // bytes, 4-aligned, >= 20
 		uint32_t   index_buffer_size = 0; // elements

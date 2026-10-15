@@ -1364,7 +1364,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		MeshIndirectTranslator::Request request {};
 		request.args_buffer          = indirect_args.first->Handle();
 		request.args_offset          = indirect_args.second;
-		request.args_range           = indirect_args.second + indirect_args_bytes;
+		request.args_bytes           = indirect_args_bytes;
 		request.count                = gpu_indirect->draw_count;
 		request.stride               = gpu_indirect->stride;
 		request.index_buffer_size    = gpu_indirect->index_buffer_size;

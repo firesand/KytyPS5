@@ -1266,7 +1266,12 @@ bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_c
 				     m_index_buffer_size, range, m_index_base_addr);
 			}
 		}
-		if (range > MeshIndexRangeCap || !GuestRange {m_index_base_addr, range}.Valid() ||
+		// The prepass binds the records as one storage buffer range (128 MiB is the guaranteed
+		// minimum of maxStorageBufferRange).
+		constexpr uint64_t MeshArgsRangeCap = 128ull << 20;
+		const uint64_t     args_span =
+		    uint64_t {max_count_or_count - 1u} * stride_in_bytes + sizeof(DrawIndexedIndirectArgs);
+		if (args_span > MeshArgsRangeCap || range > MeshIndexRangeCap || !GuestRange {m_index_base_addr, range}.Valid() ||
 		    !m_renderer.IsMapped(m_index_base_addr, range)) {
 			HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackMesh);
 			return fallback();
