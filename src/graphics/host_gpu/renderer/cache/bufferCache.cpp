@@ -46,6 +46,7 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* 
 		EXIT_IF(destination_offset > buffer.Size() || chunk > buffer.Size() - destination_offset);
 		m_scheduler.EndRendering();
 		const auto command = m_scheduler.Current().Handle();
+		m_scheduler.Current().Hazards().transfer_wrote = true; // hazard tracker: staging copy
 		vk::BufferMemoryBarrier2 before {};
 		before.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
 		before.srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
@@ -583,6 +584,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
 		const auto native = command.Handle();
+		command.Hazards().transfer_wrote = true; // hazard tracker: copy into a cache buffer
 		vk::BufferMemoryBarrier before {};
 		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
 		                       vk::AccessFlagBits::eTransferRead |
@@ -1027,6 +1029,7 @@ void BufferCache::EndUploadBatch() {
 	auto& command = m_scheduler.Current();
 	command.EndRendering();
 	const auto        native = command.Handle();
+	command.Hazards().transfer_wrote = true; // hazard tracker: batched copies into cache buffers
 	vk::MemoryBarrier before {};
 	before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
 	                       vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;

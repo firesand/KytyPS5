@@ -11713,6 +11713,267 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // KYTY_LAZY_BARRIERS=1: dispatches are ordered by the hazard tracker instead of unconditional
+  // barriers. Everything stays in one command buffer (a submit resets the tracker), results are
+  // read back only at the end, and the BarrierProbe totals say which barriers were elided.
+  void CheckLazyBarriers() {
+    constexpr const char *name = "LazyBarriers";
+    constexpr uintptr_t base = 0x0000000209000000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t case_size = 0x10000;
+    constexpr uint32_t sentinel = 0xa5a5a5a5u;
+    // Results are asserted in every mode (KYTY_LAZY_BARRIERS=0/1/2); the barrier counts only where
+    // the tracker is the sole barrier source (mode 1).
+    const bool counted = LazyBarrierMode() == 1;
+
+    // store_imm: buffer[desc s0..3] = s12.
+    std::vector<u32> store_imm;
+    store_imm.push_back(EncodeVop1(0x01u, 1, 12u));
+    store_imm.push_back(EncodeMubuf0(0x1cu, 0, false, false));
+    store_imm.push_back(EncodeMubuf1(1, 0, 0));
+    AppendEnd(&store_imm);
+    // copy: buffer[desc s4..7] = buffer[desc s0..3] + 1.
+    std::vector<u32> copy_shader;
+    copy_shader.push_back(EncodeMubuf0(0x0cu, 0, false, false));
+    copy_shader.push_back(EncodeMubuf1(2, 0, 0));
+    copy_shader.push_back(EncodeSopp(0x0c, 0));
+    copy_shader.push_back(EncodeVop2(0x25u, 2, InlineU32(1), 2));
+    copy_shader.push_back(EncodeMubuf0(0x1cu, 0, false, false));
+    copy_shader.push_back(EncodeMubuf1(2, 1, 0));
+    AppendEnd(&copy_shader);
+    // read_only: loads buffer[desc s0..3] and writes nothing.
+    std::vector<u32> read_only;
+    read_only.push_back(EncodeMubuf0(0x0cu, 0, false, false));
+    read_only.push_back(EncodeMubuf1(2, 0, 0));
+    read_only.push_back(EncodeSopp(0x0c, 0));
+    AppendEnd(&read_only);
+    // writer / consumer: the NativeIndirectDispatch argument producer and thread-id writer.
+    std::vector<u32> writer;
+    for (u32 i = 0; i < 3; i++) {
+      writer.push_back(EncodeVop1(0x01u, 1, 12u + i));
+      writer.push_back(EncodeMubuf0(0x1cu, 0, false, false));
+      writer.push_back(EncodeMubuf1(1, i, 0));
+    }
+    AppendEnd(&writer);
+    std::vector<u32> consumer;
+    AppendVop3(&consumer, 0x346u, 1, 4, InlineU32(2), Vgpr(0));
+    consumer.push_back(EncodeVop2(0x25u, 2, InlineU32(1), 1));
+    consumer.push_back(EncodeVop2(0x1au, 1, InlineU32(2), 1));
+    consumer.push_back(EncodeMubuf0(0x1cu));
+    consumer.push_back(EncodeMubuf1(2, 0, 1));
+    AppendEnd(&consumer);
+    for (const auto *code : {&store_imm, &copy_shader, &read_only, &writer, &consumer}) {
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code->data()),
+          {.type = Prospero::ShaderBinaryType::kCs,
+           .code_size_bytes = static_cast<uint32_t>(code->size() * sizeof(u32))});
+    }
+
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, case_size, 0, &direct_offset) == 0,
+            "lazy barrier allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, case_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "lazy barrier mapping failed");
+    std::memset(mapped, 0xa5, allocation_size);
+    // One page-aligned region per buffer so no owner merge (and no copy) happens mid-sequence.
+    constexpr uint64_t x_address = base + 0x1000;
+    constexpr uint64_t y_address = base + 0x11000;
+    constexpr uint64_t output_address = base + 0x21000;
+    constexpr uint64_t args_base = base + 0x30000;
+    constexpr uint64_t args_address = args_base + BufferCache::CACHING_PAGESIZE - 4u;
+    std::memset(reinterpret_cast<void *>(args_address), 0, 12);
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto &scheduler = context.GetCommandScheduler();
+      auto &cache = context.GetBufferCache();
+      auto &shaders = processor.GetShCtx();
+      context.MapMemory(base, allocation_size);
+      const auto set_buffer = [&](u32 sgpr, uint64_t address, u32 records, u32 stride = 0) {
+        ShaderBufferResource descriptor{};
+        descriptor.UpdateAddress48(address);
+        descriptor.fields[1] |= stride << 16u;
+        descriptor.fields[2] = records;
+        descriptor.fields[3] = DstSel(4, 5, 6, 7) |
+            (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+        for (u32 i = 0; i < 4; i++) {
+          shaders.SetCsUserSgpr(sgpr + i, descriptor.fields[i],
+                               HW::UserSgprType::Unknown);
+        }
+      };
+      const auto set_shader = [&](std::vector<u32> &code, u32 threads = 1,
+                                  uint8_t user_sgpr = 15, bool tgid = false) {
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                             .num_thread_x = threads, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = 64, .user_sgpr = user_sgpr, .tgid_x_en = tgid});
+      };
+      const auto store = [&](uint64_t address, u32 value) {
+        set_shader(store_imm);
+        set_buffer(0, address, 4);
+        shaders.SetCsUserSgpr(12u, value, HW::UserSgprType::Unknown);
+        processor.DispatchDirect(1, 1, 1, 0x41u);
+      };
+      const auto copy = [&](uint64_t from, uint64_t to) {
+        set_shader(copy_shader);
+        set_buffer(0, from, 1, 4);
+        set_buffer(4, to, 4);
+        processor.DispatchDirect(1, 1, 1, 0x41u);
+      };
+      const auto read = [&](uint64_t address) {
+        set_shader(read_only);
+        set_buffer(0, address, 1, 4);
+        processor.DispatchDirect(1, 1, 1, 0x41u);
+      };
+      const auto write_args = [&](u32 x) {
+        set_shader(writer);
+        for (u32 i = 0; i < 3; i++) {
+          set_buffer(i * 4u, args_address + i * 4u, 4);
+          shaders.SetCsUserSgpr(12u + i, i == 0 ? x : 1u, HW::UserSgprType::Unknown);
+        }
+        processor.DispatchDirect(1, 1, 1, 0x41u);
+      };
+      const auto indirect = [&](std::vector<u32> &code, u32 threads, bool tgid) {
+        set_shader(code, threads, uint8_t{4}, tgid);
+        if (tgid) {
+          set_buffer(0, output_address, 16u * sizeof(u32));
+        } else {
+          set_buffer(0, x_address, 1, 4);
+        }
+        processor.SetDispatchIndirectArgsBaseAddress(args_base);
+        const std::array<u32, 2> packet{
+            static_cast<u32>(BufferCache::CACHING_PAGESIZE - 4u), 0x41u};
+        Require(name, "indirect packet",
+                CpOpDispatchIndirect(processor, 0xc0011600u, packet.data(), 0, 0) == 2,
+                "the indirect packet was not consumed");
+      };
+
+      using Probe = BarrierProbe;
+      struct Window { std::array<uint64_t, Probe::KindCount> emitted{}, old{}; };
+      Window window;
+      auto last = Probe::Total();
+      const auto close_window = [&] {
+        const auto now = Probe::Total();
+        for (u32 i = 0; i < Probe::KindCount; i++) {
+          window.emitted[i] = now.emitted[i] - last.emitted[i];
+          window.old[i] = now.old[i] - last.old[i];
+        }
+        last = now;
+      };
+      const auto expect = [&](const char *what, Probe::Kind kind, uint64_t emitted,
+                              uint64_t old) {
+        std::string all;
+        for (u32 i = 0; i < Probe::KindCount; i++) {
+          all += std::string(" ") + Probe::Name(i) + "=" + std::to_string(window.emitted[i]) +
+                 "/" + std::to_string(window.old[i]);
+        }
+        Require(name, what, window.emitted[kind] == emitted && window.old[kind] == old,
+                std::string(Probe::Name(kind)) + " emitted " +
+                    std::to_string(window.emitted[kind]) + " (expected " +
+                    std::to_string(emitted) + "), old " + std::to_string(window.old[kind]) +
+                    " (expected " + std::to_string(old) + "); window:" + all);
+      };
+      const auto expect_no_flush = [&](const char *what) {
+        Require(name, what,
+                window.emitted[Probe::FlushForeign] == 0 &&
+                    window.emitted[Probe::FlushEndRendering] == 0 &&
+                    window.emitted[Probe::FlushDraw] == 0 &&
+                    window.emitted[Probe::FlushSubmit] == 0,
+                "a foreign flush, pass end or submit resolved hazards inside the sequence: "
+                "foreign " + std::to_string(window.emitted[Probe::FlushForeign]) +
+                " end-rendering " + std::to_string(window.emitted[Probe::FlushEndRendering]) +
+                " draw " + std::to_string(window.emitted[Probe::FlushDraw]) + " submit " +
+                std::to_string(window.emitted[Probe::FlushSubmit]));
+      };
+
+      // Pass 0 warms pipelines and buffer owners; pass 1 is measured on a fresh command buffer.
+      for (u32 pass = 0; pass < 2; pass++) {
+        const bool measure = pass == 1 && counted;
+        if (pass == 0) {
+          // CPU writes after the warm-up would re-upload the buffers inside the measured sequence.
+          std::memset(reinterpret_cast<void *>(x_address), 0xa5, 4);
+          std::memset(reinterpret_cast<void *>(y_address), 0xa5, 4);
+          std::memset(reinterpret_cast<void *>(output_address), 0xa5, 16u * sizeof(u32));
+          std::memset(reinterpret_cast<void *>(args_address), 0, 12);
+        }
+        scheduler.Finish();
+        scheduler.CheckActive();
+        const auto tick = scheduler.CurrentTick();
+        close_window();
+
+        // RAW, RAW elision, WAR.
+        store(x_address, 11);                 // A: nothing pending yet
+        copy(x_address, y_address);           // B: RAW on A's write
+        read(x_address);                      // C: RAW on B's write
+        read(x_address);                      // C2: nothing written since C
+        store(x_address, 0x77);               // D: WAR against C's read
+        if (measure) {
+          close_window();
+          expect("direct dispatch barriers", Probe::DispatchDirect, 3, 8);
+          expect("no indirect dispatch yet", Probe::DispatchIndirect, 0, 0);
+          expect_no_flush("direct sequence stayed in one open command buffer");
+        }
+
+        // Indirect arguments written by a dispatch, then read-only indirect dispatches.
+        write_args(2);                        // E: WAW against D
+        indirect(consumer, 4, true);          // F: args written by E (merged barrier)
+        indirect(read_only, 1, false);        // G: RAW on F's output
+        indirect(read_only, 1, false);        // G2: clean
+        if (measure) {
+          close_window();
+          expect("args writer barriers", Probe::DispatchDirect, 1, 2);
+          expect("indirect dispatch barriers", Probe::DispatchIndirect, 2, 7);
+          expect_no_flush("indirect sequence stayed in one open command buffer");
+          Require(name, "one command buffer", scheduler.CurrentTick() == tick,
+                  "the sequence submitted work, so the counts are not comparable");
+        }
+
+        cache.ReadMemory(x_address, 4);
+        cache.ReadMemory(y_address, 4);
+        cache.ReadMemory(output_address, 16u * sizeof(u32));
+        cache.ReadMemory(args_address, 12);
+        u32 x = 0, y = 0;
+        std::array<u32, 16> actual{};
+        Require(name, "readback",
+                LibKernel::Memory::TryReadBacking(x_address, &x, sizeof(x)) &&
+                    LibKernel::Memory::TryReadBacking(y_address, &y, sizeof(y)) &&
+                    LibKernel::Memory::TryReadBacking(output_address, actual.data(),
+                                                     sizeof(actual)),
+                "lazy barrier results could not be read back");
+        Require(name, "WAR result", x == 0x77u, "X holds " + Hex(x) + ", expected 0x77");
+        Require(name, "RAW result", y == 12u, "Y holds " + Hex(y) + ", expected 12");
+        for (u32 i = 0; i < actual.size(); i++) {
+          const auto expected = i < 8 ? i + 1u : sentinel;
+          Require(name, "indirect dispatch after GPU-written arguments", actual[i] == expected,
+                  "word " + std::to_string(i) + " expected " + Hex(expected) + ", got " +
+                      Hex(actual[i]));
+        }
+      }
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "lazy barrier mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "lazy barrier allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckNativeIndirectDispatch() {
     constexpr const char *name = "NativeIndirectDispatch";
     constexpr uintptr_t base = 0x0000000204600000ull;
@@ -18479,6 +18740,44 @@ public:
           Require("NativeIndirectDrawOffsets", indexed ? "indexed" : "auto",
                   pixels[component] == (component % 4 == 3 ? 0x3f800000u : 0x3e800000u),
                   "native vertex or instance offset was applied twice");
+        }
+        if (LazyBarrierMode() == 1) {
+          // KYTY_LAZY_BARRIERS: a shader write recorded by an earlier draw (no fixture draw has a
+          // storage write, so the tracker state is set as ExecutePreparedDraw sets it) must be
+          // resolved by one barrier before the next draw, and the draw must still be correct.
+          auto &hazards = scheduler.Current().Hazards();
+          hazards.written_stages |= vk::PipelineStageFlagBits::eFragmentShader;
+          hazards.indirect_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
+          hazards.written_access |= vk::AccessFlagBits::eShaderWrite;
+          const auto before = BarrierProbe::Total();
+          TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
+              {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+          if (indexed) {
+            RenderExecutorTestAccess::DrawIndex(executor, scheduler.Current(),
+                {.index_count = 3, .index_addr = reinterpret_cast<const void *>(index_address),
+                 .instance_count = 1, .index_type_and_size = 1, .base_vertex = 7, .first_instance = 5,
+                 .offset_source = DrawOffsetSource::IndirectArgs});
+          } else {
+            RenderExecutorTestAccess::DrawAuto(executor, scheduler.Current(),
+                {.vertex_count = 3, .instance_count = 1, .first_vertex = 7, .first_instance = 5,
+                 .offset_source = DrawOffsetSource::IndirectArgs});
+          }
+          const auto after = BarrierProbe::Total();
+          uint64_t resolved = 0;
+          for (const auto kind : {BarrierProbe::FlushEndRendering, BarrierProbe::FlushForeign,
+                                  BarrierProbe::FlushDraw}) {
+            resolved += after.emitted[kind] - before.emitted[kind];
+          }
+          Require("LazyBarriers", "pending draw write resolved before the next consumer",
+                  resolved == 1 && !hazards.written_stages && !hazards.indirect_write_stages,
+                  "expected exactly one hazard barrier, got " + std::to_string(resolved));
+          const auto repeated = ReadCachedTexel(name, context, sparse_color.image_id,
+                                                {}, {extent, extent, 1});
+          for (size_t component = 0; component < repeated.size(); component++) {
+            Require("LazyBarriers", "draw after a resolved write",
+                    repeated[component] == (component % 4 == 3 ? 0x3f800000u : 0x3e800000u),
+                    "the draw following a tracked write rendered incorrectly");
+          }
         }
       }
 
@@ -46057,6 +46356,12 @@ int main(int argc, char **argv) {
     setenv("KYTY_GPU_TIMESTAMPS", "1", 1);
     VulkanHarness vulkan;
     vulkan.CheckGpuTimestamps();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--lazy-barriers-only") == 0) {
+    setenv("KYTY_LAZY_BARRIERS", "1", 0); // an explicit 0/2 from the caller wins
+    VulkanHarness vulkan;
+    vulkan.CheckLazyBarriers();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--htile-clear-only") == 0) {

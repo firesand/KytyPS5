@@ -527,7 +527,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
-	auto              vk_buffer        = buffer.Handle();
+	// RawHandle: commands recorded below are tracked by the hazard state, not foreign.
+	auto              vk_buffer        = buffer.RawHandle();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
@@ -540,7 +541,15 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
 	                }) ||
 	    has_storage_writes;
-	if (has_storage_writes) {
+	// KYTY_LAZY_BARRIERS: a dispatch whose writes reach memory not named by a bound written
+	// descriptor (BDA / write-fault tracked) still counts as a writer for the tracker.
+	const bool tracked_writes = has_storage_writes || program.info.uses_write_faults;
+	if (LazyBarriersActive()) {
+		EmitLazyDispatchBarrier(vk_buffer, buffer.Hazards(), tracked_writes, false,
+		                        BarrierProbe::DispatchDirect);
+		BarrierProbe::NoteOld(BarrierProbe::DispatchDirect, (has_storage_writes ? 1u : 0u) + 1u);
+	}
+	if (LazyBarriersKeepOld() && has_storage_writes) {
 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 		// while allowing the queue to execute asynchronously.
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -667,8 +676,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
-	// The removed host fence also ordered read-only dispatches before later writers.
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (LazyBarriersActive()) {
+		NoteDispatchHazards(buffer.Hazards(), tracked_writes);
+	}
+	if (LazyBarriersKeepOld()) {
+		// The removed host fence also ordered read-only dispatches before later writers.
+		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	}
 	ResetBindings();
 	m_context.GetCommandScheduler().DiagnosticOperationComplete();
 }
@@ -711,24 +725,34 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	RebindBuffers(bindings);
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
-	const auto vk_buffer = buffer.Handle();
+	const auto vk_buffer = buffer.RawHandle();
 	const bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
 	    HasShaderBufferWrites(input_info.stage) ||
 	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& image) {
 		    return image.written && image.resource_class ==
 		                                ShaderRecompiler::IR::ImageResourceClass::Storage;
 	    });
-	if (has_storage_writes) {
-		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	const bool tracked_writes = has_storage_writes || program.info.uses_write_faults;
+	if (LazyBarriersActive()) {
+		// One merged barrier: RAW/WAW/WAR for the shader plus the eDrawIndirect dependency for the
+		// argument read (destination eAllCommands also covers eDrawIndirect/IndirectCommandRead).
+		EmitLazyDispatchBarrier(vk_buffer, buffer.Hazards(), tracked_writes, true,
+		                        BarrierProbe::DispatchIndirect);
+		BarrierProbe::NoteOld(BarrierProbe::DispatchIndirect, (has_storage_writes ? 1u : 0u) + 2u);
 	}
-	vk::MemoryBarrier barrier {};
-	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
-	barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
-	{ GpuTimestampScope ts_scope(vk_buffer, GpuTimestamps::Kind::BarrierGlobal); vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
-	                              vk::PipelineStageFlagBits::eComputeShader |
-	                              vk::PipelineStageFlagBits::eTransfer,
-	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
-	                          1, &barrier, 0, nullptr, 0, nullptr); }
+	if (LazyBarriersKeepOld()) {
+		if (has_storage_writes) {
+			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		}
+		vk::MemoryBarrier barrier {};
+		barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
+		{ GpuTimestampScope ts_scope(vk_buffer, GpuTimestamps::Kind::BarrierGlobal); vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
+		                              vk::PipelineStageFlagBits::eComputeShader |
+		                              vk::PipelineStageFlagBits::eTransfer,
+		                          vk::PipelineStageFlagBits::eDrawIndirect, {},
+		                          1, &barrier, 0, nullptr, 0, nullptr); }
+	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	if (program.info.uses_write_faults) {
 		m_context.GetBufferCache().MarkWriteFaultsDirty();
@@ -752,7 +776,12 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		                           GpuTimestamps::Kind::DispatchIndirect, program.shader_hash);
 		vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	}
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (LazyBarriersActive()) {
+		NoteDispatchHazards(buffer.Hazards(), tracked_writes);
+	}
+	if (LazyBarriersKeepOld()) {
+		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	}
 	ResetBindings();
 	m_context.GetCommandScheduler().DiagnosticOperationComplete();
 }

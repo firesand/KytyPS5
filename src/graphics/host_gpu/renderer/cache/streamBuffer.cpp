@@ -241,6 +241,7 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 		before_stage |= vk::PipelineStageFlagBits::eHost;
 	}
 	const auto native = command.Handle();
+	command.Hazards().transfer_wrote = true; // hazard tracker: buffer-to-buffer copy
 	{ GpuTimestampScope ts_scope(native, GpuTimestamps::Kind::BarrierBuffer); native.pipelineBarrier(before_stage, vk::PipelineStageFlagBits::eTransfer,
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, before, 0, nullptr); }
 	const vk::BufferCopy copy {source_offset, destination_offset, size};
@@ -267,6 +268,7 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 	    Barrier(offset, size, vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
 	            vk::AccessFlagBits::eTransferWrite);
 	const auto native = command.Handle();
+	command.Hazards().transfer_wrote = true; // hazard tracker: fill
 	{ GpuTimestampScope ts_scope(native, GpuTimestamps::Kind::BarrierBuffer); native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
 	                       0, nullptr, 1, &before, 0, nullptr); }

@@ -1252,11 +1252,19 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    static_cast<uint64_t>(gpu_indirect->draw_count - 1u) * gpu_indirect->stride + record_size;
 		const auto wait_begin = std::chrono::steady_clock::now();
 		cache.PrepareHostRead(gpu_indirect->args_addr, indirect_args_bytes);
+		// Lazy mode replaces the sticky HasPendingUnboundedWrites() (true until a host wait) with
+		// the tracker's per-command-buffer indirect_write_stages, evaluated at the barrier site.
 		indirect_barrier = cache.HasGpuDirtyBytes(gpu_indirect->args_addr, indirect_args_bytes) ||
-		                   cache.HasPendingUnboundedWrites();
+		                   (LazyBarriersKeepOld() && cache.HasPendingUnboundedWrites());
 		if (gpu_indirect->count_addr != 0) {
 			cache.PrepareHostRead(gpu_indirect->count_addr, sizeof(uint32_t));
 			indirect_barrier |= cache.HasGpuDirtyBytes(gpu_indirect->count_addr, sizeof(uint32_t));
+		}
+		if (LazyBarriersActive()) {
+			// What the pre-tracker code would have decided (sticky flag included), for the counters.
+			if (indirect_barrier || cache.HasPendingUnboundedWrites()) {
+				BarrierProbe::NoteOld(BarrierProbe::DrawIndirectArgs);
+			}
 		}
 		HostReadProbe::AddGpuIndirectWait(static_cast<uint64_t>(
 		    std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1340,7 +1348,19 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
 	// memory.
-	auto vk_buffer = buffer.Handle();
+	// Resolves tracked shader writes (dispatches, earlier draws) before this draw consumes them:
+	// closes the pass when something is pending. No-op unless KYTY_LAZY_BARRIERS is on. An earlier
+	// draw's writes cannot be ordered against a later draw inside one pass, so any pending write
+	// makes this draw start a new pass (the old code ended the pass after the writing draw).
+	buffer.PrepareForDraw();
+	auto vk_buffer = buffer.RawHandle();
+	if (LazyBarriersActive() && gpu_indirect != nullptr) {
+		// After PrepareForDraw the tracked part is resolved whenever a hazard was pending.
+		auto& hazards = buffer.Hazards();
+		if (hazards.indirect_write_stages || hazards.transfer_wrote) {
+			indirect_barrier = true;
+		}
+	}
 	if (indirect_barrier) {
 		// Barriers are illegal inside dynamic rendering: close it, order the GPU-built records
 		// before the indirect read (same barrier DispatchIndirect records), BeginRendering reopens.
@@ -1353,6 +1373,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                              vk::PipelineStageFlagBits::eTransfer,
 		                          vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0,
 		                          nullptr, 0, nullptr);
+		if (LazyBarriersActive()) {
+			BarrierProbe::NoteEmitted(BarrierProbe::DrawIndirectArgs);
+			auto& hazards = buffer.Hazards();
+			hazards.indirect_write_stages = {};
+			hazards.transfer_wrote        = false;
+		}
 	}
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
 	if (!mesh_active) {
@@ -1540,7 +1566,34 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
 		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
 	}
-	if (shader_write_stages) {
+	if (LazyBarriersActive()) {
+		// The writes of a stage whose descriptors are not bound-written but that fault-track
+		// unbounded writes are as real as a bound one: the tracker records them too.
+		vk::PipelineStageFlags tracked_stages = shader_write_stages;
+		for (const auto& stage: vertex_stages) {
+			if (stage.stage.program->info.uses_write_faults) {
+				tracked_stages |= ShaderPipelineStages(NativeShaderStage(stage.logical_stage));
+			}
+		}
+		if (state.ps_active && state.ps_input_info.stage.program->info.uses_write_faults) {
+			tracked_stages |= vk::PipelineStageFlagBits::eFragmentShader;
+		}
+		auto& hazards = buffer.Hazards();
+		hazards.read_stages |= vk::PipelineStageFlagBits::eAllGraphics;
+		if (shader_write_stages) {
+			BarrierProbe::NoteOld(BarrierProbe::DrawPost);
+		}
+		if (LazyBarrierMode() == 1 && StrictPostDrawBarrier()) {
+			// The strict post-draw barrier below already covers shader_write_stages.
+			tracked_stages &= ~shader_write_stages;
+		}
+		if (tracked_stages) {
+			hazards.written_stages |= tracked_stages;
+			hazards.indirect_write_stages |= tracked_stages;
+			hazards.written_access |= vk::AccessFlagBits::eShaderWrite;
+		}
+	}
+	if (shader_write_stages && (LazyBarriersKeepOld() || StrictPostDrawBarrier())) {
 		m_context.GetCommandScheduler().EndRendering();
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
 	}

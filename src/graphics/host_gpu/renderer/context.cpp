@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -26,12 +27,36 @@ bool CommandBuffer::IsInvalid() const {
 
 vk::CommandBuffer CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
+	if (LazyBarriersActive() && !m_rendering && m_hazards.NeedsExternalFlush()) {
+		FlushHazards(BarrierProbe::FlushForeign);
+	}
 	return m_buffer;
+}
+
+vk::CommandBuffer CommandBuffer::RawHandle() const {
+	EXIT_IF(IsInvalid());
+	return m_buffer;
+}
+
+void CommandBuffer::FlushHazards(BarrierProbe::Kind kind) const {
+	EXIT_IF(m_rendering || IsInvalid());
+	EmitPendingHazardBarrier(m_buffer, m_hazards, kind);
+}
+
+void CommandBuffer::PrepareForDraw() const {
+	if (!LazyBarriersActive() || !m_hazards.NeedsExternalFlush()) {
+		return;
+	}
+	EndRendering(); // flushes when it actually closes a pass
+	if (m_hazards.NeedsExternalFlush()) {
+		FlushHazards(BarrierProbe::FlushDraw);
+	}
 }
 
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
-	auto buffer = Handle();
+	m_hazards.Clear();
+	auto buffer = RawHandle();
 
 	vk::CommandBufferBeginInfo begin_info {};
 	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
@@ -43,7 +68,12 @@ void CommandBuffer::Begin() {
 
 void CommandBuffer::End() const {
 	EndRendering();
-	auto buffer = Handle();
+	// The unconditional post-dispatch barrier also ordered a command buffer's last shader writes
+	// before the next submission; resolve whatever is still pending before the buffer closes.
+	if (LazyBarriersActive() && m_hazards.NeedsExternalFlush()) {
+		FlushHazards(BarrierProbe::FlushSubmit);
+	}
+	auto buffer = RawHandle();
 
 	auto result = buffer.end();
 
@@ -68,6 +98,9 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
 	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
 	EndRendering();
+	if (LazyBarriersActive() && m_hazards.NeedsExternalFlush()) {
+		FlushHazards(BarrierProbe::FlushDraw);
+	}
 
 	std::array<vk::RenderingAttachmentInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
 	for (uint32_t i = 0; i < state.num_color_attachments; i++) {
@@ -104,7 +137,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pColorAttachments    = colors.data();
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
-	{ GpuTimestampScope ts_scope(Handle(), GpuTimestamps::Kind::RenderPass); Handle().beginRendering(rendering); }
+	{ GpuTimestampScope ts_scope(RawHandle(), GpuTimestamps::Kind::RenderPass); RawHandle().beginRendering(rendering); }
 	m_render_state = state;
 	m_rendering    = true;
 }
@@ -113,9 +146,13 @@ void CommandBuffer::EndRendering() const {
 	if (!m_rendering) {
 		return;
 	}
-	{ GpuTimestampScope ts_scope(Handle(), GpuTimestamps::Kind::RenderPass); Handle().endRendering(); }
+	{ GpuTimestampScope ts_scope(RawHandle(), GpuTimestamps::Kind::RenderPass); RawHandle().endRendering(); }
 	m_rendering    = false;
 	m_render_state = {};
+	// A pass that closes may hold unresolved shader writes: resolve them now, outside the pass.
+	if (LazyBarriersActive() && m_hazards.NeedsExternalFlush()) {
+		FlushHazards(BarrierProbe::FlushEndRendering);
+	}
 }
 
 } // namespace Libs::Graphics

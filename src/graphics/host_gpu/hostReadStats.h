@@ -235,6 +235,55 @@ struct HostResidentProbe {
 	}
 };
 
+
+// KYTY_LAZY_BARRIERS counters (counted unconditionally; printed on the FaultHistogram line).
+// Per kind: `emitted` = barriers the hazard tracker recorded, `old` = barriers the pre-tracker code
+// would have recorded at that site (counted only where the tracker replaced a site), so
+// elided = old - emitted (negative = the tracker added a barrier the old site did not have).
+// Flush kinds have no old site: they are the places where deferred hazards were finally emitted.
+struct BarrierProbe {
+	enum Kind : uint32_t {
+		DispatchDirect = 0, DispatchIndirect, DrawPost, DrawIndirectArgs,
+		FlushEndRendering, FlushForeign, FlushDraw, FlushSubmit, KindCount
+	};
+	struct Snapshot {
+		std::array<uint64_t, KindCount> emitted {}, old {};
+	};
+	inline static std::array<std::atomic<uint64_t>, KindCount> s_emitted {}, s_old {};
+	inline static std::array<std::atomic<uint64_t>, KindCount> s_total_emitted {}, s_total_old {};
+	static void NoteEmitted(Kind kind, uint64_t n = 1) noexcept {
+		s_emitted[kind].fetch_add(n, std::memory_order_relaxed);
+		s_total_emitted[kind].fetch_add(n, std::memory_order_relaxed);
+	}
+	static void NoteOld(Kind kind, uint64_t n = 1) noexcept {
+		s_old[kind].fetch_add(n, std::memory_order_relaxed);
+		s_total_old[kind].fetch_add(n, std::memory_order_relaxed);
+	}
+	static Snapshot Take() noexcept {
+		Snapshot snapshot;
+		for (uint32_t i = 0; i < KindCount; ++i) {
+			snapshot.emitted[i] = s_emitted[i].exchange(0, std::memory_order_relaxed);
+			snapshot.old[i]     = s_old[i].exchange(0, std::memory_order_relaxed);
+		}
+		return snapshot;
+	}
+	// Never reset by Take(); for tests.
+	static Snapshot Total() noexcept {
+		Snapshot snapshot;
+		for (uint32_t i = 0; i < KindCount; ++i) {
+			snapshot.emitted[i] = s_total_emitted[i].load(std::memory_order_relaxed);
+			snapshot.old[i]     = s_total_old[i].load(std::memory_order_relaxed);
+		}
+		return snapshot;
+	}
+	static const char* Name(uint32_t kind) noexcept {
+		static constexpr const char* names[KindCount] = {
+		    "dispatch", "dispatch-indirect", "draw-post", "draw-indirect-args",
+		    "flush-end-rendering", "flush-foreign", "flush-draw", "flush-submit"};
+		return names[kind];
+	}
+};
+
 } // namespace Libs::Graphics
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_HOSTREADSTATS_H_
