@@ -443,6 +443,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR supported_workgroup_layout {};
 	vk::PhysicalDeviceVulkan12Features supported_features12 {};
 	supported_features12.pNext = workgroup_layout_extension ? &supported_workgroup_layout : nullptr;
+	vk::PhysicalDeviceVulkan11Features supported_features11 {};
+	supported_features11.pNext = supported_features12.pNext;
+	supported_features12.pNext = &supported_features11;
 	vk::PhysicalDeviceVulkan13Features supported_features13 {};
 	supported_features13.pNext = &supported_features12;
 
@@ -490,6 +493,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 
 	auto features12 = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported_features12.shaderSharedInt64Atomics;
+	// GPU-side indirect draws (KYTY_CP_GPU_INDIRECT) need all four; enable them together or not at all.
+	graphics.gpu_indirect_draw_enabled =
+	    supported_features2.features.multiDrawIndirect == VK_TRUE &&
+	    supported_features2.features.drawIndirectFirstInstance == VK_TRUE &&
+	    supported_features11.shaderDrawParameters == VK_TRUE &&
+	    supported_features12.drawIndirectCount == VK_TRUE;
+	features12.drawIndirectCount = graphics.gpu_indirect_draw_enabled ? VK_TRUE : VK_FALSE;
 	vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout {};
 	workgroup_layout.workgroupMemoryExplicitLayout =
 	    supported_workgroup_layout.workgroupMemoryExplicitLayout;
@@ -497,6 +507,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	features12.pNext = workgroup_layout_extension ? static_cast<void*>(&workgroup_layout)
 	                                             : static_cast<void*>(&depth_clip_control);
 	auto features11 = WindowContext::RequiredVulkan11Features();
+	features11.shaderDrawParameters = graphics.gpu_indirect_draw_enabled ? VK_TRUE : VK_FALSE;
 	features11.pNext = features12.pNext;
 	features12.pNext = &features11;
 	if (!features12.shaderSharedInt64Atomics || !workgroup_layout.workgroupMemoryExplicitLayout) {
@@ -560,6 +571,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.fragmentStoresAndAtomics = VK_TRUE;
 	device_features.samplerAnisotropy        = VK_TRUE;
 	device_features.robustBufferAccess       = VK_TRUE;
+	device_features.multiDrawIndirect        = graphics.gpu_indirect_draw_enabled ? VK_TRUE : VK_FALSE;
+	device_features.drawIndirectFirstInstance = graphics.gpu_indirect_draw_enabled ? VK_TRUE : VK_FALSE;
 #if !defined(__APPLE__)
 	device_features.depthBounds = VK_TRUE; // unsupported by MoltenVK
 	device_features.depthClamp  = VK_TRUE;

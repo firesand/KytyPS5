@@ -484,6 +484,8 @@ uint32_t BuiltInForInput(IR::StageInputKind kind) {
 		case IR::StageInputKind::LocalInvocationId: return spv::BuiltInLocalInvocationId;
 		case IR::StageInputKind::LocalInvocationIndex: return spv::BuiltInLocalInvocationIndex;
 		case IR::StageInputKind::GlobalInvocationId: return spv::BuiltInGlobalInvocationId;
+		case IR::StageInputKind::BaseVertex: return spv::BuiltInBaseVertex;
+		case IR::StageInputKind::BaseInstance: return spv::BuiltInBaseInstance;
 		default: return UINT32_MAX;
 	}
 }
@@ -504,6 +506,16 @@ void DefineInputs(EmitterState& state) {
 	if (state.program.info.uses_lds && state.lds_storage_class == spv::StorageClassStorageBuffer) {
 		add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
 		add_builtin(IR::StageInputKind::NumWorkgroups, 3, "gl_NumWorkGroups");
+	}
+	if (const auto* vertex = state.input_info.vertex;
+	    vertex != nullptr && vertex->draw_parameters.active) {
+		const auto& draw = vertex->draw_parameters;
+		if (draw.base_vertex_slot != ShaderDrawParameters::kNoSlot || draw.rebase_ids) {
+			add_builtin(IR::StageInputKind::BaseVertex, 1, "gl_BaseVertex");
+		}
+		if (draw.base_instance_slot != ShaderDrawParameters::kNoSlot || draw.rebase_ids) {
+			add_builtin(IR::StageInputKind::BaseInstance, 1, "gl_BaseInstance");
+		}
 	}
 	if (state.lane_count == 2) {
 		add_builtin(IR::StageInputKind::LocalInvocationIndex, 1, "gl_LocalInvocationIndex");
@@ -534,6 +546,8 @@ void DefineInputs(EmitterState& state) {
 			case IR::StageInputKind::PrimitiveId:
 			case IR::StageInputKind::InstanceIndex:
 			case IR::StageInputKind::Layer:
+			case IR::StageInputKind::BaseVertex:
+			case IR::StageInputKind::BaseInstance:
 			case IR::StageInputKind::SampleId: type = TypeI32(state); break;
 			case IR::StageInputKind::WorkgroupId:
 			case IR::StageInputKind::NumWorkgroups:
@@ -566,6 +580,11 @@ void DefineInputs(EmitterState& state) {
 		    DefineInterfaceVariable(state, type, spv::StorageClassInput, input.debug_name.c_str());
 		if (input.kind == IR::StageInputKind::Layer || input.kind == IR::StageInputKind::SampleId) {
 			state.builder.AddAnnotation(spv::OpDecorate, input.variable_id, spv::DecorationFlat);
+		}
+		if (input.kind == IR::StageInputKind::BaseVertex ||
+		    input.kind == IR::StageInputKind::BaseInstance) {
+			state.builder.RequireExtension("SPV_KHR_shader_draw_parameters");
+			state.builder.RequireCapability(spv::CapabilityDrawParameters);
 		}
 		if (input.kind == IR::StageInputKind::Parameter) {
 			const auto flat = PixelParameterIsFlat(state, input.location);

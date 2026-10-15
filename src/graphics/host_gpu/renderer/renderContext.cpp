@@ -152,6 +152,9 @@ struct FaultSampler {
 			reads_sum.sites[i].first += host_reads.sites[i].first;
 			reads_sum.sites[i].second += host_reads.sites[i].second;
 		}
+		for (size_t i = 0; i < host_reads.gpu_indirect.size(); ++i) {
+			reads_sum.gpu_indirect[i] += host_reads.gpu_indirect[i];
+		}
 		syncs_sum.calls += syncs.calls;
 		syncs_sum.regions += syncs.regions;
 		for (size_t i = 0; i < budget.categories.size(); ++i) {
@@ -214,7 +217,8 @@ struct FaultSampler {
 		                    hot_all.skipped, hot_all.demoted, hot_all.invalidated);
 		const auto& rs = reads_all.sites;
 		line += fmt::format(" | cpu-sync {} calls {} regions {} copy-batches {} copy-buffers"
-		                    " | cp reads: args {} ({} ms) count {} ({} ms) dispatch {} ({} ms) pred {} ({} ms)",
+		                    " | cp reads: args {} ({} ms) count {} ({} ms) dispatch {} ({} ms) pred {} ({} ms)"
+		                    " | gpu-indirect {} draws {} fallback(index_offset) {} fallback(other) {} (of which mesh)",
 		                    syncs_all.calls, syncs_all.regions, sync_all.copy_batches, sync_all.copy_buffers,
 		                    rs[HostReadProbe::DrawArgs].first,
 		                    rs[HostReadProbe::DrawArgs].second / 1000000,
@@ -222,7 +226,11 @@ struct FaultSampler {
 		                    rs[HostReadProbe::DispatchArgs].first,
 		                    rs[HostReadProbe::DispatchArgs].second / 1000000,
 		                    rs[HostReadProbe::Predication].first,
-		                    rs[HostReadProbe::Predication].second / 1000000);
+		                    rs[HostReadProbe::Predication].second / 1000000,
+		                    reads_all.gpu_indirect[HostReadProbe::GpuDraws],
+		                    reads_all.gpu_indirect[HostReadProbe::FallbackIndexOffset],
+		                    reads_all.gpu_indirect[HostReadProbe::FallbackOther],
+		                    reads_all.gpu_indirect[HostReadProbe::FallbackMesh]);
 		const auto& bc = budget_all.categories;
 		const auto  ms = [](uint64_t ns) { return ns / 1000000; };
 		const auto cat = [&](BudgetProbe::Category c) {

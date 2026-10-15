@@ -609,6 +609,14 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	EXIT_IF(info.resources_num < 0 || info.resources_num > ShaderVertexInputInfo::RES_MAX);
 	key.clear();
 	key.push_back(static_cast<uint32_t>(info.fetch_embedded));
+	// Draw-parameter map: the draw packet, not the shader, decides it, so a shader used by both an
+	// ordinary and a GPU-indirect draw gets two programs.
+	key.push_back(static_cast<uint32_t>(info.draw_parameters.active));
+	if (info.draw_parameters.active) {
+		key.push_back(info.draw_parameters.base_vertex_slot);
+		key.push_back(info.draw_parameters.base_instance_slot);
+		key.push_back(static_cast<uint32_t>(info.draw_parameters.rebase_ids));
+	}
 	key.push_back(static_cast<uint32_t>(info.fetch_attrib_reg));
 	key.push_back(static_cast<uint32_t>(info.fetch_buffer_reg));
 	key.push_back(info.resources_num);
@@ -714,6 +722,14 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 		key.push_back(static_cast<uint32_t>(info.group_id[i]));
 	}
 	key.push_back(static_cast<uint32_t>(info.tg_size_en));
+}
+
+bool VertexShaderIsMesh(const HW::VertexShaderInfo& regs, const HW::Context& context) {
+	const auto [data, hash] = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoVS():");
+	(void)hash;
+	const bool merged = (context.GetShaderStages() & 0x20u) != 0;
+	return merged || (data.type == Prospero::ShaderBinaryType::kGs &&
+	                  regs.gs_regs.rsrc2.lds_size != 0);
 }
 
 ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,

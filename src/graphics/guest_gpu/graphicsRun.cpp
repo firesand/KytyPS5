@@ -1163,12 +1163,108 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, IndirectDrawRegisters 
 	DrawIndirectMulti(data_offset, 1, nullptr, args_size, registers, draw_initiator, indexed);
 }
 
+// KYTY_CP_GPU_INDIRECT=1: indirect draws read their argument records on the GPU
+// (vkCmdDraw[Indexed]Indirect[Count]) instead of through host reads that wait for the producing
+// dispatch. Default off.
+static bool GpuIndirectEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_CP_GPU_INDIRECT");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+// Returns true when the draw was recorded with GPU-resident arguments. False keeps the host path
+// (and has counted why).
+bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_count_or_count,
+                                            const volatile uint32_t* count_addr,
+                                            uint32_t stride_in_bytes, IndirectDrawRegisters registers,
+                                            bool indexed) {
+	// The first-index SGPR has no draw-parameter built-in.
+	if (registers.index_offset != Pm4::SH_NOP) {
+		HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackIndexOffset);
+		return false;
+	}
+	const auto fallback = [](HostReadProbe::GpuIndirect kind = HostReadProbe::FallbackOther) {
+		HostReadProbe::CountGpuIndirect(kind);
+		return false;
+	};
+	ShaderDrawParameters parameters;
+	parameters.active = true;
+	const auto slot_of = [](uint32_t location, uint32_t& slot) {
+		if (location == Pm4::SH_NOP) {
+			slot = ShaderDrawParameters::kNoSlot;
+			return true;
+		}
+		if (location < Pm4::SPI_SHADER_USER_DATA_GS_0 || location > Pm4::SPI_SHADER_USER_DATA_GS_31) {
+			return false; // not a vertex-stage user-data register
+		}
+		slot = location - Pm4::SPI_SHADER_USER_DATA_GS_0;
+		return true;
+	};
+	if (!slot_of(registers.vertex_offset, parameters.base_vertex_slot) ||
+	    !slot_of(registers.instance_offset, parameters.base_instance_slot)) {
+		return fallback();
+	}
+
+	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
+	if (max_count_or_count == 0 || stride_in_bytes < args_size || (stride_in_bytes & 3u) != 0 ||
+	    ((m_draw_indirect_args_base_addr + data_offset) & 3u) != 0 ||
+	    (count_addr != nullptr && (reinterpret_cast<uint64_t>(count_addr) & 3u) != 0)) {
+		return fallback();
+	}
+	if (indexed && (m_index_base_addr == 0 || m_index_buffer_size == 0)) {
+		return fallback();
+	}
+
+	auto& executor = m_renderer.GetRenderExecutor();
+	bool  mesh     = false;
+	if (!executor.CanDrawIndirectOnGpu(CurrentBuffer(), indexed, m_index_type_and_size,
+	                                   max_count_or_count, &mesh)) {
+		if (mesh) {
+			HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackMesh);
+		}
+		return fallback();
+	}
+
+	GpuIndirectDraw draw;
+	draw.args_addr         = m_draw_indirect_args_base_addr + data_offset;
+	draw.count_addr        = reinterpret_cast<uint64_t>(count_addr);
+	draw.draw_count        = max_count_or_count;
+	draw.stride            = stride_in_bytes;
+	draw.index_base        = m_index_base_addr;
+	draw.index_buffer_size = m_index_buffer_size;
+	draw.parameters        = parameters;
+
+	// The renderer needs a non-empty placeholder: the real counts live in the argument records.
+	if (indexed) {
+		DrawIndex({.index_count    = m_index_buffer_size,
+		           .index_addr     = reinterpret_cast<const void*>(m_index_base_addr),
+		           .instance_count = 1,
+		           .offset_source  = DrawOffsetSource::IndirectArgs,
+		           .gpu_indirect   = &draw});
+	} else {
+		DrawIndexAuto({.vertex_count   = 1,
+		               .instance_count = 1,
+		               .offset_source  = DrawOffsetSource::IndirectArgs,
+		               .gpu_indirect   = &draw});
+	}
+	HostReadProbe::CountGpuIndirect(HostReadProbe::GpuDraws);
+	return true;
+}
+
 void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
                                          const volatile uint32_t* count_addr,
                                          uint32_t stride_in_bytes, IndirectDrawRegisters registers,
                                          uint32_t draw_initiator, bool indexed) {
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != (indexed ? 0u : 2u));
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
+
+	if (GpuIndirectEnabled() &&
+	    TryDrawIndirectOnGpu(data_offset, max_count_or_count, count_addr, stride_in_bytes,
+	                         registers, indexed)) {
+		return;
+	}
 
 	uint32_t draw_count = max_count_or_count;
 	if (count_addr != nullptr) {

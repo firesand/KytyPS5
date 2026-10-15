@@ -34,10 +34,20 @@ struct HostReadCounters {
 
 struct HostReadProbe {
 	enum Site : uint32_t { DrawArgs = 0, DrawCount, DispatchArgs, Predication, SiteCount };
+	// KYTY_CP_GPU_INDIRECT accounting: draws issued with GPU-side arguments, and the indirect draws
+	// that stayed on the host path (first-index SGPR named, or any other reason; "mesh" is the
+	// subset of "other" caused by NGG/mesh vertex shaders).
+	enum GpuIndirect : uint32_t { GpuDraws = 0, FallbackIndexOffset, FallbackOther, FallbackMesh, GpuIndirectCount };
 	struct Snapshot {
 		std::array<std::pair<uint64_t, uint64_t>, SiteCount> sites {}; // calls, nanoseconds
+		std::array<uint64_t, GpuIndirectCount>               gpu_indirect {};
 	};
 	inline static std::array<HostReadCounters, SiteCount> s_sites {};
+	inline static std::array<std::atomic<uint64_t>, GpuIndirectCount> s_gpu_indirect {};
+
+	static void CountGpuIndirect(GpuIndirect kind) noexcept {
+		s_gpu_indirect[kind].fetch_add(1, std::memory_order_relaxed);
+	}
 
 	static void Add(Site site, uint64_t ns) noexcept {
 		s_sites[site].calls.fetch_add(1, std::memory_order_relaxed);
@@ -48,6 +58,9 @@ struct HostReadProbe {
 		for (uint32_t i = 0; i < SiteCount; ++i) {
 			snapshot.sites[i] = {s_sites[i].calls.exchange(0, std::memory_order_relaxed),
 			                     s_sites[i].ns.exchange(0, std::memory_order_relaxed)};
+		}
+		for (uint32_t i = 0; i < GpuIndirectCount; ++i) {
+			snapshot.gpu_indirect[i] = s_gpu_indirect[i].exchange(0, std::memory_order_relaxed);
 		}
 		return snapshot;
 	}
