@@ -1598,6 +1598,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (shader_write_stages && (LazyBarriersKeepOld() || StrictPostDrawBarrier())) {
 		m_context.GetCommandScheduler().EndRendering();
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
+		if (LazyBarrierMode() == 1) {
+			BarrierProbe::NoteEmitted(BarrierProbe::DrawPost); // strict bisection barrier
+		}
 	}
 	LogDrawPhase(draw.Name(), "DrawComplete");
 	if (!draw.IsIndexed()) {

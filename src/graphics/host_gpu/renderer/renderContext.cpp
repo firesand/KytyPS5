@@ -242,17 +242,32 @@ struct FaultSampler {
 		                    reads_all.gpu_indirect_wait_ns / 1000000);
 		line += fmt::format(" | host-resident binds {} bytes {} KiB fallbacks {}", resident_all.binds,
 		                    resident_all.bytes >> 10, resident_all.fallbacks);
-		// Lazy hazard-tracked barriers (KYTY_LAZY_BARRIERS): per site `emitted/elided` (elided =
-		// barriers the pre-tracker code recorded there minus those the tracker recorded; negative
-		// means the tracker added one), then the places where deferred hazards were emitted.
+		// Lazy hazard-tracked barriers (KYTY_LAZY_BARRIERS). Mode 1: per site `emitted/elided`
+		// (elided = barriers the pre-tracker code recorded there minus those the tracker recorded;
+		// negative means the tracker added one). The tracker does not record draw-post barriers
+		// itself: they are replaced by flush-draw / flush-end-rendering, so draw-post is credited
+		// with those two counts (an upper bound, they also serve dispatch hazards). Mode 2 keeps
+		// the old barriers, nothing is elided: it prints `decisions (old N)` only. Then the places
+		// where deferred hazards were emitted.
 		{
-			const auto bar = BarrierProbe::Take();
-			line += fmt::format(" | barriers mode {}:", LazyBarrierMode());
+			const auto bar  = BarrierProbe::Take();
+			const auto mode = LazyBarrierMode();
+			line += fmt::format(" | barriers mode {}:", mode);
+			const auto replaced = static_cast<int64_t>(bar.emitted[BarrierProbe::FlushDraw]) +
+			                      static_cast<int64_t>(bar.emitted[BarrierProbe::FlushEndRendering]);
 			for (uint32_t k = 0; k < BarrierProbe::KindCount; ++k) {
 				if (bar.old[k] != 0 || k < BarrierProbe::FlushEndRendering) {
-					line += fmt::format(" {} {}/{}", BarrierProbe::Name(k), bar.emitted[k],
-					                    static_cast<int64_t>(bar.old[k]) -
-					                        static_cast<int64_t>(bar.emitted[k]));
+					if (mode == 2) {
+						line += fmt::format(" {} {}(old {})", BarrierProbe::Name(k), bar.emitted[k],
+						                    bar.old[k]);
+					} else {
+						auto elided = static_cast<int64_t>(bar.old[k]) -
+						              static_cast<int64_t>(bar.emitted[k]);
+						if (k == BarrierProbe::DrawPost) {
+							elided -= replaced;
+						}
+						line += fmt::format(" {} {}/{}", BarrierProbe::Name(k), bar.emitted[k], elided);
+					}
 				} else {
 					line += fmt::format(" {} {}", BarrierProbe::Name(k), bar.emitted[k]);
 				}

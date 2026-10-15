@@ -1721,7 +1721,10 @@ void CommandProcessor::EmitGlobalBarrier() {
 	dependency.memoryBarrierCount = 1;
 	dependency.pMemoryBarriers    = &barrier;
 	GetScheduler().EndRendering();
-	CurrentBuffer().Handle().pipelineBarrier2(dependency);
+	auto& buffer = CurrentBuffer();
+	buffer.RawHandle().pipelineBarrier2(dependency);
+	// An all-commands -> all-commands read|write barrier satisfies every pending tracker hazard.
+	buffer.Hazards().Clear();
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
