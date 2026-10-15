@@ -5678,7 +5678,7 @@ public:
         const Range ranges[] = {
             {base, 0x1000000},           // every live image
             {base + 0x180000, 0x80000},  // inside the alias pair
-            {base + 0x3ff000, 0x2000},   // alias pair + straddle + adjacent
+            {base + 0x3ff000, 0x2000},   // alias pair tail + adjacent
             {base + 0x400000, 0x1000},   // exact end of the pair: only the neighbour
             {base + 0x401000, 0x10000},  // same MiB page as `adjacent`, no byte shared
             {base + 0x2ff800, 0x100},    // pair + straddle
@@ -5686,6 +5686,8 @@ public:
             {base + 0x4fffff, 0x100001}, // ends one byte before `tiny`
             {base + 0x700000, 0x80000},  // deleted image left no membership
             {base + 0x2000000, 0x20000}, // empty region
+            {base + 0x400000, 0x400000}, // 4 MiB tracker-region shape (D3)
+            {base + 0x2ff000, 0x1000},   // one 4 KiB tracker page (D2): pair + straddle
         };
         for (const auto &range : ranges) {
           const auto scan = TextureCacheTestAccess::WriteOverlaps(

@@ -1410,8 +1410,10 @@ void TestGpuWriteTicksMatchesMap() {
   constexpr uint64_t kPages = uint64_t{1} << 30;
   std::vector<uint64_t> touched;
   for (int i = 0; i < 20000; ++i) {
+    // Dense window (cheap) plus a few far-apart pages that exercise distinct buckets.
     const uint64_t page = (i % 3 == 0 && !touched.empty()) ? touched[next() % touched.size()]
-                                                           : next() % kPages;
+                          : (i % 500 == 0)                  ? next() % kPages
+                                                            : 0x40000 + next() % 0x10000;
     const uint64_t tick = next() % 5 == 0 ? 0 : next() % 1000;
     Check(ticks.Note(page, tick), "valid page rejected");
     auto &stamp = reference[page];
@@ -1422,7 +1424,7 @@ void TestGpuWriteTicksMatchesMap() {
     Check(ticks.Contains(page) && ticks.Get(page) == reference[page], "stamp differs from map");
   }
   for (int i = 0; i < 20000; ++i) {
-    const uint64_t page = next() % kPages;
+    const uint64_t page = i % 2 ? 0x40000 + next() % 0x12000 : next() % kPages;
     const auto it = reference.find(page);
     Check(ticks.Contains(page) == (it != reference.end()), "presence differs from map");
     Check(ticks.Get(page) == (it != reference.end() ? it->second : 0), "value differs from map");
