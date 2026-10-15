@@ -4,12 +4,14 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/cache/meshIndirectTranslator.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -180,7 +182,10 @@ public:
 	// tessellation shaders, quad lists, 8-bit indices, custom primitive-restart values).
 	// `parameters` names the user-data slots the packet patches; a vertex shader whose resource plan
 	// evaluates one of them on the host (or one not compiled yet) keeps the host path (Srt).
+	// Indexed mesh (NGG) draws are eligible too: parameters.mesh_record selects the translation
+	// prepass variant, and the draw must name no count buffer (the caller checks).
 	enum class GpuIndirectBlock { None, Mesh, Srt, Other };
+	[[nodiscard]] bool DrawUsesMeshVertexStage(CommandBuffer& buffer);
 	[[nodiscard]] bool CanDrawIndirectOnGpu(CommandBuffer& buffer, bool indexed,
 	                                        uint32_t index_type_and_size, uint32_t draw_count,
 	                                        const ShaderDrawParameters& parameters,
@@ -244,6 +249,7 @@ private:
 	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
 
 	RenderContext&                        m_context;
+	std::unique_ptr<MeshIndirectTranslator> m_mesh_indirect;
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;

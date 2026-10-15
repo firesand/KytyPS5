@@ -1218,24 +1218,32 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			EXIT("unsupported mesh draw: primitive=%u indexed=%u restart=%u\n",
 			     static_cast<uint32_t>(ucfg.GetPrimType()), draw.IsIndexed(), primitive_restart_enable);
 		}
-		const auto primitives = mesh.InputPrimitiveCount(draw.index_count);
-		if (primitives == 0 || draw.instance_count == 0) {
-			return;
-		}
-		mesh_groups        = (primitives - 1u) / mesh.primitives_per_group + 1u;
-		const auto& limits = m_context.GetGraphics().mesh_shader_properties;
-		if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
-		    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
-		    static_cast<uint64_t>(mesh_groups) * draw.instance_count >
-		        limits.maxMeshWorkGroupTotalCount) {
-			EXIT("mesh draw exceeds host workgroup limits: %ux%u\n", mesh_groups,
-			     draw.instance_count);
+		// GPU-side indirect: the placeholder draw says nothing about the records. The translation
+		// prepass derives the group counts (with the same formula) and clamps to the limits.
+		if (gpu_indirect == nullptr) {
+			const auto primitives = mesh.InputPrimitiveCount(draw.index_count);
+			if (primitives == 0 || draw.instance_count == 0) {
+				return;
+			}
+			mesh_groups        = (primitives - 1u) / mesh.primitives_per_group + 1u;
+			const auto& limits = m_context.GetGraphics().mesh_shader_properties;
+			if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
+			    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
+			    static_cast<uint64_t>(mesh_groups) * draw.instance_count >
+			        limits.maxMeshWorkGroupTotalCount) {
+				EXIT("mesh draw exceeds host workgroup limits: %ux%u\n", mesh_groups,
+				     draw.instance_count);
+			}
 		}
 	}
 
 	if (gpu_indirect != nullptr) {
-		EXIT_IF(mesh_active);
+		EXIT_IF(mesh_active != gpu_indirect->parameters.mesh_record);
+		EXIT_IF(mesh_active && (!draw.IsIndexed() || gpu_indirect->count_addr != 0 ||
+		                        state.vertex_info[0].mesh.fast_launch ||
+		                        !MeshIndirectTranslator::Fits(gpu_indirect->draw_count)));
 	}
+	const bool mesh_gpu = mesh_active && gpu_indirect != nullptr;
 	// GPU-resident indirect arguments: publish pending write-fault records (without touching the
 	// memory), then decide whether the argument read needs a shaderWrite -> indirectCommandRead
 	// barrier. Marks are made at record time for bound shader writes; unbounded (fault-tracked)
@@ -1322,14 +1330,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
 	                         feedback_aspects, stages);
-	const uint32_t draw_data[] {
+	uint32_t draw_data[] {
 	    draw.index_count,
 	    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
 	    emit.first_instance, index_source.guest_element_size,
 	    static_cast<uint32_t>(index_source.address),
 	    static_cast<uint32_t>(index_source.address >> 32u)};
 	static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
-	if (mesh_active) {
+	if (mesh_active && !mesh_gpu) {
 		ZeroCompanyMeshInputs::Capture(buffer, submit_id,
 		    GpuDiagnostics::HandleValue(pipeline.pipeline), m_context.GetTextureCache().m_slot_images,
 		    stages, draw_data,
@@ -1341,7 +1349,40 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// point onward, every operation targets the current command buffer and cannot touch guest
 	// memory.
 	auto vk_buffer = buffer.Handle();
-	if (indirect_barrier) {
+	MeshIndirectTranslator::Result mesh_indirect {};
+	if (mesh_gpu) {
+		// vkCmdDispatch is illegal inside dynamic rendering: close it (BeginRendering reopens). The
+		// prepass orders the producers of the records (when GPU-written) before its reads and its
+		// writes before the indirect command / mesh shader record reads.
+		m_context.GetCommandScheduler().EndRendering();
+		if (m_mesh_indirect == nullptr) {
+			m_mesh_indirect = std::make_unique<MeshIndirectTranslator>(
+			    m_context.GetGraphics(), m_context.GetCommandScheduler());
+		}
+		const auto& mesh   = state.vertex_info[0].mesh;
+		const auto& limits = m_context.GetGraphics().mesh_shader_properties;
+		MeshIndirectTranslator::Request request {};
+		request.args_buffer          = indirect_args.first->Handle();
+		request.args_offset          = indirect_args.second;
+		request.args_range           = indirect_args.second + indirect_args_bytes;
+		request.count                = gpu_indirect->draw_count;
+		request.stride               = gpu_indirect->stride;
+		request.index_buffer_size    = gpu_indirect->index_buffer_size;
+		request.index_base           = gpu_indirect->index_base;
+		request.element_size         = index_source.guest_element_size;
+		request.primitive_size       = mesh.InputPrimitiveSize();
+		request.primitive_step       = mesh.InputPrimitiveStep();
+		request.primitives_per_group = mesh.primitives_per_group;
+		request.max_groups_x         = limits.maxMeshWorkGroupCount[0];
+		request.max_groups_y         = limits.maxMeshWorkGroupCount[1];
+		request.max_groups_total     = limits.maxMeshWorkGroupTotalCount;
+		request.producer_barrier     = indirect_barrier;
+		mesh_indirect                = m_mesh_indirect->Translate(vk_buffer, request);
+		draw_data[0] = static_cast<uint32_t>(mesh_indirect.records_address);
+		draw_data[1] = static_cast<uint32_t>(mesh_indirect.records_address >> 32u);
+		draw_data[2] = index_source.guest_element_size;
+		draw_data[3] = draw_data[4] = draw_data[5] = 0;
+	} else if (indirect_barrier) {
 		// Barriers are illegal inside dynamic rendering: close it, order the GPU-built records
 		// before the indirect read (same barrier DispatchIndirect records), BeginRendering reopens.
 		m_context.GetCommandScheduler().EndRendering();
@@ -1367,9 +1408,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                        vk::ShaderStageFlagBits::eMeshEXT |
 		                            vk::ShaderStageFlagBits::eFragment,
 		                        0, sizeof(draw_data), draw_data);
-		ZeroCompanyMeshResources::Capture(buffer, submit_id,
-		    GpuDiagnostics::HandleValue(pipeline.pipeline),
-		    m_context.GetTextureCache().m_slot_images, stages, draw_data);
+		if (!mesh_gpu) {
+			// Mesh GPU-indirect draws have no host-known per-record values to capture.
+			ZeroCompanyMeshResources::Capture(buffer, submit_id,
+			    GpuDiagnostics::HandleValue(pipeline.pipeline),
+			    m_context.GetTextureCache().m_slot_images, stages, draw_data);
+		}
 	} else {
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
@@ -1482,8 +1526,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				               draw.index_count, index_source.guest_element_size};
 				m_context.GetCommandScheduler().RecordGpuOperation(layout);
 			}
-			diagnostic.args = {mesh_groups, draw.instance_count, 1, draw.index_count,
-			                   emit.first_instance, index_source.address};
+			if (mesh_gpu) {
+				diagnostic.kind = "draw-mesh-indirect-gpu";
+				diagnostic.args = {gpu_indirect->args_addr, gpu_indirect->count_addr,
+				                   gpu_indirect->draw_count, gpu_indirect->stride,
+				                   indirect_barrier ? 1u : 0u, index_source.address};
+			} else {
+				diagnostic.args = {mesh_groups, draw.instance_count, 1, draw.index_count,
+				                   emit.first_instance, index_source.address};
+			}
 			CommandScheduler::Checkpoint(vk_buffer,
 			                             m_context.GetCommandScheduler().RecordGpuOperation(diagnostic));
 		}
@@ -1493,7 +1544,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		const uint64_t ts_ps_hash = state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0;
 		GpuTimestampScope ts_scope(m_context.GetCommandScheduler(), vk_buffer,
 		                           GpuTimestamps::Kind::Draw, ts_ps_hash, ts_vs_hash);
-		if (mesh_active) {
+		if (mesh_gpu) {
+			vk_buffer.drawMeshTasksIndirectEXT(mesh_indirect.buffer, mesh_indirect.commands_offset,
+			                                   gpu_indirect->draw_count,
+			                                   MeshIndirectTranslator::CommandBytes);
+		} else if (mesh_active) {
 			vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 		} else if (gpu_indirect != nullptr) {
 			if (GpuDiagnostics::Enabled()) {
@@ -1551,6 +1606,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	m_context.GetCommandScheduler().DiagnosticOperationComplete();
 }
 
+bool RenderExecutor::DrawUsesMeshVertexStage(CommandBuffer& buffer) {
+	auto& sh_ctx = buffer.GetShaders();
+	return DrawHasValidVertexShader(sh_ctx) &&
+	       VertexShaderIsMesh(sh_ctx.GetVs(), buffer.GetRegisters());
+}
+
 bool RenderExecutor::CanDrawIndirectOnGpu(CommandBuffer& buffer, bool indexed,
                                           uint32_t index_type_and_size, uint32_t draw_count,
                                           const ShaderDrawParameters& parameters,
@@ -1579,10 +1640,29 @@ bool RenderExecutor::CanDrawIndirectOnGpu(CommandBuffer& buffer, bool indexed,
 		return false;
 	}
 	uint64_t shader_hash = 0;
-	if (VertexShaderIsMesh(sh_ctx.GetVs(), buffer.GetRegisters(), &shader_hash)) {
-		if (block != nullptr) {
-			*block = GpuIndirectBlock::Mesh;
+	const bool mesh = VertexShaderIsMesh(sh_ctx.GetVs(), buffer.GetRegisters(), &shader_hash);
+	if (mesh) {
+		// Indexed NGG draws take the translation prepass (parameters.mesh_record); anything the
+		// prepass cannot reproduce stays on the host path.
+		if (!parameters.mesh_record || !indexed || !graphics.mesh_shader_enabled ||
+		    !MeshIndirectTranslator::Fits(draw_count)) {
+			if (block != nullptr) {
+				*block = GpuIndirectBlock::Mesh;
+			}
+			return false;
 		}
+		// The group counts and primitives per group come from the program info the pipeline would
+		// build for this state (same function; EXITs on the same unsupported assemblies).
+		ShaderVertexInputInfo info {};
+		const auto params = PrepareProgram(sh_ctx.GetVs(), buffer.GetRegisters(), ucfg, info);
+		shader_hash = params.hash;
+		if (info.mesh.fast_launch || info.mesh.primitives_per_group == 0) {
+			if (block != nullptr) {
+				*block = GpuIndirectBlock::Mesh;
+			}
+			return false;
+		}
+	} else if (parameters.mesh_record) {
 		return false;
 	}
 	// The host evaluates the resource plan (descriptor addresses, SRT reads, uniform branches) from
@@ -1596,7 +1676,8 @@ bool RenderExecutor::CanDrawIndirectOnGpu(CommandBuffer& buffer, bool indexed,
 	};
 	if (!m_context.GetPipelineCache().GetVertexUserDataMask(shader_hash, plan_mask) ||
 	    (plan_mask & (slot_bit(parameters.base_vertex_slot) |
-	                  slot_bit(parameters.base_instance_slot))) != 0) {
+	                  slot_bit(parameters.base_instance_slot) |
+	                  slot_bit(parameters.first_index_slot))) != 0) {
 		if (block != nullptr) {
 			*block = GpuIndirectBlock::Srt;
 		}

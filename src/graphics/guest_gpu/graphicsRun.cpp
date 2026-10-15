@@ -1181,8 +1181,12 @@ bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_c
                                             const volatile uint32_t* count_addr,
                                             uint32_t stride_in_bytes, IndirectDrawRegisters registers,
                                             bool indexed) {
-	// The first-index SGPR has no draw-parameter built-in.
-	if (registers.index_offset != Pm4::SH_NOP) {
+	auto& executor = m_renderer.GetRenderExecutor();
+	// NGG / mesh vertex stages: the translation prepass serves every batch SGPR (including the
+	// first-index one) from the record, but only for indexed draws without a count buffer.
+	const bool mesh = executor.DrawUsesMeshVertexStage(CurrentBuffer());
+	// The vertex variant has no first-index draw-parameter built-in.
+	if (!mesh && registers.index_offset != Pm4::SH_NOP) {
 		HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackIndexOffset);
 		return false;
 	}
@@ -1190,8 +1194,13 @@ bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_c
 		HostReadProbe::CountGpuIndirect(kind);
 		return false;
 	};
+	if (mesh && (!indexed || count_addr != nullptr)) {
+		HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackMesh);
+		return fallback();
+	}
 	ShaderDrawParameters parameters;
-	parameters.active = true;
+	parameters.active      = true;
+	parameters.mesh_record = mesh;
 	const auto slot_of = [](uint32_t location, uint32_t& slot) {
 		if (location == Pm4::SH_NOP) {
 			slot = ShaderDrawParameters::kNoSlot;
@@ -1204,7 +1213,8 @@ bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_c
 		return true;
 	};
 	if (!slot_of(registers.vertex_offset, parameters.base_vertex_slot) ||
-	    !slot_of(registers.instance_offset, parameters.base_instance_slot)) {
+	    !slot_of(registers.instance_offset, parameters.base_instance_slot) ||
+	    (mesh && !slot_of(registers.index_offset, parameters.first_index_slot))) {
 		return fallback();
 	}
 
@@ -1218,13 +1228,13 @@ bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_c
 		return fallback();
 	}
 
-	auto& executor = m_renderer.GetRenderExecutor();
 	RenderExecutor::GpuIndirectBlock block = RenderExecutor::GpuIndirectBlock::Other;
 	if (!executor.CanDrawIndirectOnGpu(CurrentBuffer(), indexed, m_index_type_and_size,
 	                                   max_count_or_count, parameters, &block)) {
 		if (block == RenderExecutor::GpuIndirectBlock::Srt) {
-			// The vertex shader's resource plan reads an offset SGPR (or is not compiled yet).
-			HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackSrt);
+			// The shader's resource plan reads an offset SGPR (or is not compiled yet).
+			HostReadProbe::CountGpuIndirect(mesh ? HostReadProbe::FallbackMeshSrt
+			                                     : HostReadProbe::FallbackSrt);
 			return false;
 		}
 		if (block == RenderExecutor::GpuIndirectBlock::Mesh) {
@@ -1256,6 +1266,9 @@ bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_c
 		               .gpu_indirect   = &draw});
 	}
 	HostReadProbe::CountGpuIndirect(HostReadProbe::GpuDraws);
+	if (mesh) {
+		HostReadProbe::CountGpuIndirect(HostReadProbe::GpuMeshDraws);
+	}
 	return true;
 }
 
