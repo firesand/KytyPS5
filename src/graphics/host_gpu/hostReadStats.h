@@ -185,6 +185,28 @@ struct SyncProbe {
 	}
 };
 
+// KYTY_HOST_RESIDENT=1: vertex/index bindings read straight from imported guest memory.
+// Fallbacks are bindings that wanted the host path but took the VRAM-copy path (GPU-modified
+// range, not direct memory, chunk crossing, 8-bit index widening, unaligned index offset).
+struct HostResidentProbe {
+	struct Snapshot {
+		uint64_t binds = 0, bytes = 0, fallbacks = 0;
+	};
+	inline static std::atomic<uint64_t> s_binds {0};
+	inline static std::atomic<uint64_t> s_bytes {0};
+	inline static std::atomic<uint64_t> s_fallbacks {0};
+	static void NoteBind(uint64_t bytes) noexcept {
+		s_binds.fetch_add(1, std::memory_order_relaxed);
+		s_bytes.fetch_add(bytes, std::memory_order_relaxed);
+	}
+	static void     NoteFallback() noexcept { s_fallbacks.fetch_add(1, std::memory_order_relaxed); }
+	static Snapshot Take() noexcept {
+		return {s_binds.exchange(0, std::memory_order_relaxed),
+		        s_bytes.exchange(0, std::memory_order_relaxed),
+		        s_fallbacks.exchange(0, std::memory_order_relaxed)};
+	}
+};
+
 } // namespace Libs::Graphics
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_HOSTREADSTATS_H_

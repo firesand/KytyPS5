@@ -767,6 +767,9 @@ struct VertexBufferRange {
 	uint64_t                     requested_end = 0;
 	uint64_t                     acquired_end  = 0;
 	std::pair<Buffer*, uint64_t> binding;
+	// Host-resident prototype: set instead of `binding` when the range is read in place.
+	vk::Buffer host_buffer = nullptr;
+	uint64_t   host_offset = 0;
 
 	[[nodiscard]] uint64_t RequestedSize() const { return requested_end - base_address; }
 };
@@ -829,6 +832,16 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 		const auto size =
 		    Libs::LibKernel::Memory::ClampRangeSize(range.base_address, range.RequestedSize());
 		range.acquired_end = range.base_address + size;
+		// KYTY_HOST_RESIDENT=1: a range the GPU has not modified is read in place from the imported
+		// guest memory (no VRAM copy, no upload); GPU-modified or unresolvable ranges fall back.
+		if (auto* resident = cache.GetHostResident(); resident != nullptr) {
+			if (!cache.IsRegionGpuModified(range.base_address, size) &&
+			    resident->Resolve(range.base_address, size, range.host_buffer, range.host_offset)) {
+				HostResidentProbe::NoteBind(size);
+				continue;
+			}
+			HostResidentProbe::NoteFallback();
+		}
 		range.binding      = cache.ObtainBuffer(range.base_address, size, false);
 	}
 
@@ -858,8 +871,13 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 			     vertex.addr);
 		}
 
-		prepared.buffers[i] = range->binding.first->Handle();
-		prepared.offsets[i] = range->binding.second + vertex.addr - range->base_address;
+		if (range->host_buffer != nullptr) {
+			prepared.buffers[i] = range->host_buffer;
+			prepared.offsets[i] = range->host_offset + vertex.addr - range->base_address;
+		} else {
+			prepared.buffers[i] = range->binding.first->Handle();
+			prepared.offsets[i] = range->binding.second + vertex.addr - range->base_address;
+		}
 		prepared.sizes[i]   = std::min(size, range->acquired_end - vertex.addr);
 	}
 
@@ -1055,8 +1073,22 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 		prepared.offset = stream.Copy(source.host_data, source.size, 16);
 		prepared.buffer = stream.Handle();
 	} else {
-		auto [buffer_ptr, offset] =
-		    buffer.GetContext().GetBufferCache().ObtainBuffer(source.address, source.size, false);
+		auto& cache = buffer.GetContext().GetBufferCache();
+		if (auto* resident = cache.GetHostResident(); resident != nullptr) {
+			// Index data read in place. Vulkan needs the offset aligned to the index size; 8-bit
+			// indices never reach here (they are widened on the host into host_data).
+			uint64_t host_offset = 0;
+			if (!cache.IsRegionGpuModified(source.address, source.size) &&
+			    resident->Resolve(source.address, source.size, prepared.buffer, host_offset) &&
+			    host_offset % source.guest_element_size == 0) {
+				prepared.offset = host_offset;
+				HostResidentProbe::NoteBind(source.size);
+				return prepared;
+			}
+			prepared.buffer = nullptr;
+			HostResidentProbe::NoteFallback();
+		}
+		auto [buffer_ptr, offset] = cache.ObtainBuffer(source.address, source.size, false);
 		prepared.buffer = buffer_ptr->Handle();
 		prepared.offset = offset;
 	}

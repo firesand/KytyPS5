@@ -117,7 +117,7 @@ struct FaultSampler {
 	void Dump(Describe&& describe, const BufferCache::SyncStats& sync,
 	          std::pair<uint64_t, uint64_t> protects, HotPageStats hot,
 	          const HostReadProbe::Snapshot& host_reads, SyncProbe::Snapshot syncs,
-	          const BudgetProbe::Snapshot& budget) {
+	          const BudgetProbe::Snapshot& budget, const HostResidentProbe::Snapshot& resident) {
 		if (!enabled) return;
 		static uint64_t last_total = 0;
 		static int      calls      = 0;
@@ -129,6 +129,7 @@ struct FaultSampler {
 		static HostReadProbe::Snapshot        reads_sum {};
 		static SyncProbe::Snapshot            syncs_sum {};
 		static BudgetProbe::Snapshot          budget_sum {};
+		static HostResidentProbe::Snapshot    resident_sum {};
 		static CpuTimes                       last_cpu = CpuTimes::Read();
 		static auto                           last_wall = std::chrono::steady_clock::now();
 		sync_sum.obtain_calls += sync.obtain_calls;
@@ -152,6 +153,9 @@ struct FaultSampler {
 			reads_sum.sites[i].first += host_reads.sites[i].first;
 			reads_sum.sites[i].second += host_reads.sites[i].second;
 		}
+		resident_sum.binds += resident.binds;
+		resident_sum.bytes += resident.bytes;
+		resident_sum.fallbacks += resident.fallbacks;
 		syncs_sum.calls += syncs.calls;
 		syncs_sum.regions += syncs.regions;
 		for (size_t i = 0; i < budget.categories.size(); ++i) {
@@ -166,6 +170,7 @@ struct FaultSampler {
 		const auto reads_all = std::exchange(reads_sum, {});
 		const auto syncs_all = std::exchange(syncs_sum, {});
 		const auto budget_all = std::exchange(budget_sum, {});
+		const auto resident_all = std::exchange(resident_sum, {});
 		const auto cpu_now    = CpuTimes::Read();
 		const auto wall_now   = std::chrono::steady_clock::now();
 		const auto wall_ms    = static_cast<uint64_t>(
@@ -223,6 +228,8 @@ struct FaultSampler {
 		                    rs[HostReadProbe::DispatchArgs].second / 1000000,
 		                    rs[HostReadProbe::Predication].first,
 		                    rs[HostReadProbe::Predication].second / 1000000);
+		line += fmt::format(" | host-resident binds {} bytes {} KiB fallbacks {}", resident_all.binds,
+		                    resident_all.bytes >> 10, resident_all.fallbacks);
 		const auto& bc = budget_all.categories;
 		const auto  ms = [](uint64_t ns) { return ns / 1000000; };
 		const auto cat = [&](BudgetProbe::Category c) {
@@ -371,7 +378,7 @@ void RenderContext::RunGarbageCollector() {
 	    },
 	    m_buffer_cache.TakeSyncStats(), PageManager::TakeProtectStats(),
 	    MemoryTracker::TakeHotStats(), HostReadProbe::Take(), SyncProbe::Take(),
-	    BudgetProbe::Take());
+	    BudgetProbe::Take(), HostResidentProbe::Take());
 	m_buffer_cache.FlushWriteFaults(false);
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;

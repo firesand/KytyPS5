@@ -35,6 +35,9 @@ struct GraphicContext {
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
+	// VK_EXT_external_memory_host enabled (only requested under KYTY_HOST_RESIDENT=1).
+	bool                               external_memory_host_enabled          = false;
+	uint64_t                           min_imported_host_pointer_alignment   = 0;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;
 	uint32_t                           min_subgroup_size                     = 0;

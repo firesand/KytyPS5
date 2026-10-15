@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/cache/hostResidentMemory.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -1956,6 +1957,46 @@ std::vector<u32> MakePassthroughVertexSpirv(bool layered, float clip_w = 1.0f) {
   b.AddFunction(spv::OpFunctionEnd);
   return b.Build();
 }
+
+// glslangValidator -V: out[i] = in[i] for i < 256 (set 0: binding 0 readonly storage, binding 1 storage).
+static const u32 HOST_RESIDENT_COPY_SPV[] = {
+    0x07230203, 0x00010000, 0x0008000b, 0x00000029, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
+    0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+    0x0006000f, 0x00000005, 0x00000004, 0x6e69616d, 0x00000000, 0x0000000b, 0x00060010, 0x00000004,
+    0x00000011, 0x00000040, 0x00000001, 0x00000001, 0x00030003, 0x00000002, 0x000001c2, 0x00040005,
+    0x00000004, 0x6e69616d, 0x00000000, 0x00030005, 0x00000008, 0x00000069, 0x00080005, 0x0000000b,
+    0x475f6c67, 0x61626f6c, 0x766e496c, 0x7461636f, 0x496e6f69, 0x00000044, 0x00030005, 0x00000017,
+    0x0074754f, 0x00040006, 0x00000017, 0x00000000, 0x00747364, 0x00030005, 0x00000019, 0x00000000,
+    0x00030005, 0x0000001e, 0x00006e49, 0x00040006, 0x0000001e, 0x00000000, 0x00637273, 0x00030005,
+    0x00000020, 0x00000000, 0x00040047, 0x0000000b, 0x0000000b, 0x0000001c, 0x00040047, 0x00000016,
+    0x00000006, 0x00000004, 0x00030047, 0x00000017, 0x00000003, 0x00050048, 0x00000017, 0x00000000,
+    0x00000023, 0x00000000, 0x00040047, 0x00000019, 0x00000021, 0x00000001, 0x00040047, 0x00000019,
+    0x00000022, 0x00000000, 0x00040047, 0x0000001d, 0x00000006, 0x00000004, 0x00030047, 0x0000001e,
+    0x00000003, 0x00040048, 0x0000001e, 0x00000000, 0x00000018, 0x00050048, 0x0000001e, 0x00000000,
+    0x00000023, 0x00000000, 0x00030047, 0x00000020, 0x00000018, 0x00040047, 0x00000020, 0x00000021,
+    0x00000000, 0x00040047, 0x00000020, 0x00000022, 0x00000000, 0x00040047, 0x00000028, 0x0000000b,
+    0x00000019, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00040015, 0x00000006,
+    0x00000020, 0x00000000, 0x00040020, 0x00000007, 0x00000007, 0x00000006, 0x00040017, 0x00000009,
+    0x00000006, 0x00000003, 0x00040020, 0x0000000a, 0x00000001, 0x00000009, 0x0004003b, 0x0000000a,
+    0x0000000b, 0x00000001, 0x0004002b, 0x00000006, 0x0000000c, 0x00000000, 0x00040020, 0x0000000d,
+    0x00000001, 0x00000006, 0x0004002b, 0x00000006, 0x00000011, 0x00000100, 0x00020014, 0x00000012,
+    0x0003001d, 0x00000016, 0x00000006, 0x0003001e, 0x00000017, 0x00000016, 0x00040020, 0x00000018,
+    0x00000002, 0x00000017, 0x0004003b, 0x00000018, 0x00000019, 0x00000002, 0x00040015, 0x0000001a,
+    0x00000020, 0x00000001, 0x0004002b, 0x0000001a, 0x0000001b, 0x00000000, 0x0003001d, 0x0000001d,
+    0x00000006, 0x0003001e, 0x0000001e, 0x0000001d, 0x00040020, 0x0000001f, 0x00000002, 0x0000001e,
+    0x0004003b, 0x0000001f, 0x00000020, 0x00000002, 0x00040020, 0x00000022, 0x00000002, 0x00000006,
+    0x0004002b, 0x00000006, 0x00000026, 0x00000040, 0x0004002b, 0x00000006, 0x00000027, 0x00000001,
+    0x0006002c, 0x00000009, 0x00000028, 0x00000026, 0x00000027, 0x00000027, 0x00050036, 0x00000002,
+    0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0004003b, 0x00000007, 0x00000008,
+    0x00000007, 0x00050041, 0x0000000d, 0x0000000e, 0x0000000b, 0x0000000c, 0x0004003d, 0x00000006,
+    0x0000000f, 0x0000000e, 0x0003003e, 0x00000008, 0x0000000f, 0x0004003d, 0x00000006, 0x00000010,
+    0x00000008, 0x000500b0, 0x00000012, 0x00000013, 0x00000010, 0x00000011, 0x000300f7, 0x00000015,
+    0x00000000, 0x000400fa, 0x00000013, 0x00000014, 0x00000015, 0x000200f8, 0x00000014, 0x0004003d,
+    0x00000006, 0x0000001c, 0x00000008, 0x0004003d, 0x00000006, 0x00000021, 0x00000008, 0x00060041,
+    0x00000022, 0x00000023, 0x00000020, 0x0000001b, 0x00000021, 0x0004003d, 0x00000006, 0x00000024,
+    0x00000023, 0x00060041, 0x00000022, 0x00000025, 0x00000019, 0x0000001b, 0x0000001c, 0x0003003e,
+    0x00000025, 0x00000024, 0x000200f9, 0x00000015, 0x000200f8, 0x00000015, 0x000100fd, 0x00010038,
+};
 
 } // namespace TestSpv
 
@@ -5257,6 +5298,165 @@ public:
     std::printf("[gpu]     %s", line.c_str());
     DestroyBuffer(&target);
     std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // Host-resident guest memory (KYTY_HOST_RESIDENT prototype): the test's own direct-memory
+  // mapping is imported through HostResidentMemory and bound as a storage buffer of a compute copy.
+  // No BufferCache, staging buffer or upload is involved, so the bytes can only arrive through the
+  // import. Coherence: a CPU write after the dispatch is recorded but before the submit must be
+  // seen (Vulkan covers host writes made before vkQueueSubmit; a write after the submit relies on
+  // host-coherent memory and is the prototype's documented assumption, not asserted here).
+  void CheckHostResidentMemory() {
+    constexpr const char *name = "HostResidentMemory";
+    constexpr uintptr_t base = 0x0000000200600000ull;
+    constexpr uint64_t allocation_size = 0x400000;
+    constexpr uint64_t allocation_alignment = 0x200000;
+    constexpr u32 words = 256;
+    EnsureRuntimeContext();
+    if (!m_host_memory_ext) {
+      std::printf("[host]    %-32s skipped, VK_EXT_external_memory_host unavailable\n", name);
+      return;
+    }
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+    auto *memory = static_cast<u32 *>(mapped);
+
+    HostResidentMemory resident(m_runtime_context);
+    Require(name, "available", resident.Available(), "import path is not available");
+    vk::Buffer imported = nullptr;
+    uint64_t imported_offset = 0;
+    Require(name, "resolve", resident.Resolve(base, words * 4, imported, imported_offset) &&
+                                 imported != nullptr &&
+                                 imported_offset == static_cast<uint64_t>(direct_offset),
+            "mapped direct memory did not resolve to its backing offset");
+    Require(name, "resolve inner offset",
+            resident.Resolve(base + 0x1000, 64, imported, imported_offset) &&
+                imported_offset == static_cast<uint64_t>(direct_offset) + 0x1000,
+            "interior range did not keep its offset");
+    vk::Buffer unused = nullptr;
+    uint64_t unused_offset = 0;
+    Require(name, "unmapped range fails",
+            !resident.Resolve(0x0000000300000000ull, 64, unused, unused_offset) &&
+                !resident.Resolve(base + allocation_size - 16, 64, unused, unused_offset),
+            "unmapped or partly unmapped range resolved");
+    Require(name, "resolve again", resident.Resolve(base, words * 4, imported, imported_offset),
+            "second resolve failed");
+
+    // Compute copy: imported[0..255] -> a plain host-visible output buffer.
+    vk::ShaderModuleCreateInfo module_info{};
+    module_info.codeSize = sizeof(TestSpv::HOST_RESIDENT_COPY_SPV);
+    module_info.pCode = TestSpv::HOST_RESIDENT_COPY_SPV;
+    vk::ShaderModule module = nullptr;
+    RequireVk(name, "pipeline", m_device.createShaderModule(&module_info, nullptr, &module),
+              "vkCreateShaderModule");
+    std::array<vk::DescriptorSetLayoutBinding, 2> bindings{};
+    for (u32 i = 0; i < 2; i++) {
+      bindings[i].binding = i;
+      bindings[i].descriptorType = vk::DescriptorType::eStorageBuffer;
+      bindings[i].descriptorCount = 1;
+      bindings[i].stageFlags = vk::ShaderStageFlagBits::eCompute;
+    }
+    vk::DescriptorSetLayoutCreateInfo layout_info{};
+    layout_info.bindingCount = 2;
+    layout_info.pBindings = bindings.data();
+    vk::DescriptorSetLayout set_layout = nullptr;
+    RequireVk(name, "pipeline", m_device.createDescriptorSetLayout(&layout_info, nullptr, &set_layout),
+              "vkCreateDescriptorSetLayout");
+    vk::PipelineLayoutCreateInfo pipeline_layout_info{};
+    pipeline_layout_info.setLayoutCount = 1;
+    pipeline_layout_info.pSetLayouts = &set_layout;
+    vk::PipelineLayout pipeline_layout = nullptr;
+    RequireVk(name, "pipeline", m_device.createPipelineLayout(&pipeline_layout_info, nullptr, &pipeline_layout),
+              "vkCreatePipelineLayout");
+    vk::ComputePipelineCreateInfo pipeline_info{};
+    pipeline_info.stage.stage = vk::ShaderStageFlagBits::eCompute;
+    pipeline_info.stage.module = module;
+    pipeline_info.stage.pName = "main";
+    pipeline_info.layout = pipeline_layout;
+    vk::Pipeline pipeline = nullptr;
+    RequireVk(name, "pipeline",
+              m_device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &pipeline),
+              "vkCreateComputePipelines");
+    const vk::DescriptorPoolSize pool_size{vk::DescriptorType::eStorageBuffer, 4};
+    vk::DescriptorPoolCreateInfo pool_info{};
+    pool_info.maxSets = 2;
+    pool_info.poolSizeCount = 1;
+    pool_info.pPoolSizes = &pool_size;
+    vk::DescriptorPool pool = nullptr;
+    RequireVk(name, "pipeline", m_device.createDescriptorPool(&pool_info, nullptr, &pool),
+              "vkCreateDescriptorPool");
+    const std::array<vk::DescriptorSetLayout, 2> set_layouts{set_layout, set_layout};
+    vk::DescriptorSetAllocateInfo allocate{};
+    allocate.descriptorPool = pool;
+    allocate.descriptorSetCount = 2;
+    allocate.pSetLayouts = set_layouts.data();
+    std::array<vk::DescriptorSet, 2> sets{};
+    RequireVk(name, "pipeline", m_device.allocateDescriptorSets(&allocate, sets.data()),
+              "vkAllocateDescriptorSets");
+
+    // scenario 0: write A, dispatch, expect A. scenario 1: write A, record, write B, submit,
+    // expect B (the GPU reads at execution, not at bind).
+    for (u32 scenario = 0; scenario < 2; scenario++) {
+      auto output = CreateHostBuffer(name, words * 4, vk::BufferUsageFlagBits::eStorageBuffer,
+                                     std::vector<u32>(words, 0xdeadbeefu));
+      const vk::DescriptorBufferInfo in_info{imported, imported_offset, words * 4};
+      const vk::DescriptorBufferInfo out_info{output.buffer, 0, words * 4};
+      std::array<vk::WriteDescriptorSet, 2> writes{};
+      writes[0].dstSet = sets[scenario];
+      writes[0].dstBinding = 0;
+      writes[0].descriptorCount = 1;
+      writes[0].descriptorType = vk::DescriptorType::eStorageBuffer;
+      writes[0].pBufferInfo = &in_info;
+      writes[1] = writes[0];
+      writes[1].dstBinding = 1;
+      writes[1].pBufferInfo = &out_info;
+      m_device.updateDescriptorSets(2, writes.data(), 0, nullptr);
+
+      for (u32 i = 0; i < words; i++) {
+        memory[i] = 0xa0000000u + i;
+      }
+      auto cmd = BeginCommands(name, "host-resident dispatch");
+      cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
+      cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layout, 0, 1,
+                             &sets[scenario], 0, nullptr);
+      cmd.dispatch(words / 64, 1, 1);
+      if (scenario == 1) {
+        for (u32 i = 0; i < words; i++) {
+          memory[i] = 0xb0000000u + i * 3;
+        }
+      }
+      EndSubmitAndFree(name, "host-resident dispatch", cmd);
+      const auto result = ReadBuffer(name, output, words);
+      bool match = true;
+      for (u32 i = 0; i < words; i++) {
+        const u32 expected = scenario == 0 ? 0xa0000000u + i : 0xb0000000u + i * 3;
+        if (result[i] != expected) {
+          std::printf("[host]    %s scenario %u word %u: got 0x%08x expected 0x%08x\n", name,
+                      scenario, i, result[i], expected);
+          match = false;
+          break;
+        }
+      }
+      Require(name, scenario == 0 ? "bytes arrive without upload" : "CPU write after bind seen",
+              match, "GPU view of the imported guest memory did not match the CPU pattern");
+      DestroyBuffer(&output);
+    }
+    m_device.destroyDescriptorPool(pool, nullptr);
+    m_device.destroyPipeline(pipeline, nullptr);
+    m_device.destroyPipelineLayout(pipeline_layout, nullptr);
+    m_device.destroyDescriptorSetLayout(set_layout, nullptr);
+    m_device.destroyShaderModule(module, nullptr);
+    std::printf("[host]    %-32s ok\n", name);
   }
 
   void CheckUnifiedTextureCacheFlow() {
@@ -19558,6 +19758,8 @@ public:
 private:
   bool m_rasterization_supported = true;
   bool m_conditional_rendering_supported = false;
+  bool m_host_memory_ext = false;
+  uint64_t m_host_pointer_alignment = 0;
   u32   m_skipped_cases          = 0;
 
   RenderContext &Renderer() {
@@ -19592,6 +19794,8 @@ private:
     m_runtime_context.queue_family = m_queue_family;
     m_runtime_context.queue = m_queue;
     m_runtime_context.shader_image_int64_atomics_enabled = true;
+    m_runtime_context.external_memory_host_enabled = m_host_memory_ext;
+    m_runtime_context.min_imported_host_pointer_alignment = m_host_pointer_alignment;
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
@@ -19760,6 +19964,19 @@ private:
               return std::strcmp(extension.extensionName.data(),
                                  VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME) == 0;
             });
+    // Host-resident memory test: the device exposes VK_EXT_external_memory_host (unused otherwise).
+    m_host_memory_ext = std::any_of(
+        available_extensions.begin(), available_extensions.end(), [](const auto &extension) {
+          return std::strcmp(extension.extensionName.data(),
+                             VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) == 0;
+        });
+    if (m_host_memory_ext) {
+      vk::PhysicalDeviceExternalMemoryHostPropertiesEXT host_properties{};
+      vk::PhysicalDeviceProperties2 properties2{};
+      properties2.pNext = &host_properties;
+      m_physical_device.getProperties2(&properties2);
+      m_host_pointer_alignment = host_properties.minImportedHostPointerAlignment;
+    }
     Require("VulkanHarness", "dispatch",
             available_features.shaderStorageImageWriteWithoutFormat == true,
             "shaderStorageImageWriteWithoutFormat is not supported");
@@ -19896,6 +20113,9 @@ private:
         VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME};
     if (m_conditional_rendering_supported) {
       device_extensions.push_back(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+    }
+    if (m_host_memory_ext) {
+      device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     }
     if (m_rasterization_supported) {
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
@@ -45517,6 +45737,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--bda-page-table-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBdaPageTableUploads();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--host-resident-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckHostResidentMemory();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-range-only") == 0) {

@@ -247,6 +247,44 @@ public:
 		return true;
 	}
 
+	// Host-resident prototype: the direct-memory offset of [vaddr, vaddr + size) when the whole range
+	// is mapped to one contiguous run of the backing object (consecutive map entries must continue
+	// the offset). The backing offset is stable for the object's lifetime; the mapping may change.
+	bool ResolveBackingOffset(uint64_t vaddr, uint64_t size, uint64_t* backing_offset) {
+		if (!IsAvailable() || size == 0 || UINT64_MAX - vaddr < size || backing_offset == nullptr) {
+			return false;
+		}
+		std::shared_lock lock(m_mutex);
+		const auto       end   = vaddr + size;
+		auto             first = m_maps.upper_bound(vaddr);
+		if (first == m_maps.begin()) {
+			return false;
+		}
+		--first;
+		uint64_t start_offset = 0;
+		auto     current      = vaddr;
+		for (auto mapping = first; current < end; ++mapping) {
+			if (mapping == m_maps.end() || current < mapping->second.vaddr ||
+			    current >= mapping->second.vaddr + mapping->second.size) {
+				return false;
+			}
+			const auto& entry  = mapping->second;
+			const auto  bytes  = std::min(end, entry.vaddr + entry.size) - current;
+			const auto  offset = entry.backing_offset + current - entry.vaddr;
+			if (!RangeOk(offset, bytes)) {
+				return false;
+			}
+			if (current == vaddr) {
+				start_offset = offset;
+			} else if (offset != start_offset + (current - vaddr)) {
+				return false;
+			}
+			current += bytes;
+		}
+		*backing_offset = start_offset;
+		return true;
+	}
+
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
 		if (!IsAvailable() || data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
@@ -771,6 +809,9 @@ public:
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBacking(vaddr, data, size);
+	}
+	bool ResolveBackingOffset(uint64_t vaddr, uint64_t size, uint64_t* backing_offset) {
+		return m_backing->ResolveBackingOffset(vaddr, size, backing_offset);
 	}
 
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
