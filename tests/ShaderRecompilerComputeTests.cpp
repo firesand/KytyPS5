@@ -6,6 +6,8 @@
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "gpu_test_shaders/gpu_test_mesh_draw_index_spv.h"
+#include "gpu_test_shaders/gpu_test_mesh_record_spv.h"
+#include "gpu_tiler_shaders/mesh_indirect_translate_spv.h"
 #include "gpu_test_shaders/gpu_test_ms_depth_spv.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
@@ -45353,14 +45355,18 @@ void CheckMeshDrawIndexGate0() {
   props.pNext = &mesh_props;
   physical.getProperties2(&props);
 
+  vk::PhysicalDeviceVulkan12Features f12{};
+  f12.bufferDeviceAddress = true;
   vk::PhysicalDeviceVulkan13Features f13{};
   f13.dynamicRendering = true;
+  f13.pNext = &f12;
   vk::PhysicalDeviceMeshShaderFeaturesEXT mesh_features{};
   mesh_features.meshShader = true;
   mesh_features.multiviewMeshShader = false;
   mesh_features.pNext = &f13;
   vk::PhysicalDeviceFeatures features{};
   features.multiDrawIndirect = true;
+  features.shaderInt64 = true;
   const float priority = 1.0f;
   vk::DeviceQueueCreateInfo queue_info{};
   queue_info.queueFamilyIndex = family;
@@ -45384,7 +45390,7 @@ void CheckMeshDrawIndexGate0() {
   vk::PhysicalDeviceMemoryProperties memory{};
   physical.getMemoryProperties(&memory);
   auto make_buffer = [&](vk::DeviceSize size, vk::BufferUsageFlags usage, vk::Buffer *buffer,
-                         vk::DeviceMemory *mem, void **mapped) {
+                         vk::DeviceMemory *mem, void **mapped, bool bda = false) {
     vk::BufferCreateInfo info{};
     info.size = size;
     info.usage = usage;
@@ -45401,7 +45407,10 @@ void CheckMeshDrawIndexGate0() {
       }
     }
     Require(name, "buffer", type != ~0u, "no host-visible memory type");
+    vk::MemoryAllocateFlagsInfo flags_info{};
+    flags_info.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
     vk::MemoryAllocateInfo alloc{};
+    alloc.pNext = bda ? &flags_info : nullptr;
     alloc.allocationSize = req.size;
     alloc.memoryTypeIndex = type;
     RequireVk(name, "buffer", device.allocateMemory(&alloc, nullptr, mem), "vkAllocateMemory");
@@ -45560,6 +45569,265 @@ void CheckMeshDrawIndexGate0() {
           "DrawIndex in MeshEXT is wrong or constant for multi-draw mesh indirect");
   std::printf("%s: PASS DrawIndex correct in MeshEXT multi-draw indirect, zero-group records "
               "(x=0 and y=0) accepted\n", name);
+
+  // Phase 2: the translation prepass (the product's SPIR-V) over synthetic DrawIndexedIndirect
+  // records, then a mesh shader that loads each draw's record through a physical storage buffer
+  // pointer keyed by DrawIndex. Mirrors the host formulas (index clamp, mesh_groups, limits).
+  {
+    const char *phase = "MeshIndirectPrepass";
+    constexpr u32 count = 7;
+    constexpr u32 stride_dwords = 8; // padded records: stride 32 bytes
+    constexpr u32 args_offset_dwords = 3; // the argument range does not start at the buffer start
+    constexpr u32 index_buffer_size = 1000;
+    constexpr u32 element_size = 2;
+    constexpr u32 primitives_per_group = 62;
+    constexpr u32 max_x = 4, max_y = 3, max_total = 8;
+    constexpr u64 index_base = 0x00000001ffffff00ull;
+    struct Record { u32 index_count, instances, start_index, base_vertex, start_instance; };
+    const Record records[count] = {
+        {186, 1, 0, 0, 0},                // exactly one group
+        {5000, 2, 0, 0, 0},               // clamped to INDEX_BUFFER_SIZE, group count clamped to x
+        {0, 1, 0, 0, 0},                  // no primitives
+        {3000, 0, 0, 0, 0},               // no instances
+        {1000, 5, 0, 0, 0},               // instances clamped to y, then the total limit
+        {2, 1, 0, 0, 0},                  // fewer vertices than a triangle
+        {3, 1, 0x7fffffffu, 0xfffffff0u, 7}, // index address carries into the high dword
+    };
+    vk::Buffer in_buffer{}, scratch_buffer{}, result_buffer{};
+    vk::DeviceMemory in_memory{}, scratch_memory{}, result_memory{};
+    void *in_map = nullptr, *scratch_map = nullptr, *result_map = nullptr;
+    const u32 in_dwords = args_offset_dwords + count * stride_dwords;
+    const u64 command_bytes = (count * 12u + 15u) & ~15u;
+    const u64 scratch_bytes = command_bytes + count * 32u;
+    make_buffer(in_dwords * 4, vk::BufferUsageFlagBits::eStorageBuffer, &in_buffer, &in_memory,
+                &in_map);
+    make_buffer(scratch_bytes,
+                vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eIndirectBuffer |
+                    vk::BufferUsageFlagBits::eShaderDeviceAddress,
+                &scratch_buffer, &scratch_memory, &scratch_map, true);
+    make_buffer((count * 8 + count) * 4, vk::BufferUsageFlagBits::eStorageBuffer, &result_buffer,
+                &result_memory, &result_map);
+    auto *in_words = static_cast<u32 *>(in_map);
+    std::fill(in_words, in_words + in_dwords, 0xdeadbeefu);
+    for (u32 i = 0; i < count; i++) {
+      u32 *record = in_words + args_offset_dwords + i * stride_dwords;
+      record[0] = records[i].index_count;
+      record[1] = records[i].instances;
+      record[2] = records[i].start_index;
+      record[3] = records[i].base_vertex;
+      record[4] = records[i].start_instance;
+    }
+    std::memset(scratch_map, 0xcd, scratch_bytes);
+    std::memset(result_map, 0, (count * 8 + count) * 4);
+
+    // Compute pipeline of the prepass.
+    const vk::DescriptorSetLayoutBinding compute_bindings[2] = {
+        {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
+        {1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr}};
+    vk::DescriptorSetLayoutCreateInfo compute_set_info{};
+    compute_set_info.bindingCount = 2;
+    compute_set_info.pBindings = compute_bindings;
+    vk::DescriptorSetLayout compute_set_layout{};
+    RequireVk(phase, "layout", device.createDescriptorSetLayout(&compute_set_info, nullptr, &compute_set_layout),
+              "vkCreateDescriptorSetLayout");
+    const vk::PushConstantRange compute_push{vk::ShaderStageFlagBits::eCompute, 0, 64};
+    vk::PipelineLayoutCreateInfo compute_layout_info{};
+    compute_layout_info.setLayoutCount = 1;
+    compute_layout_info.pSetLayouts = &compute_set_layout;
+    compute_layout_info.pushConstantRangeCount = 1;
+    compute_layout_info.pPushConstantRanges = &compute_push;
+    vk::PipelineLayout compute_layout{};
+    RequireVk(phase, "layout", device.createPipelineLayout(&compute_layout_info, nullptr, &compute_layout),
+              "vkCreatePipelineLayout");
+    vk::ShaderModuleCreateInfo compute_module_info{};
+    compute_module_info.codeSize = sizeof(MESH_INDIRECT_TRANSLATE_SPV);
+    compute_module_info.pCode = MESH_INDIRECT_TRANSLATE_SPV;
+    vk::ShaderModule compute_module{};
+    RequireVk(phase, "shader", device.createShaderModule(&compute_module_info, nullptr, &compute_module),
+              "vkCreateShaderModule");
+    vk::ComputePipelineCreateInfo compute_info{};
+    compute_info.stage.stage = vk::ShaderStageFlagBits::eCompute;
+    compute_info.stage.module = compute_module;
+    compute_info.stage.pName = "main";
+    compute_info.layout = compute_layout;
+    vk::Pipeline compute_pipeline{};
+    RequireVk(phase, "pipeline",
+              device.createComputePipelines({}, 1, &compute_info, nullptr, &compute_pipeline),
+              "vkCreateComputePipelines");
+
+    // Mesh pipeline: set 0 = result buffer, push = scratch records address + draw count.
+    vk::DescriptorSetLayoutBinding mesh_binding{};
+    mesh_binding.descriptorType = vk::DescriptorType::eStorageBuffer;
+    mesh_binding.descriptorCount = 1;
+    mesh_binding.stageFlags = vk::ShaderStageFlagBits::eMeshEXT;
+    vk::DescriptorSetLayoutCreateInfo mesh_set_info{};
+    mesh_set_info.bindingCount = 1;
+    mesh_set_info.pBindings = &mesh_binding;
+    vk::DescriptorSetLayout mesh_set_layout{};
+    RequireVk(phase, "layout", device.createDescriptorSetLayout(&mesh_set_info, nullptr, &mesh_set_layout),
+              "vkCreateDescriptorSetLayout");
+    const vk::PushConstantRange mesh_push{vk::ShaderStageFlagBits::eMeshEXT, 0, 16};
+    vk::PipelineLayoutCreateInfo mesh_layout_info{};
+    mesh_layout_info.setLayoutCount = 1;
+    mesh_layout_info.pSetLayouts = &mesh_set_layout;
+    mesh_layout_info.pushConstantRangeCount = 1;
+    mesh_layout_info.pPushConstantRanges = &mesh_push;
+    vk::PipelineLayout mesh_layout{};
+    RequireVk(phase, "layout", device.createPipelineLayout(&mesh_layout_info, nullptr, &mesh_layout),
+              "vkCreatePipelineLayout");
+    vk::ShaderModuleCreateInfo mesh_module_info{};
+    mesh_module_info.codeSize = sizeof(GPU_TEST_MESH_RECORD_SPV);
+    mesh_module_info.pCode = GPU_TEST_MESH_RECORD_SPV;
+    vk::ShaderModule mesh_module{};
+    RequireVk(phase, "shader", device.createShaderModule(&mesh_module_info, nullptr, &mesh_module),
+              "vkCreateShaderModule");
+    pipeline_info.layout = mesh_layout;
+    stage.module = mesh_module;
+    vk::Pipeline mesh_pipeline{};
+    RequireVk(phase, "pipeline",
+              device.createGraphicsPipelines({}, 1, &pipeline_info, nullptr, &mesh_pipeline),
+              "vkCreateGraphicsPipelines");
+
+    // Descriptors: two compute sets' worth plus the mesh one.
+    vk::DescriptorPoolSize sizes{vk::DescriptorType::eStorageBuffer, 3};
+    vk::DescriptorPoolCreateInfo pool2_info{};
+    pool2_info.maxSets = 2;
+    pool2_info.poolSizeCount = 1;
+    pool2_info.pPoolSizes = &sizes;
+    vk::DescriptorPool pool2{};
+    RequireVk(phase, "descriptor", device.createDescriptorPool(&pool2_info, nullptr, &pool2),
+              "vkCreateDescriptorPool");
+    vk::DescriptorSet compute_set{}, mesh_set{};
+    vk::DescriptorSetAllocateInfo a1{};
+    a1.descriptorPool = pool2; a1.descriptorSetCount = 1; a1.pSetLayouts = &compute_set_layout;
+    RequireVk(phase, "descriptor", device.allocateDescriptorSets(&a1, &compute_set), "allocate sets");
+    vk::DescriptorSetAllocateInfo a2{};
+    a2.descriptorPool = pool2; a2.descriptorSetCount = 1; a2.pSetLayouts = &mesh_set_layout;
+    RequireVk(phase, "descriptor", device.allocateDescriptorSets(&a2, &mesh_set), "allocate sets");
+    const vk::DescriptorBufferInfo infos[3] = {{in_buffer, 0, VK_WHOLE_SIZE},
+                                               {scratch_buffer, 0, VK_WHOLE_SIZE},
+                                               {result_buffer, 0, VK_WHOLE_SIZE}};
+    vk::WriteDescriptorSet writes[3]{};
+    for (u32 w = 0; w < 3; w++) {
+      writes[w].dstSet = w < 2 ? compute_set : mesh_set;
+      writes[w].dstBinding = w < 2 ? w : 0;
+      writes[w].descriptorCount = 1;
+      writes[w].descriptorType = vk::DescriptorType::eStorageBuffer;
+      writes[w].pBufferInfo = &infos[w];
+    }
+    device.updateDescriptorSets(3, writes, 0, nullptr);
+
+    vk::BufferDeviceAddressInfo address_info{};
+    address_info.buffer = scratch_buffer;
+    const u64 scratch_address = device.getBufferAddress(address_info);
+    const u64 records_address = scratch_address + command_bytes;
+
+    const u32 push[16] = {args_offset_dwords, stride_dwords, count, index_buffer_size,
+                          static_cast<u32>(index_base), static_cast<u32>(index_base >> 32),
+                          element_size, 3, 3, primitives_per_group, max_x, max_y, max_total,
+                          0, static_cast<u32>(command_bytes / 4), 0};
+    const u32 mesh_pushes[4] = {static_cast<u32>(records_address),
+                                static_cast<u32>(records_address >> 32), count, 0};
+
+    vk::CommandPool cpool2{};
+    vk::CommandPoolCreateInfo cpool2_info{};
+    cpool2_info.queueFamilyIndex = family;
+    RequireVk(phase, "commands", device.createCommandPool(&cpool2_info, nullptr, &cpool2), "pool");
+    vk::CommandBufferAllocateInfo cb2_alloc{};
+    cb2_alloc.commandPool = cpool2;
+    cb2_alloc.commandBufferCount = 1;
+    vk::CommandBuffer cb2{};
+    RequireVk(phase, "commands", device.allocateCommandBuffers(&cb2_alloc, &cb2), "allocate");
+    vk::CommandBufferBeginInfo begin2{};
+    RequireVk(phase, "commands", cb2.begin(&begin2), "begin");
+    cb2.bindPipeline(vk::PipelineBindPoint::eCompute, compute_pipeline);
+    cb2.bindDescriptorSets(vk::PipelineBindPoint::eCompute, compute_layout, 0, 1, &compute_set, 0,
+                           nullptr);
+    cb2.pushConstants(compute_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), push);
+    cb2.dispatch((count + 63u) / 64u, 1, 1);
+    vk::MemoryBarrier2 barrier{};
+    barrier.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader;
+    barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
+    barrier.dstStageMask = vk::PipelineStageFlagBits2::eDrawIndirect |
+                           vk::PipelineStageFlagBits2::eMeshShaderEXT;
+    barrier.dstAccessMask = vk::AccessFlagBits2::eIndirectCommandRead |
+                            vk::AccessFlagBits2::eShaderRead;
+    vk::DependencyInfo dependency{};
+    dependency.memoryBarrierCount = 1;
+    dependency.pMemoryBarriers = &barrier;
+    cb2.pipelineBarrier2(dependency);
+    cb2.beginRendering(&render);
+    cb2.bindPipeline(vk::PipelineBindPoint::eGraphics, mesh_pipeline);
+    cb2.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, mesh_layout, 0, 1, &mesh_set, 0,
+                           nullptr);
+    cb2.pushConstants(mesh_layout, vk::ShaderStageFlagBits::eMeshEXT, 0, sizeof(mesh_pushes),
+                      mesh_pushes);
+    cb2.setViewport(0, 1, &vp);
+    cb2.setScissor(0, 1, &scissor);
+    cb2.drawMeshTasksIndirectEXT(scratch_buffer, 0, count, 12);
+    cb2.endRendering();
+    RequireVk(phase, "commands", cb2.end(), "end");
+    vk::SubmitInfo submit2{};
+    submit2.commandBufferCount = 1;
+    submit2.pCommandBuffers = &cb2;
+    RequireVk(phase, "submit", queue.submit(1, &submit2, {}), "vkQueueSubmit");
+    RequireVk(phase, "submit", queue.waitIdle(), "vkQueueWaitIdle");
+
+    // Host reference: same formulas as graphicsRun.cpp / ExecutePreparedDraw, limits as clamps.
+    ShaderMeshInputInfo mesh_info{};
+    mesh_info.input_primitive = static_cast<u32>(Prospero::PrimitiveType::kTriList);
+    const u32 *commands = static_cast<const u32 *>(scratch_map);
+    const u32 *scratch_records = commands + command_bytes / 4;
+    const u32 *result = static_cast<const u32 *>(result_map);
+    bool ok = true;
+    for (u32 i = 0; i < count; i++) {
+      const auto &r = records[i];
+      const u32 clamped = std::min(r.index_count, index_buffer_size);
+      const u32 primitives = mesh_info.InputPrimitiveCount(clamped);
+      u32 groups = (primitives == 0 || r.instances == 0)
+                       ? 0u : (primitives - 1u) / primitives_per_group + 1u;
+      groups = std::min(groups, max_x);
+      const u32 instances = std::min(r.instances, max_y);
+      if (instances != 0 && groups > max_total / instances) {
+        groups = max_total / instances;
+      }
+      const u64 address = index_base + static_cast<u64>(r.start_index) * element_size;
+      const u32 expected_record[8] = {clamped, r.base_vertex, r.start_instance, r.start_index,
+                                      static_cast<u32>(address), static_cast<u32>(address >> 32),
+                                      0, 0};
+      const u32 expected_command[3] = {groups, instances, 1};
+      bool command_ok = std::equal(expected_command, expected_command + 3, commands + i * 3);
+      bool record_ok = std::equal(expected_record, expected_record + 8, scratch_records + i * 8);
+      const u32 launched = groups * instances;
+      bool mesh_ok = result[8 * count + i] == launched;
+      for (u32 k = 0; k < 8; k++) {
+        mesh_ok &= result[i * 8 + k] == (launched != 0 ? expected_record[k] : 0u);
+      }
+      std::printf("%s: record %u cmd={%u,%u,1} launched=%u scratch=%s mesh_load=%s\n", phase, i,
+                  groups, instances, result[8 * count + i], command_ok && record_ok ? "ok" : "BAD",
+                  mesh_ok ? "ok" : "BAD");
+      ok &= command_ok && record_ok && mesh_ok;
+    }
+    Require(phase, "prepass", ok,
+            "translation prepass output, indirect launch or mesh-shader physical-storage-buffer "
+            "record load differs from the host formulas");
+    std::printf("%s: PASS prepass formulas, clamps, 64-bit index address and the DrawIndex-keyed "
+                "physical-storage-buffer record load\n", phase);
+
+    device.waitIdle();
+    device.destroyCommandPool(cpool2, nullptr);
+    device.destroyPipeline(mesh_pipeline, nullptr);
+    device.destroyPipeline(compute_pipeline, nullptr);
+    device.destroyShaderModule(mesh_module, nullptr);
+    device.destroyShaderModule(compute_module, nullptr);
+    device.destroyDescriptorPool(pool2, nullptr);
+    device.destroyPipelineLayout(mesh_layout, nullptr);
+    device.destroyPipelineLayout(compute_layout, nullptr);
+    device.destroyDescriptorSetLayout(mesh_set_layout, nullptr);
+    device.destroyDescriptorSetLayout(compute_set_layout, nullptr);
+    for (auto b : {in_buffer, scratch_buffer, result_buffer}) device.destroyBuffer(b, nullptr);
+    for (auto m : {in_memory, scratch_memory, result_memory}) device.freeMemory(m, nullptr);
+  }
 
   device.waitIdle();
   device.destroyCommandPool(cpool, nullptr);
