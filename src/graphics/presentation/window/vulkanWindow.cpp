@@ -11,6 +11,7 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/hostResidentMemory.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -1142,6 +1143,19 @@ void WindowContext::CreateVulkan() {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}
+		}
+		// Host-resident guest memory prototype (KYTY_HOST_RESIDENT=1): import the direct-memory
+		// backing view as device buffers. Nothing changes when the variable is unset.
+		if (HostResidentRequested() &&
+		    HasExtension(available_extensions, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+			graphic_ctx.external_memory_host_enabled = true;
+			vk::PhysicalDeviceExternalMemoryHostPropertiesEXT host_properties {};
+			vk::PhysicalDeviceProperties2                     properties2 {};
+			properties2.pNext = &host_properties;
+			graphic_ctx.physical_device.getProperties2(&properties2);
+			graphic_ctx.min_imported_host_pointer_alignment =
+			    host_properties.minImportedHostPointerAlignment;
 		}
 		for (const auto* extension: device_extensions) {
 			LOGF("Vulkan device extension enabled: %s\n", extension);

@@ -115,6 +115,10 @@ int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
+// Host-resident guest memory prototype: guest vaddr -> direct-memory (backing object) offset for a
+// range mapped as one contiguous run, and the permanent always-writable host view of the object.
+bool                   QueryBackingOffset(uint64_t vaddr, uint64_t size, uint64_t* backing_offset);
+[[nodiscard]] uint8_t* GetBackingHostView(uint64_t* size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;

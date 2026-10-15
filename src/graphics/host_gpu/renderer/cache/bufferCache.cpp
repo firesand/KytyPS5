@@ -259,6 +259,9 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
+	if (HostResidentRequested()) {
+		m_host_resident = std::make_unique<HostResidentMemory>(graphics);
+	}
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),

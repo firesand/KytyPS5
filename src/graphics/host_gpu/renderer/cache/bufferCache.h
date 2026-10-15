@@ -8,10 +8,12 @@
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
+#include "graphics/host_gpu/renderer/cache/hostResidentMemory.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <map>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <string>
@@ -96,6 +98,8 @@ public:
 		}
 		EXIT("BufferCache: invalid utility-buffer usage\n");
 	}
+	// Non-null only under KYTY_HOST_RESIDENT=1 (prototype); see HostResidentMemory.
+	[[nodiscard]] HostResidentMemory* GetHostResident() noexcept { return m_host_resident.get(); }
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
@@ -256,6 +260,7 @@ private:
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
+	std::unique_ptr<HostResidentMemory>               m_host_resident;
 	TextureCache&                                     m_texture_cache;
 	RangeSet                                          m_write_fault_ranges;
 	bool                                              m_write_faults_dirty = false;
