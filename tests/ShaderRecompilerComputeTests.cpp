@@ -17141,6 +17141,9 @@ public:
     constexpr uint64_t allocation_size = 0x40000;
     constexpr uint64_t rect_address = depth_address + 0x8000;
     constexpr uint64_t index_address = rect_address + 0x1000;
+    // GPU-side indirect draw inputs; the GPU-written destinations get a page each so that the
+    // page-granular GPU-modified tracking never covers the CPU-written index data.
+    constexpr uint64_t indirect_base = depth_address + 0x20000;
     EnsureRuntimeContext();
     RenderContext context(m_runtime_context);
     auto &scheduler = context.GetCommandScheduler();
@@ -17186,6 +17189,16 @@ public:
                   sizeof(rect_vertices));
       constexpr std::array<uint32_t, 3> indices{0, 1, 2};
       std::memcpy(reinterpret_cast<void *>(index_address), indices.data(), sizeof(indices));
+      // GPU-side indirect draw inputs (see GpuIndirectDraw below): argument records the GPU
+      // copies into zeroed ranges, and two count dwords.
+      constexpr std::array<uint32_t, 4> auto_record{3, 1, 7, 5};
+      constexpr std::array<uint32_t, 5> indexed_record{3, 1, 0, 7, 5};
+      std::memcpy(reinterpret_cast<void *>(indirect_base), auto_record.data(),
+                  sizeof(auto_record));
+      std::memcpy(reinterpret_cast<void *>(indirect_base + 0x20), indexed_record.data(),
+                  sizeof(indexed_record));
+      *reinterpret_cast<uint32_t *>(indirect_base + 0x3000) = 1;
+      *reinterpret_cast<uint32_t *>(indirect_base + 0x3004) = 0;
     }
     resources.MapMemory(depth_address, allocation_size);
     if (depth_feedback) {
@@ -18099,25 +18112,19 @@ public:
         shaders.SetGsUserSgpr(0, 0x7777u, HW::UserSgprType::Unknown);
         shaders.SetGsUserSgpr(1, 0x5555u, HW::UserSgprType::Unknown);
         auto &buffer_cache = context.GetBufferCache();
-        constexpr uint64_t args_src = index_address + 0x100;
-        constexpr uint64_t args_dst = index_address + 0x200;
-        constexpr uint64_t count_dword = index_address + 0x300;
         enum class Mode { Direct, CountOne, CountZero };
         for (const bool indexed : {false, true}) {
+          // Sources and zeroed destinations were prepared before the memory was mapped.
+          const uint64_t args_src = indirect_base + (indexed ? 0x20 : 0x0);
+          const uint64_t args_dst = indirect_base + (indexed ? 0x2000 : 0x1000);
           for (const Mode mode : {Mode::Direct, Mode::CountOne, Mode::CountZero}) {
             const char *gpu_name = "GpuIndirectDraw";
-            const std::array<u32, 5> indexed_record{3, 1, 0, 7, 5};
-            const std::array<u32, 4> auto_record{3, 1, 7, 5};
             const u32 stride = indexed ? 20u : 16u;
-            std::memset(reinterpret_cast<void *>(args_src), 0, 0x100);
-            std::memset(reinterpret_cast<void *>(args_dst), 0, 0x100);
-            if (indexed) {
-              std::memcpy(reinterpret_cast<void *>(args_src), indexed_record.data(), stride);
-            } else {
-              std::memcpy(reinterpret_cast<void *>(args_src), auto_record.data(), stride);
-            }
-            *reinterpret_cast<volatile u32 *>(count_dword) = mode == Mode::CountOne ? 1u : 0u;
-            buffer_cache.CopyBuffer(args_dst, args_src, 0x100, false, false);
+            const uint64_t count_dword = indirect_base + (mode == Mode::CountOne ? 0x3000 : 0x3004);
+            // Mark the destination GPU-modified first: CopyBuffer otherwise takes its host
+            // memcpy shortcut, which would hide the transfer -> indirect-read ordering.
+            (void)buffer_cache.ObtainBuffer(args_dst, 0x20, true);
+            buffer_cache.CopyBuffer(args_dst, args_src, 0x20, false, false);
             GpuIndirectDraw indirect{};
             indirect.args_addr = args_dst;
             indirect.count_addr = mode == Mode::Direct ? 0 : count_dword;
@@ -18241,8 +18248,16 @@ public:
       vertex_shader = owned_vertex_shader;
       pixel_shader = owned_pixel_shader;
     }
+    if (m_gpu_indirect_supported && !depth_feedback && !packed_vertex_color) {
+      // The GPU-copied argument pages are GPU-owned; unmapping publishes them to the CPU, which
+      // needs the GPU command lane.
+      context.InitializeGpu(nullptr);
+    }
     resources.UnmapMemory(depth_address, allocation_size);
     scheduler.Finish();
+    if (m_gpu_indirect_supported && !depth_feedback && !packed_vertex_color) {
+      context.ShutdownGpu();
+    }
     DestroyBuffer(&buffer);
     m_device.destroyShaderModule(pixel_shader.module);
     m_device.destroyShaderModule(vertex_shader.module);
