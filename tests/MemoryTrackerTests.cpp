@@ -1,7 +1,9 @@
 #include "common/hostException.h"
+#include "common/slotVector.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
+#include "graphics/host_gpu/renderer/cache/gpuWriteTicks.h"
 
 #include <algorithm>
 #include <functional>
@@ -15,6 +17,7 @@
 #include <semaphore>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -1391,6 +1394,138 @@ void TestSyncCandidateRunsMatchWholeRangeUpload() {
   Release(memory);
 }
 
+// GpuWriteTicks (paged array) must behave exactly like the unordered_map<page, tick> it replaced:
+// stamped-or-not, monotonic max, tick 0 still counts as stamped, out-of-range pages are rejected.
+void TestGpuWriteTicksMatchesMap() {
+  using Ticks = Libs::Graphics::GpuWriteTicks<14>;
+  Ticks ticks;
+  std::unordered_map<uint64_t, uint64_t> reference;
+  uint64_t state = 0x9E3779B97F4A7C15ull;
+  const auto next = [&]() {
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    return state;
+  };
+  constexpr uint64_t kPages = uint64_t{1} << 30;
+  std::vector<uint64_t> touched;
+  for (int i = 0; i < 20000; ++i) {
+    // Dense window (cheap) plus a few far-apart pages that exercise distinct buckets.
+    const uint64_t page = (i % 3 == 0 && !touched.empty()) ? touched[next() % touched.size()]
+                          : (i % 500 == 0)                  ? next() % kPages
+                                                            : 0x40000 + next() % 0x10000;
+    const uint64_t tick = next() % 5 == 0 ? 0 : next() % 1000;
+    Check(ticks.Note(page, tick), "valid page rejected");
+    auto &stamp = reference[page];
+    stamp = std::max(stamp, tick);
+    touched.push_back(page);
+  }
+  for (const auto page : touched) {
+    Check(ticks.Contains(page) && ticks.Get(page) == reference[page], "stamp differs from map");
+  }
+  for (int i = 0; i < 20000; ++i) {
+    const uint64_t page = i % 2 ? 0x40000 + next() % 0x12000 : next() % kPages;
+    const auto it = reference.find(page);
+    Check(ticks.Contains(page) == (it != reference.end()), "presence differs from map");
+    Check(ticks.Get(page) == (it != reference.end() ? it->second : 0), "value differs from map");
+  }
+  Check(!ticks.Note(kPages, 5) && !ticks.Contains(kPages) && ticks.Get(kPages) == 0,
+        "out-of-range page must be rejected and unstamped");
+  Ticks zero;
+  Check(zero.Note(7, 0) && zero.Contains(7) && zero.Get(7) == 0, "tick 0 must still be a stamp");
+  Check(zero.Note(7, 9) && zero.Note(7, 3) && zero.Get(7) == 9, "stamp must be monotonic");
+}
+
+// SlotVector (paged storage): stable addresses across growth, generation checks, free-list reuse and
+// index-ordered ForEach, across several 4096-entry pages.
+void TestSlotVectorPaged() {
+  struct Item {
+    explicit Item(int v) : value(v) {}
+    Item(const Item &) = delete;
+    int value;
+  };
+  Common::SlotVector<Item> slots;
+  std::vector<Common::SlotId> ids;
+  std::vector<const Item *> addresses;
+  constexpr int kCount = 3 * 4096 + 17;
+  for (int i = 0; i < kCount; ++i) {
+    ids.push_back(slots.insert(i));
+    addresses.push_back(&slots[ids.back()]);
+  }
+  Check(slots.size() == static_cast<size_t>(kCount) && slots.capacity() == static_cast<size_t>(kCount),
+        "slot count after inserts");
+  for (int i = 0; i < kCount; ++i) {
+    Check(slots.try_get(ids[i]) == addresses[i] && slots[ids[i]].value == i,
+          "slot address moved or value changed while growing");
+  }
+  for (int i = 0; i < kCount; i += 3) slots.erase(ids[i]);
+  for (int i = 0; i < kCount; ++i) {
+    Check((slots.try_get(ids[i]) != nullptr) == (i % 3 != 0), "erased slot still allocated");
+  }
+  Check(slots.try_get(Common::SlotId{}) == nullptr &&
+            slots.try_get(Common::SlotId{static_cast<uint32_t>(kCount), 1}) == nullptr,
+        "invalid ids must not resolve");
+  const auto reused = slots.insert(-1);
+  Check(reused.index == ids[kCount - 1 - ((kCount - 1) % 3)].index && reused.generation == 2,
+        "free list must reuse the last erased index with a new generation");
+  Check(slots.try_get(ids[reused.index]) == nullptr, "stale generation must not resolve");
+  int previous = -1;
+  size_t visited = 0;
+  slots.ForEach([&](Common::SlotId id, const Item &) {
+    Check(static_cast<int>(id.index) > previous, "ForEach must visit in index order");
+    previous = static_cast<int>(id.index);
+    ++visited;
+  });
+  Check(visited == slots.size(), "ForEach visit count");
+}
+
+// The fused stream-path query must equal !IsRegionGpuModified && IsRegionCpuModified in every
+// CPU/GPU state combination, for one page and for a range spanning two tracker regions.
+void TestFusedCpuNotGpuQuery() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 4);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto agree = [&](uint64_t begin, uint64_t size, const char *state) {
+    const bool old_form =
+        !tracker.IsRegionGpuModified(begin, size) && tracker.IsRegionCpuModified(begin, size);
+    Check(tracker.IsRegionCpuModifiedNotGpuModified(begin, size) == old_form, state);
+    return old_form;
+  };
+  // Fresh range: CPU-dirty, never GPU-owned.
+  Check(agree(address, page_size, "fused query disagrees on a fresh range"),
+        "a fresh range must be CPU-modified");
+  // Uploaded clean: neither.
+  tracker.ForEachUploadRange(
+      address, page_size * 4, false, [](uint64_t, uint64_t, const void *) noexcept {},
+      []() noexcept {});
+  Check(!agree(address, page_size, "fused query disagrees on a clean range"),
+        "a clean range must not be CPU-modified");
+  // GPU-owned page.
+  tracker.ForEachUploadRange(
+      address + page_size, page_size, true, [](uint64_t, uint64_t, const void *) noexcept {},
+      []() noexcept {});
+  Check(!agree(address + page_size, page_size, "fused query disagrees on a GPU page"),
+        "a GPU-owned page must not take the stream path");
+  // Mixed range: one GPU-owned page inside a wider range is GPU-modified overall.
+  Check(!agree(address, page_size * 4, "fused query disagrees on a mixed range"),
+        "a range holding a GPU-owned page must not take the stream path");
+  // CPU-dirty page next to the GPU one.
+  tracker.MarkRegionAsCpuModified(address + 2 * page_size, page_size);
+  Check(agree(address + 2 * page_size, page_size, "fused query disagrees on a CPU page"),
+        "a CPU-dirty page must take the stream path");
+  Check(!agree(address, page_size * 4, "fused query disagrees on CPU+GPU range"),
+        "CPU+GPU range must stay off the stream path");
+  tracker.UnmarkRegionAsGpuModified(address + page_size, page_size);
+  Check(agree(address, page_size * 4, "fused query disagrees after GPU release"),
+        "after the GPU page is released the CPU-dirty page qualifies");
+  tracker.MarkRegionAsCpuModified(address, page_size * 4);
+  tracker.UntrackMemory(address, page_size * 4);
+  Release(memory);
+}
+
 int main(int argc, char **argv) {
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
@@ -1400,6 +1535,9 @@ int main(int argc, char **argv) {
     return 0;
   }
   setenv("KYTY_HOT_DEMOTE_SYNCS", "3", 1); // read once, by the first sync that sees a hot page
+  TestGpuWriteTicksMatchesMap();
+  TestSlotVectorPaged();
+  TestFusedCpuNotGpuQuery();
   TestGuestRange();
   TestRangeSet();
   TestHotPageSnapshotHash();

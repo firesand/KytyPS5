@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
+#include "graphics/host_gpu/renderer/cache/gpuWriteTicks.h"
 #include "graphics/host_gpu/renderer/cache/hostResidentMemory.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
@@ -125,8 +126,7 @@ public:
 		return m_write_fault_ranges.Intersects(vaddr, size);
 	}
 	[[nodiscard]] uint64_t LastGpuWriteTick(uint64_t vaddr) const {
-		const auto it = m_gpu_write_ticks.find(vaddr >> CACHING_PAGEBITS);
-		return it != m_gpu_write_ticks.end() ? it->second : 0;
+		return m_gpu_write_ticks.Get(vaddr >> CACHING_PAGEBITS);
 	}
 	// Unbounded-heap GPU writes recorded or in flight whose pages are not yet marked GPU-dirty.
 	// Host-resident eligibility (review 2026-10-16 F1): tracker-only ownership query; a range inside a
@@ -278,7 +278,7 @@ private:
 	std::vector<std::pair<uint64_t, uint64_t>>        m_pending_gpu_modified;
 	std::vector<std::pair<uint64_t, uint64_t>>        m_pending_texture_invalidations;
 	SyncStats                                         m_sync_stats;
-	std::unordered_map<uint64_t, uint64_t>            m_gpu_write_ticks;
+	GpuWriteTicks<CACHING_PAGEBITS>                    m_gpu_write_ticks;
 	uint64_t                                          m_bar_block_tick = 0;
 	bool                                              m_last_download_bar = false;
 	int                                               m_last_bar_reason   = 0; // 1 unmapped, 2 no tick, 3 in flight

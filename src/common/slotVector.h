@@ -3,10 +3,11 @@
 
 #include "common/assert.h"
 #include "common/abi.h"
+#include "common/common.h"
 
 #include <compare>
 #include <cstdint>
-#include <deque>
+#include <memory>
 #include <functional>
 #include <limits>
 #include <optional>
@@ -39,47 +40,51 @@ public:
 
 	[[nodiscard]] T& operator[](SlotId id) noexcept {
 		EXIT_IF(!is_allocated(id));
-		return *m_values[id.index].value;
+		return *SlotAt(id.index).value;
 	}
 
 	[[nodiscard]] const T& operator[](SlotId id) const noexcept {
 		EXIT_IF(!is_allocated(id));
-		return *m_values[id.index].value;
+		return *SlotAt(id.index).value;
 	}
 
 	[[nodiscard]] T* try_get(SlotId id) noexcept {
-		return is_allocated(id) ? &*m_values[id.index].value : nullptr;
+		return is_allocated(id) ? &*SlotAt(id.index).value : nullptr;
 	}
 
 	[[nodiscard]] const T* try_get(SlotId id) const noexcept {
-		return is_allocated(id) ? &*m_values[id.index].value : nullptr;
+		return is_allocated(id) ? &*SlotAt(id.index).value : nullptr;
 	}
 
 	[[nodiscard]] bool is_allocated(SlotId id) const noexcept {
-		return id && id.index < m_values.size() &&
-		       m_values[id.index].generation == id.generation && m_values[id.index].value.has_value();
+		if (!id || id.index >= m_slot_count) return false;
+		const Slot& slot = SlotAt(id.index);
+		return slot.generation == id.generation && slot.value.has_value();
 	}
 
 	template <typename... Args>
 	[[nodiscard]] SlotId insert(Args&&... args) {
 		uint32_t index = 0;
 		if (m_free_list.empty()) {
-			index = static_cast<uint32_t>(m_values.size());
-			m_values.emplace_back();
-			m_values.back().value.emplace(std::forward<Args>(args)...);
+			index = m_slot_count;
+			if ((index & PageMask) == 0) {
+				m_pages.push_back(std::make_unique<Slot[]>(PageSize));
+			}
+			++m_slot_count;
+			SlotAt(index).value.emplace(std::forward<Args>(args)...);
 		} else {
 			index = m_free_list.back();
 			m_free_list.pop_back();
-			EXIT_IF(m_values[index].value.has_value());
-			m_values[index].value.emplace(std::forward<Args>(args)...);
+			EXIT_IF(SlotAt(index).value.has_value());
+			SlotAt(index).value.emplace(std::forward<Args>(args)...);
 		}
 		++m_size;
-		return SlotId {index, m_values[index].generation};
+		return SlotId {index, SlotAt(index).generation};
 	}
 
 	void erase(SlotId id) noexcept {
 		EXIT_IF(!is_allocated(id));
-		auto& slot = m_values[id.index];
+		auto& slot = SlotAt(id.index);
 		slot.value.reset();
 		if (++slot.generation == 0) {
 			slot.generation = 1;
@@ -89,22 +94,24 @@ public:
 	}
 
 	[[nodiscard]] size_t size() const noexcept { return m_size; }
-	[[nodiscard]] size_t capacity() const noexcept { return m_values.size(); }
+	[[nodiscard]] size_t capacity() const noexcept { return m_slot_count; }
 
 	template <typename F>
 	void ForEach(F&& fn) {
-		for (uint32_t index = 0; index < m_values.size(); ++index) {
-			if (m_values[index].value) {
-				fn(SlotId {index, m_values[index].generation}, *m_values[index].value);
+		for (uint32_t index = 0; index < m_slot_count; ++index) {
+			auto& slot = SlotAt(index);
+			if (slot.value) {
+				fn(SlotId {index, slot.generation}, *slot.value);
 			}
 		}
 	}
 
 	template <typename F>
 	void ForEach(F&& fn) const {
-		for (uint32_t index = 0; index < m_values.size(); ++index) {
-			if (m_values[index].value) {
-				fn(SlotId {index, m_values[index].generation}, *m_values[index].value);
+		for (uint32_t index = 0; index < m_slot_count; ++index) {
+			auto& slot = SlotAt(index);
+			if (slot.value) {
+				fn(SlotId {index, slot.generation}, *slot.value);
 			}
 		}
 	}
@@ -115,7 +122,20 @@ private:
 		uint32_t         generation = 1;
 	};
 
-	std::deque<Slot>             m_values;
+	// Fixed 4096-slot pages: stable addresses, two plain loads per lookup (no deque iterator math).
+	static constexpr uint32_t PageBits = 12;
+	static constexpr uint32_t PageSize = uint32_t {1} << PageBits;
+	static constexpr uint32_t PageMask = PageSize - 1;
+
+	[[nodiscard]] Slot& SlotAt(uint32_t index) noexcept {
+		return m_pages[index >> PageBits][index & PageMask];
+	}
+	[[nodiscard]] const Slot& SlotAt(uint32_t index) const noexcept {
+		return m_pages[index >> PageBits][index & PageMask];
+	}
+
+	std::vector<std::unique_ptr<Slot[]>> m_pages;
+	uint32_t                     m_slot_count = 0;
 	std::vector<uint32_t>        m_free_list;
 	size_t                       m_size = 0;
 };

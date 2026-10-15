@@ -993,7 +993,10 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	flat.assign(m_program.srt_reads.size(), 0u);
 	active.assign(m_program.descriptor_sources.size(), 1u);
 	for (const auto& block: m_program.control_flow) {
-		for (const auto source: block.sources) active.at(source) = 0u;
+		for (const auto source: block.sources) {
+			if (source >= active.size()) return false; // plan/source mismatch, same verdict as at()
+			active[source] = 0u;
+		}
 	}
 	auto& visited = m_program.visited_blocks;
 	auto& pending = m_program.pending_blocks;
@@ -1003,7 +1006,8 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	while (!pending.empty()) {
 		const auto index = pending.back();
 		pending.pop_back();
-		if (visited.at(index)) continue;
+		if (index >= visited.size()) return false;
+		if (visited[index]) continue;
 		visited[index] = 1u;
 		const auto& block = m_program.control_flow[index];
 		for (const auto source: block.sources) active[source] = 1u;
@@ -1017,7 +1021,7 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		    predicate.Evaluate(block.condition, condition)) {
 			pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
 		} else {
-			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
+			for (const auto successor: block.successors) pending.push_back(successor);
 		}
 	}
 	if (NoSourcePruning()) {
