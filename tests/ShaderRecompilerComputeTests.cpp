@@ -11954,7 +11954,7 @@ public:
         if (counted) {
           close_window();
           expect("graphics read resolved at the buffer end", Probe::FlushSubmit, 1, 0);
-          expect("no dispatch barrier in the next buffer", Probe::DispatchDirect, 0, 1);
+          expect("no dispatch barrier in the next buffer", Probe::DispatchDirect, 0, 2);
         }
         cache.ReadMemory(x_address, 4);
         u32 x = 0;
