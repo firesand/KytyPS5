@@ -4,6 +4,8 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/hostReadStats.h"
+#include "graphics/host_gpu/renderer/hazardState.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -128,7 +130,17 @@ public:
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
 
+	// Handle() is the funnel for every consumer that records commands the hazard tracker does not
+	// know about (uploads, copies, image transitions, readbacks): under KYTY_LAZY_BARRIERS it first
+	// resolves pending shader hazards when no render pass is open (EndRendering resolves them
+	// otherwise). Lazy-aware dispatch/draw recording uses RawHandle().
 	[[nodiscard]] vk::CommandBuffer Handle() const;
+	[[nodiscard]] vk::CommandBuffer RawHandle() const;
+	[[nodiscard]] PendingHazardState& Hazards() const noexcept { return m_hazards; }
+	// Ends the render pass and emits the barrier for pending hazards, if the tracker is on and
+	// any consumer-visible hazard is pending. Called before every draw.
+	void PrepareForDraw() const;
+	void FlushHazards(BarrierProbe::Kind kind) const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
 	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
@@ -158,6 +170,7 @@ private:
 	uint64_t            m_debug_arg4      = 0;
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
+	mutable PendingHazardState m_hazards;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;

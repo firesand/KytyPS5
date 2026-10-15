@@ -134,4 +134,61 @@ void ShaderWriteBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags sour
 	                          vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr); }
 }
 
+bool EmitPendingHazardBarrier(vk::CommandBuffer vk_buffer, PendingHazardState& hazards,
+                              BarrierProbe::Kind kind) {
+	EXIT_IF(vk_buffer == nullptr);
+	auto source = hazards.written_stages | hazards.read_stages | hazards.indirect_write_stages;
+	if (hazards.transfer_wrote) {
+		source |= vk::PipelineStageFlagBits::eTransfer;
+	}
+	if (!source) {
+		hazards.Clear();
+		return false;
+	}
+	vk::MemoryBarrier barrier {};
+	barrier.srcAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite |
+	                        hazards.written_access;
+	if (hazards.transfer_wrote) {
+		barrier.srcAccessMask |= vk::AccessFlagBits::eTransferWrite;
+	}
+	barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	{ GpuTimestampScope ts_scope(vk_buffer, GpuTimestamps::Kind::BarrierGlobal); vk_buffer.pipelineBarrier(source, vk::PipelineStageFlagBits::eAllCommands,
+	                          vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr); }
+	hazards.Clear();
+	BarrierProbe::NoteEmitted(kind);
+	return true;
+}
+
+bool EmitLazyDispatchBarrier(vk::CommandBuffer vk_buffer, PendingHazardState& hazards, bool writes,
+                             bool indirect, BarrierProbe::Kind kind) {
+	EXIT_IF(vk_buffer == nullptr);
+	// RAW/WAW: an earlier writer is still unresolved. WAR: this dispatch writes and something read
+	// since the last barrier. Indirect: the arguments may have been written by a shader or a copy.
+	const bool compute_hazard  = hazards.written_stages || (writes && hazards.read_stages);
+	const bool indirect_hazard = indirect && (hazards.indirect_write_stages || hazards.transfer_wrote);
+	if (!compute_hazard && !indirect_hazard) {
+		return false;
+	}
+	// Pure RAW/indirect barriers leave the read side pending: the readers were not part of the
+	// source scope, so a later writer still needs its WAR barrier.
+	const auto pending_read = hazards.read_stages;
+	if (!writes) {
+		hazards.read_stages = {};
+	}
+	const bool emitted = EmitPendingHazardBarrier(vk_buffer, hazards, kind);
+	if (!writes) {
+		hazards.read_stages = pending_read;
+	}
+	return emitted;
+}
+
+void NoteDispatchHazards(PendingHazardState& hazards, bool writes) noexcept {
+	hazards.read_stages |= vk::PipelineStageFlagBits::eComputeShader;
+	if (writes) {
+		hazards.written_stages |= vk::PipelineStageFlagBits::eComputeShader;
+		hazards.indirect_write_stages |= vk::PipelineStageFlagBits::eComputeShader;
+		hazards.written_access |= vk::AccessFlagBits::eShaderWrite;
+	}
+}
+
 } // namespace Libs::Graphics

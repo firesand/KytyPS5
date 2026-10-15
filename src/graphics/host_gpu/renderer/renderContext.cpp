@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "graphics/host_gpu/hostReadStats.h"
+#include "graphics/host_gpu/renderer/hazardState.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -241,6 +242,22 @@ struct FaultSampler {
 		                    reads_all.gpu_indirect_wait_ns / 1000000);
 		line += fmt::format(" | host-resident binds {} bytes {} KiB fallbacks {}", resident_all.binds,
 		                    resident_all.bytes >> 10, resident_all.fallbacks);
+		// Lazy hazard-tracked barriers (KYTY_LAZY_BARRIERS): per site `emitted/elided` (elided =
+		// barriers the pre-tracker code recorded there minus those the tracker recorded; negative
+		// means the tracker added one), then the places where deferred hazards were emitted.
+		{
+			const auto bar = BarrierProbe::Take();
+			line += fmt::format(" | barriers mode {}:", LazyBarrierMode());
+			for (uint32_t k = 0; k < BarrierProbe::KindCount; ++k) {
+				if (bar.old[k] != 0 || k < BarrierProbe::FlushEndRendering) {
+					line += fmt::format(" {} {}/{}", BarrierProbe::Name(k), bar.emitted[k],
+					                    static_cast<int64_t>(bar.old[k]) -
+					                        static_cast<int64_t>(bar.emitted[k]));
+				} else {
+					line += fmt::format(" {} {}", BarrierProbe::Name(k), bar.emitted[k]);
+				}
+			}
+		}
 		const auto& bc = budget_all.categories;
 		const auto  ms = [](uint64_t ns) { return ns / 1000000; };
 		const auto cat = [&](BudgetProbe::Category c) {
