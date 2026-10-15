@@ -1,0 +1,78 @@
+// Mesh-stage GPU-side indirect draws: translates DrawIndexedIndirect records (the PS5 packet's
+// argument records) into VkDrawMeshTasksIndirectCommandEXT plus a per-record scratch the
+// mesh_record shader variant reads through DrawIndex. One thread per record. The arithmetic mirrors
+// the host mesh path (graphicsRun.cpp index_count clamp, RenderExecutor::ExecutePreparedDraw
+// mesh_groups) except that the host's workgroup-limit EXIT becomes a clamp.
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer args_buf {
+    uint args[];
+};
+
+layout(std430, set = 0, binding = 1) buffer scratch_buf {
+    uint scratch[];
+};
+
+layout(push_constant) uniform push {
+    uint args_dword;       // first record, in dwords from the start of the bound range
+    uint stride_dwords;
+    uint count;
+    uint index_buffer_size; // INDEX_BUFFER_SIZE in elements, never 0
+    uint index_base_lo;
+    uint index_base_hi;
+    uint element_size;      // guest index size in bytes (2 or 4)
+    uint prim_size;         // input primitive size / step / primitives per mesh workgroup
+    uint prim_step;
+    uint prims_per_group;
+    uint max_groups_x;
+    uint max_groups_y;
+    uint max_groups_total;
+    uint command_dword;     // VkDrawMeshTasksIndirectCommandEXT array, in dwords of scratch
+    uint record_dword;      // 8-dword records, in dwords of scratch
+    uint padding;
+} pc;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) {
+        return;
+    }
+    const uint record = pc.args_dword + i * pc.stride_dwords;
+    const uint index_count = args[record + 0u];
+    const uint instances = args[record + 1u];
+    const uint start_index = args[record + 2u];
+    const uint base_vertex = args[record + 3u];
+    const uint start_instance = args[record + 4u];
+
+    const uint clamped = min(index_count, pc.index_buffer_size);
+    const uint primitives = clamped < pc.prim_size ? 0u : (clamped - pc.prim_size) / pc.prim_step + 1u;
+    uint groups = (primitives == 0u || instances == 0u) ? 0u : (primitives - 1u) / pc.prims_per_group + 1u;
+    groups = min(groups, pc.max_groups_x);
+    const uint launched_instances = min(instances, pc.max_groups_y);
+    if (launched_instances != 0u && groups > pc.max_groups_total / launched_instances) {
+        groups = pc.max_groups_total / launched_instances;
+    }
+
+    const uint command = pc.command_dword + i * 3u;
+    scratch[command + 0u] = groups;
+    scratch[command + 1u] = launched_instances;
+    scratch[command + 2u] = 1u;
+
+    uint offset_hi, offset_lo;
+    umulExtended(start_index, pc.element_size, offset_hi, offset_lo);
+    uint carry;
+    const uint address_lo = uaddCarry(pc.index_base_lo, offset_lo, carry);
+    const uint address_hi = pc.index_base_hi + offset_hi + carry;
+
+    const uint out_record = pc.record_dword + i * 8u;
+    scratch[out_record + 0u] = clamped;
+    scratch[out_record + 1u] = base_vertex;
+    scratch[out_record + 2u] = start_instance;
+    scratch[out_record + 3u] = start_index;
+    scratch[out_record + 4u] = address_lo;
+    scratch[out_record + 5u] = address_hi;
+    scratch[out_record + 6u] = 0u;
+    scratch[out_record + 7u] = 0u;
+}

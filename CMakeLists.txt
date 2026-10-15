@@ -325,6 +325,21 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${color_clear_check_header}")
+
+set(mesh_indirect_translate_source "${gpu_tiler_shader_dir}/mesh_indirect_translate.comp")
+set(mesh_indirect_translate_spv "${gpu_tiler_generated_dir}/mesh_indirect_translate.spv")
+set(mesh_indirect_translate_header "${gpu_tiler_generated_dir}/mesh_indirect_translate_spv.h")
+add_custom_command(
+	OUTPUT "${mesh_indirect_translate_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${mesh_indirect_translate_spv}" "${mesh_indirect_translate_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${mesh_indirect_translate_spv} -DOUTPUT=${mesh_indirect_translate_header}
+	        -DSYMBOL=MESH_INDIRECT_TRANSLATE_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${mesh_indirect_translate_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${mesh_indirect_translate_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
