@@ -54,6 +54,19 @@ enum class DrawOffsetSource : uint8_t {
 	IndirectArgs,
 };
 
+// KYTY_CP_GPU_INDIRECT: an indirect draw whose argument records stay on the GPU. The renderer
+// issues vkCmdDraw[Indexed]Indirect[Count] over them instead of the command processor reading the
+// records on the host. For indexed draws the whole INDEX_BUFFER_SIZE range at index_base is bound.
+struct GpuIndirectDraw {
+	uint64_t             args_addr          = 0;
+	uint64_t             count_addr         = 0; // 0: draw_count records, else a GPU-read count dword
+	uint32_t             draw_count         = 0; // exact count, or the maximum when count_addr != 0
+	uint32_t             stride             = 0;
+	uint64_t             index_base         = 0;
+	uint32_t             index_buffer_size  = 0; // in elements
+	ShaderDrawParameters parameters;
+};
+
 struct DrawIndexArgs {
 	uint32_t         index_count                = 0;
 	const void*      index_addr                 = nullptr;
@@ -63,6 +76,7 @@ struct DrawIndexArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	const GpuIndirectDraw* gpu_indirect         = nullptr;
 };
 
 struct DrawAutoArgs {
@@ -72,6 +86,7 @@ struct DrawAutoArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	const GpuIndirectDraw* gpu_indirect         = nullptr;
 };
 
 struct SubmitInfo {
@@ -160,6 +175,13 @@ public:
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                      uint32_t mode, bool async_compute);
 
+	// True when an indirect draw can be issued with GPU-resident arguments: the device supports it
+	// and nothing about the bound state needs the argument values on the host (mesh/NGG or
+	// tessellation shaders, quad lists, 8-bit indices, custom primitive-restart values).
+	[[nodiscard]] bool CanDrawIndirectOnGpu(CommandBuffer& buffer, bool indexed,
+	                                        uint32_t index_type_and_size, uint32_t draw_count,
+	                                        bool* mesh_blocked = nullptr);
+
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	void                           FindBuffers(std::span<PreparedBindings* const> stages);
 	void                           PrepareBufferImageWrites(std::span<PreparedBindings* const> stages);
@@ -195,11 +217,13 @@ private:
 	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer,
 	                                          const DrawCallInfo& draw,
 	                                          uint32_t            render_target_slice_offset,
-	                                          DrawRenderState& state);
+	                                          DrawRenderState& state,
+	                                          const ShaderDrawParameters* draw_parameters = nullptr);
 	void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
-	                         bool primitive_restart_enable);
+	                         bool primitive_restart_enable,
+	                         const GpuIndirectDraw* gpu_indirect = nullptr);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,

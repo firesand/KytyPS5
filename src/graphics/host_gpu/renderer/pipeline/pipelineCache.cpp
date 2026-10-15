@@ -878,7 +878,8 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
     std::span<const ShaderPixelOutputType, 8> target_output_type, bool pixel_active,
-    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
+    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info,
+    const ShaderDrawParameters* draw_parameters) {
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
@@ -887,6 +888,14 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
+	if (draw_parameters != nullptr && draw_parameters->active) {
+		// The command processor only requests this for plain vertex shaders (see
+		// RenderExecutor::CanDrawIndirectOnGpu); anything else has no draw-parameter variant.
+		EXIT_NOT_IMPLEMENTED(tess_active || mesh_active);
+		vertex_info[0].draw_parameters = *draw_parameters;
+		// Native fetch consumes the SGPRs the host path patched and expects ids without the base.
+		vertex_info[0].draw_parameters.rebase_ids = !vertex_info[0].fetch_embedded;
+	}
 	if (mesh_active) {
 		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
 		auto& mesh              = vertex_info[0].mesh;

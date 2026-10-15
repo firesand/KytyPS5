@@ -17380,6 +17380,9 @@ public:
     constexpr uint64_t allocation_size = 0x40000;
     constexpr uint64_t rect_address = depth_address + 0x8000;
     constexpr uint64_t index_address = rect_address + 0x1000;
+    // GPU-side indirect draw inputs; the GPU-written destinations get a page each so that the
+    // page-granular GPU-modified tracking never covers the CPU-written index data.
+    constexpr uint64_t indirect_base = depth_address + 0x20000;
     EnsureRuntimeContext();
     RenderContext context(m_runtime_context);
     auto &scheduler = context.GetCommandScheduler();
@@ -17425,6 +17428,16 @@ public:
                   sizeof(rect_vertices));
       constexpr std::array<uint32_t, 3> indices{0, 1, 2};
       std::memcpy(reinterpret_cast<void *>(index_address), indices.data(), sizeof(indices));
+      // GPU-side indirect draw inputs (see GpuIndirectDraw below): argument records the GPU
+      // copies into zeroed ranges, and two count dwords.
+      constexpr std::array<uint32_t, 4> auto_record{3, 1, 7, 5};
+      constexpr std::array<uint32_t, 5> indexed_record{3, 1, 0, 7, 5};
+      std::memcpy(reinterpret_cast<void *>(indirect_base), auto_record.data(),
+                  sizeof(auto_record));
+      std::memcpy(reinterpret_cast<void *>(indirect_base + 0x20), indexed_record.data(),
+                  sizeof(indexed_record));
+      *reinterpret_cast<uint32_t *>(indirect_base + 0x3000) = 1;
+      *reinterpret_cast<uint32_t *>(indirect_base + 0x3004) = 0;
     }
     resources.MapMemory(depth_address, allocation_size);
     if (depth_feedback) {
@@ -18330,6 +18343,70 @@ public:
         }
       }
 
+      // GPU-resident indirect arguments (KYTY_CP_GPU_INDIRECT). The same native VS now takes its
+      // vertex and instance offsets from gl_BaseVertex/gl_BaseInstance through the draw-parameter
+      // map: the user-data dwords hold junk, and the records are copied by the GPU into the
+      // argument range so the draw must order the transfer before the indirect read (barrier).
+      if (m_gpu_indirect_supported) {
+        shaders.SetGsUserSgpr(0, 0x7777u, HW::UserSgprType::Unknown);
+        shaders.SetGsUserSgpr(1, 0x5555u, HW::UserSgprType::Unknown);
+        auto &buffer_cache = context.GetBufferCache();
+        enum class Mode { Direct, CountOne, CountZero };
+        for (const bool indexed : {false, true}) {
+          // Sources and zeroed destinations were prepared before the memory was mapped.
+          const uint64_t args_src = indirect_base + (indexed ? 0x20 : 0x0);
+          const uint64_t args_dst = indirect_base + (indexed ? 0x2000 : 0x1000);
+          for (const Mode mode : {Mode::Direct, Mode::CountOne, Mode::CountZero}) {
+            const char *gpu_name = "GpuIndirectDraw";
+            const u32 stride = indexed ? 20u : 16u;
+            const uint64_t count_dword = indirect_base + (mode == Mode::CountOne ? 0x3000 : 0x3004);
+            // Mark the destination GPU-modified first: CopyBuffer otherwise takes its host
+            // memcpy shortcut, which would hide the transfer -> indirect-read ordering.
+            (void)buffer_cache.ObtainBuffer(args_dst, 0x20, true);
+            buffer_cache.CopyBuffer(args_dst, args_src, 0x20, false, false);
+            GpuIndirectDraw indirect{};
+            indirect.args_addr = args_dst;
+            indirect.count_addr = mode == Mode::Direct ? 0 : count_dword;
+            indirect.draw_count = mode == Mode::Direct ? 1u : 4u;
+            indirect.stride = stride;
+            indirect.index_base = index_address;
+            indirect.index_buffer_size = 3;
+            indirect.parameters.active = true;
+            indirect.parameters.base_vertex_slot = 0;
+            indirect.parameters.base_instance_slot = 1;
+            Require(gpu_name, "eligibility",
+                    executor.CanDrawIndirectOnGpu(scheduler.Current(), indexed, 1,
+                                                  indirect.draw_count),
+                    "a plain vertex-stage triangle list must be eligible");
+            TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
+                {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+            if (indexed) {
+              RenderExecutorTestAccess::DrawIndex(executor, scheduler.Current(),
+                  {.index_count = 3, .index_addr = reinterpret_cast<const void *>(index_address),
+                   .instance_count = 1, .index_type_and_size = 1,
+                   .offset_source = DrawOffsetSource::IndirectArgs, .gpu_indirect = &indirect});
+            } else {
+              RenderExecutorTestAccess::DrawAuto(executor, scheduler.Current(),
+                  {.vertex_count = 1, .instance_count = 1,
+                   .offset_source = DrawOffsetSource::IndirectArgs, .gpu_indirect = &indirect});
+            }
+            const auto pixels = ReadCachedTexel(name, context, sparse_color.image_id,
+                                                {}, {extent, extent, 1});
+            for (size_t component = 0; component < pixels.size(); component++) {
+              const u32 expected = mode == Mode::CountZero
+                                       ? 0u
+                                       : (component % 4 == 3 ? 0x3f800000u : 0x3e800000u);
+              Require(gpu_name, indexed ? "indexed" : "auto", pixels[component] == expected,
+                      mode == Mode::CountZero
+                          ? "a zero GPU-side draw count still drew"
+                          : "base vertex/instance or the GPU-copied record did not reach the shader");
+            }
+          }
+        }
+        shaders.SetGsUserSgpr(0, 7, HW::UserSgprType::Unknown);
+        shaders.SetGsUserSgpr(1, 5, HW::UserSgprType::Unknown);
+      }
+
       // A fourth VS invocation reads beyond the descriptor instead of reconstructing the corner.
       const ShaderBufferResource rect_buffer{{
           static_cast<u32>(rect_address),
@@ -18410,8 +18487,16 @@ public:
       vertex_shader = owned_vertex_shader;
       pixel_shader = owned_pixel_shader;
     }
+    if (m_gpu_indirect_supported && !depth_feedback && !packed_vertex_color) {
+      // The GPU-copied argument pages are GPU-owned; unmapping publishes them to the CPU, which
+      // needs the GPU command lane.
+      context.InitializeGpu(nullptr);
+    }
     resources.UnmapMemory(depth_address, allocation_size);
     scheduler.Finish();
+    if (m_gpu_indirect_supported && !depth_feedback && !packed_vertex_color) {
+      context.ShutdownGpu();
+    }
     DestroyBuffer(&buffer);
     m_device.destroyShaderModule(pixel_shader.module);
     m_device.destroyShaderModule(vertex_shader.module);
@@ -19757,6 +19842,7 @@ public:
 
 private:
   bool m_rasterization_supported = true;
+  bool m_gpu_indirect_supported = false;
   bool m_conditional_rendering_supported = false;
   bool m_host_memory_ext = false;
   uint64_t m_host_pointer_alignment = 0;
@@ -19798,6 +19884,7 @@ private:
     m_runtime_context.min_imported_host_pointer_alignment = m_host_pointer_alignment;
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
+    m_runtime_context.gpu_indirect_draw_enabled = m_gpu_indirect_supported;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
         .type = vk::ImageType::e2D,
@@ -20012,6 +20099,10 @@ private:
             "image view minimum LOD is not supported");
     Require("VulkanHarness", "graphics", available_features12.shaderOutputLayer == true,
             "vertex layer output is not supported");
+    m_gpu_indirect_supported = available_features.multiDrawIndirect &&
+                               available_features.drawIndirectFirstInstance &&
+                               available_features11.shaderDrawParameters &&
+                               available_features12.drawIndirectCount;
     m_rasterization_supported = available_features.fillModeNonSolid &&
                                 available_features.tessellationShader &&
                                 available_features.depthBounds &&
@@ -20041,6 +20132,8 @@ private:
     auto device_features11 = WindowContext::RequiredVulkan11Features();
     auto device_features12 = WindowContext::RequiredVulkan12Features();
     device_features12.shaderSharedInt64Atomics = true;
+    device_features11.shaderDrawParameters = m_gpu_indirect_supported;
+    device_features12.drawIndirectCount = m_gpu_indirect_supported;
     vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout{};
     workgroup_layout.workgroupMemoryExplicitLayout = true;
     device_features12.pNext = &device_features11;
@@ -20103,6 +20196,8 @@ private:
     device_features.fillModeNonSolid = m_rasterization_supported;
     device_features.tessellationShader = m_rasterization_supported;
     device_features.depthBounds = m_rasterization_supported;
+    device_features.multiDrawIndirect = m_gpu_indirect_supported;
+    device_features.drawIndirectFirstInstance = m_gpu_indirect_supported;
     device_info.pEnabledFeatures = &device_features;
     std::vector<const char *> device_extensions{
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,

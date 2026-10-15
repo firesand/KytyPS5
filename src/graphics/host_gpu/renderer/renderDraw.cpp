@@ -28,6 +28,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
+#include "graphics/shader/shaderCompiler.h"
 #include "kernel/eventQueue.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
@@ -976,7 +977,8 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 }
 
 static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
-                           uint32_t color_output_mask, DrawRenderState& state) {
+                           uint32_t color_output_mask, DrawRenderState& state,
+                           const ShaderDrawParameters* draw_parameters) {
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -1014,18 +1016,19 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
 	    target_export_mapping, target_output_type, state.ps_active, state.vertex_info,
-	    state.ps_input_info);
+	    state.ps_input_info, draw_parameters);
 }
 
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
-	                                        DrawRenderState& state) {
+	                                        DrawRenderState& state,
+                                            const ShaderDrawParameters* draw_parameters) {
 	const auto& shader_regs       = buffer.GetRegisters().GetShaderRegisters();
 	const auto  color_output_mask = DrawColorOutputMask(buffer.GetRegisters());
 	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
 	                  (color_output_mask != 0 ||
 	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
-	RefreshShaders(buffer, draw, color_output_mask, state);
+	RefreshShaders(buffer, draw, color_output_mask, state, draw_parameters);
 	uint32_t mrt_mask = 0;
 	if (state.ps_active) {
 		for (const auto& output: state.ps_input_info.stage.program->info.outputs) {
@@ -1188,7 +1191,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source,
-	                                     bool primitive_restart_enable) {
+	                                     bool primitive_restart_enable,
+                                         const GpuIndirectDraw* gpu_indirect) {
 	auto& ucfg = buffer.GetUserConfig();
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
@@ -1222,6 +1226,32 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	}
 
+	if (gpu_indirect != nullptr) {
+		EXIT_IF(mesh_active);
+	}
+	// GPU-resident indirect arguments: publish pending write-fault records (without touching the
+	// memory), then decide whether the argument read needs a shaderWrite -> indirectCommandRead
+	// barrier. Marks are made at record time for bound shader writes; unbounded (fault-tracked)
+	// writes in flight are covered by HasPendingUnboundedWrites.
+	uint64_t indirect_args_bytes = 0;
+	bool     indirect_barrier    = false;
+	if (gpu_indirect != nullptr) {
+		auto& cache = m_context.GetBufferCache();
+		const uint64_t record_size =
+		    draw.IsIndexed() ? sizeof(vk::DrawIndexedIndirectCommand) : sizeof(vk::DrawIndirectCommand);
+		EXIT_IF(gpu_indirect->draw_count == 0 || gpu_indirect->stride < record_size ||
+		        (gpu_indirect->stride & 3u) != 0 || (gpu_indirect->args_addr & 3u) != 0);
+		indirect_args_bytes =
+		    static_cast<uint64_t>(gpu_indirect->draw_count - 1u) * gpu_indirect->stride + record_size;
+		cache.PrepareHostRead(gpu_indirect->args_addr, indirect_args_bytes);
+		indirect_barrier = cache.HasGpuDirtyBytes(gpu_indirect->args_addr, indirect_args_bytes) ||
+		                   cache.HasPendingUnboundedWrites();
+		if (gpu_indirect->count_addr != 0) {
+			cache.PrepareHostRead(gpu_indirect->count_addr, sizeof(uint32_t));
+			indirect_barrier |= cache.HasGpuDirtyBytes(gpu_indirect->count_addr, sizeof(uint32_t));
+		}
+	}
+
 	if (mesh_active && draw.IsIndexed()) {
 		// Register the original guest indices for shader reads; PrepareGraphicsBindings
 		// synchronizes registered BDA ranges before any draw commands are committed.
@@ -1250,6 +1280,21 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
+	}
+	std::pair<Buffer*, uint64_t> indirect_args {};
+	std::pair<Buffer*, uint64_t> indirect_count {};
+	if (gpu_indirect != nullptr) {
+		auto& cache   = m_context.GetBufferCache();
+		indirect_args = cache.ObtainBuffer(gpu_indirect->args_addr, indirect_args_bytes, false);
+		EXIT_IF(indirect_args.first == nullptr || (indirect_args.second & 3u) != 0);
+		if (gpu_indirect->count_addr != 0) {
+			indirect_count = cache.ObtainBuffer(gpu_indirect->count_addr, sizeof(uint32_t), false);
+			EXIT_IF(indirect_count.first == nullptr || (indirect_count.second & 3u) != 0);
+		}
+		// Obtaining the arguments can merge cache buffers; finalize shader bindings afterward.
+		for (auto* stage_bindings: stages) {
+			RebindBuffers(*stage_bindings);
+		}
 	}
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
@@ -1281,6 +1326,19 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// point onward, every operation targets the current command buffer and cannot touch guest
 	// memory.
 	auto vk_buffer = buffer.Handle();
+	if (indirect_barrier) {
+		// Barriers are illegal inside dynamic rendering: close it, order the GPU-built records
+		// before the indirect read (same barrier DispatchIndirect records), BeginRendering reopens.
+		m_context.GetCommandScheduler().EndRendering();
+		vk::MemoryBarrier barrier {};
+		barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
+		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
+		                              vk::PipelineStageFlagBits::eComputeShader |
+		                              vk::PipelineStageFlagBits::eTransfer,
+		                          vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0,
+		                          nullptr, 0, nullptr);
+	}
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
@@ -1422,6 +1480,34 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                           GpuTimestamps::Kind::Draw, ts_ps_hash, ts_vs_hash);
 		if (mesh_active) {
 			vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+		} else if (gpu_indirect != nullptr) {
+			if (GpuDiagnostics::Enabled()) {
+				diagnostic.kind = draw.IsIndexed() ? "draw-indexed-indirect-gpu" : "draw-indirect-gpu";
+				diagnostic.args = {gpu_indirect->args_addr, gpu_indirect->count_addr,
+				                   gpu_indirect->draw_count, gpu_indirect->stride,
+				                   indirect_barrier ? 1u : 0u, index_source.address};
+				CommandScheduler::Checkpoint(
+				    vk_buffer, m_context.GetCommandScheduler().RecordGpuOperation(diagnostic));
+			}
+			const auto args_handle = indirect_args.first->Handle();
+			if (gpu_indirect->count_addr != 0) {
+				const auto count_handle = indirect_count.first->Handle();
+				if (draw.IsIndexed()) {
+					vk_buffer.drawIndexedIndirectCount(args_handle, indirect_args.second, count_handle,
+					                                   indirect_count.second, gpu_indirect->draw_count,
+					                                   gpu_indirect->stride);
+				} else {
+					vk_buffer.drawIndirectCount(args_handle, indirect_args.second, count_handle,
+					                            indirect_count.second, gpu_indirect->draw_count,
+					                            gpu_indirect->stride);
+				}
+			} else if (draw.IsIndexed()) {
+				vk_buffer.drawIndexedIndirect(args_handle, indirect_args.second,
+				                              gpu_indirect->draw_count, gpu_indirect->stride);
+			} else {
+				vk_buffer.drawIndirect(args_handle, indirect_args.second, gpu_indirect->draw_count,
+				                       gpu_indirect->stride);
+			}
 		} else {
 			EmitDrawPrimitives(ucfg, vk_buffer, draw, emit, m_context.GetCommandScheduler(), diagnostic);
 		}
@@ -1448,6 +1534,66 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x700u);
 	}
 	m_context.GetCommandScheduler().DiagnosticOperationComplete();
+}
+
+bool RenderExecutor::CanDrawIndirectOnGpu(CommandBuffer& buffer, bool indexed,
+                                          uint32_t index_type_and_size, uint32_t draw_count,
+                                          bool* mesh_blocked) {
+	if (mesh_blocked != nullptr) {
+		*mesh_blocked = false;
+	}
+	const auto& graphics = m_context.GetGraphics();
+	if (!graphics.gpu_indirect_draw_enabled ||
+	    draw_count > graphics.GetPhysicalDeviceProperties().limits.maxDrawIndirectCount) {
+		return false;
+	}
+	auto& ucfg   = buffer.GetUserConfig();
+	auto& sh_ctx = buffer.GetShaders();
+	if (!DrawHasValidVertexShader(sh_ctx)) {
+		return false;
+	}
+	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
+	if (!GetDrawTopology(ucfg, topology)) {
+		return false;
+	}
+	const auto primitive = ucfg.GetPrimType();
+	// Tessellation and quad lists expand on the host from the draw counts.
+	if (primitive == Prospero::PrimitiveType::kPatch ||
+	    primitive == Prospero::PrimitiveType::kQuadListLegacy) {
+		return false;
+	}
+	if (VertexShaderIsMesh(sh_ctx.GetVs(), buffer.GetRegisters())) {
+		if (mesh_blocked != nullptr) {
+			*mesh_blocked = true;
+		}
+		return false;
+	}
+	if (!indexed) {
+		return true;
+	}
+	uint32_t element_size = 0;
+	switch (static_cast<Prospero::IndexType>(index_type_and_size)) {
+		case Prospero::IndexType::kIndex16: element_size = 2; break;
+		case Prospero::IndexType::kIndex32: element_size = 4; break;
+		default: return false; // 8-bit indices are widened on the host
+	}
+	// Mirrors ResolvePrimitiveRestart: only the all-ones restart index is native; any other value
+	// makes the host scan the index data.
+	const auto control = ucfg.GetPrimitiveResetControl();
+	if ((control & ~0x3u) != 0) {
+		return false;
+	}
+	if ((control & 0x1u) != 0 && (primitive == Prospero::PrimitiveType::kLineStrip ||
+	                              primitive == Prospero::PrimitiveType::kTriFan ||
+	                              primitive == Prospero::PrimitiveType::kTriStrip)) {
+		const auto index_mask  = UINT32_MAX >> ((4 - element_size) * 8);
+		const auto reset_index = buffer.GetRegisters().GetPrimitiveResetIndex();
+		if (!((control & 0x2u) != 0 && (reset_index & ~index_mask) != 0) &&
+		    (reset_index & index_mask) != index_mask) {
+			return false;
+		}
+	}
+	return true;
 }
 
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
@@ -1525,7 +1671,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	index_source.size = static_cast<uint64_t>(args.index_count) * index_source.guest_element_size;
 	// The host-side reads below (restart-marker scan, 8-bit widening) see GPU-built index data
 	// only once pending unbounded writes are published (host-read audit 2026-10-12).
-	if (args.index_addr != nullptr && index_source.size != 0) {
+	if (args.index_addr != nullptr && index_source.size != 0 && args.gpu_indirect == nullptr) {
 		m_context.GetBufferCache().PrepareHostRead(index_source.address, index_source.size);
 	}
 	const bool primitive_restart = ResolvePrimitiveRestart(buffer, index_source);
@@ -1545,7 +1691,9 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
 	                        args.instance_count, args.first_instance};
 	DrawRenderState state {};
-	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
+	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state,
+	                            args.gpu_indirect != nullptr ? &args.gpu_indirect->parameters
+	                                                         : nullptr)) {
 		ResetBindings();
 		return;
 	}
@@ -1565,7 +1713,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	emit.first_instance = native_indirect ? 0 : instance_offset;
 
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
-	                    primitive_restart);
+	                    primitive_restart, args.gpu_indirect);
 	ResetBindings();
 }
 
@@ -1625,7 +1773,9 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		return;
 	}
 	DrawRenderState state {};
-	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
+	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state,
+	                            args.gpu_indirect != nullptr ? &args.gpu_indirect->parameters
+	                                                         : nullptr)) {
 		ResetBindings();
 		return;
 	}
@@ -1657,7 +1807,8 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	emit.first_instance = native_indirect ? 0 : instance_offset;
 
 	DrawIndexBufferSource index_source {};
-	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false);
+	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false,
+	                    args.gpu_indirect);
 	ResetBindings();
 }
 

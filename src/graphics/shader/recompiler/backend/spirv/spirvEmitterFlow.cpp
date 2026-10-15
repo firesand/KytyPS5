@@ -59,11 +59,27 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 	}
 	if (kind == IR::StageInputKind::VertexIndex || kind == IR::StageInputKind::InstanceIndex ||
 	    kind == IR::StageInputKind::InvocationId || kind == IR::StageInputKind::PrimitiveId ||
-	    kind == IR::StageInputKind::Layer || kind == IR::StageInputKind::SampleId) {
+	    kind == IR::StageInputKind::Layer || kind == IR::StageInputKind::SampleId ||
+	    kind == IR::StageInputKind::BaseVertex || kind == IR::StageInputKind::BaseInstance) {
 		const auto value = state.builder.AllocateId();
 		const auto bits  = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpLoad, TypeI32(state), value, variable);
 		state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
+		// GPU-side indirect draw, native fetch: the guest id excludes the draw's base.
+		const auto* vertex = state.input_info.vertex;
+		if (vertex != nullptr && vertex->draw_parameters.active &&
+		    vertex->draw_parameters.rebase_ids &&
+		    (kind == IR::StageInputKind::VertexIndex || kind == IR::StageInputKind::InstanceIndex)) {
+			const auto base_kind = kind == IR::StageInputKind::VertexIndex
+			                           ? IR::StageInputKind::BaseVertex
+			                           : IR::StageInputKind::BaseInstance;
+			const auto base_value = state.builder.AllocateId();
+			const auto base_bits  = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLoad, TypeI32(state), base_value,
+			                          InputVariableForKind(state, base_kind));
+			state.builder.AddFunction(spv::OpBitcast, TypeU32(state), base_bits, base_value);
+			return EmitBinaryU32(state, spv::OpISub, bits, base_bits);
+		}
 		return bits;
 	}
 	if (kind == IR::StageInputKind::FragCoord || kind == IR::StageInputKind::TessCoord) {
@@ -682,6 +698,30 @@ uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 uint32_t EmitGetUserData(EmitterState& state, IR::ScalarReg reg) {
+	// GPU-side indirect draws: the packet's vertex / instance offset SGPRs come from the draw
+	// parameters built-ins instead of the (unpatched) shader-data dword.
+	if (const auto* vertex = state.input_info.vertex;
+	    vertex != nullptr && vertex->draw_parameters.active) {
+		const auto& draw  = vertex->draw_parameters;
+		const auto  index = IR::RegIndex(reg);
+		const auto  base  = state.program.user_data_base;
+		const auto  load  = [&](IR::StageInputKind kind) {
+			const auto value = state.builder.AllocateId();
+			const auto bits  = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLoad, TypeI32(state), value,
+			                          InputVariableForKind(state, kind));
+			state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
+			return bits;
+		};
+		if (draw.base_vertex_slot != ShaderDrawParameters::kNoSlot &&
+		    index == base + draw.base_vertex_slot) {
+			return load(IR::StageInputKind::BaseVertex);
+		}
+		if (draw.base_instance_slot != ShaderDrawParameters::kNoSlot &&
+		    index == base + draw.base_instance_slot) {
+			return load(IR::StageInputKind::BaseInstance);
+		}
+	}
 
 	uint32_t dword = 0;
 	if (!UserDataDwordIndex(state, reg, dword)) {

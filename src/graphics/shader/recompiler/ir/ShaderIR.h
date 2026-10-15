@@ -213,6 +213,9 @@ enum class StageInputKind {
 	LocalInvocationIndex,
 	GlobalInvocationId,
 	Parameter,
+	// VK_KHR_shader_draw_parameters; only the emitter adds them (GPU-side indirect draws).
+	BaseVertex,
+	BaseInstance,
 };
 
 enum class StageOutputKind {

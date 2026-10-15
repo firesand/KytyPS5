@@ -123,6 +123,21 @@ struct ShaderTessellationInputInfo {
 	uint32_t output_topology       = 0;
 };
 
+// GPU-side indirect draws (KYTY_CP_GPU_INDIRECT): the draw packet names the user-data SGPRs that
+// the host path patches with the argument record's vertex / instance offsets. The GPU variant reads
+// them from gl_BaseVertex / gl_BaseInstance instead of the shader-data dword. Slots are GS user-data
+// indices; kNoSlot means the packet did not name the register. Part of the program key.
+struct ShaderDrawParameters {
+	static constexpr uint32_t kNoSlot = UINT32_MAX;
+
+	bool     active             = false;
+	uint32_t base_vertex_slot   = kNoSlot;
+	uint32_t base_instance_slot = kNoSlot;
+	// Native (non-embedded) fetch expects the guest vertex / instance id without the draw's base:
+	// Vulkan adds firstVertex / firstInstance to the built-ins, so the emitter subtracts them.
+	bool     rebase_ids         = false;
+};
+
 struct ShaderVertexInputInfo {
 	static constexpr int RES_MAX = 32;
 
@@ -143,6 +158,7 @@ struct ShaderVertexInputInfo {
 	ShaderTessellationInputInfo tess;
 	bool                    fetch_external      = false;
 	bool                    fetch_embedded      = false;
+	ShaderDrawParameters    draw_parameters;
 };
 
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
