@@ -203,6 +203,9 @@ private:
 	uint64_t         m_dispatch_indirect_args_base_addr = 0;
 	// Persistent draw state: indirect draws update it for subsequent draws.
 	uint32_t m_num_instances = 1;
+	// A GPU mesh indirect packet left m_num_instances (and the patched batch SGPRs) at their
+	// pre-packet values; cleared by any host write of m_num_instances. See StaleMeshState.
+	bool     m_mesh_state_stale = false;
 
 	uint32_t m_de_count    = 0;
 	uint32_t m_ce_count    = 0;

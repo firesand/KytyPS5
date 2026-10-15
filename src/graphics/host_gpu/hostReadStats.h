@@ -45,8 +45,12 @@ struct HostReadProbe {
 	// subset of "other" caused by NGG/mesh vertex shaders). GpuMeshDraws is the subset of GpuDraws
 	// issued through the mesh translation prepass; FallbackMeshSrt counts mesh packets kept on the
 	// host path because the mesh program's resource plan reads a batch SGPR (or is not compiled yet).
+	// StaleMeshState counts later direct draws that fell back to m_num_instances (instance_count 0)
+	// while a GPU mesh packet had left it at its pre-packet value: the host path persists the last
+	// record's instance count and patched SGPRs, the GPU path cannot. Non-zero means the divergence
+	// is observable.
 	enum GpuIndirect : uint32_t { GpuDraws = 0, FallbackIndexOffset, FallbackOther, FallbackMesh, FallbackSrt,
-	                              GpuMeshDraws, FallbackMeshSrt, GpuIndirectCount };
+	                              GpuMeshDraws, FallbackMeshSrt, StaleMeshState, GpuIndirectCount };
 	struct Snapshot {
 		std::array<std::pair<uint64_t, uint64_t>, SiteCount> sites {}; // calls, nanoseconds
 		std::array<uint64_t, GpuIndirectCount>               gpu_indirect {};
