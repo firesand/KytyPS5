@@ -40417,7 +40417,7 @@ void CheckMeshRecordEmission() {
   struct Compiled {
     std::string assembly;
     bool valid = false;
-    u64 plan_mask = 0; // ResourcePlan::user_data_mask of the program
+    uint64_t plan_mask = 0; // ResourcePlan::user_data_mask of the program
   };
   const auto compile = [&](const ShaderDrawParameters &draw) {
     ShaderVertexInputInfo input{};
@@ -45618,7 +45618,7 @@ void CheckMeshDrawIndexGate0() {
     constexpr u32 element_size = 2;
     constexpr u32 primitives_per_group = 62;
     constexpr u32 max_x = 4, max_y = 3, max_total = 8;
-    constexpr u64 index_base = 0x00000001ffffff00ull;
+    constexpr uint64_t index_base = 0x00000001ffffff00ull;
     struct Record { u32 index_count, instances, start_index, base_vertex, start_instance; };
     const Record records[count] = {
         {186, 1, 0, 0, 0},                // exactly one group
@@ -45633,8 +45633,8 @@ void CheckMeshDrawIndexGate0() {
     vk::DeviceMemory in_memory{}, scratch_memory{}, result_memory{};
     void *in_map = nullptr, *scratch_map = nullptr, *result_map = nullptr;
     const u32 in_dwords = args_offset_dwords + count * stride_dwords;
-    const u64 command_bytes = (count * 12u + 15u) & ~15u;
-    const u64 scratch_bytes = command_bytes + count * 32u;
+    const uint64_t command_bytes = (count * 12u + 15u) & ~15u;
+    const uint64_t scratch_bytes = command_bytes + count * 32u;
     make_buffer(in_dwords * 4, vk::BufferUsageFlagBits::eStorageBuffer, &in_buffer, &in_memory,
                 &in_map);
     make_buffer(scratch_bytes,
@@ -45755,8 +45755,8 @@ void CheckMeshDrawIndexGate0() {
 
     vk::BufferDeviceAddressInfo address_info{};
     address_info.buffer = scratch_buffer;
-    const u64 scratch_address = device.getBufferAddress(address_info);
-    const u64 records_address = scratch_address + command_bytes;
+    const uint64_t scratch_address = device.getBufferAddress(address_info);
+    const uint64_t records_address = scratch_address + command_bytes;
 
     const u32 push[16] = {args_offset_dwords, stride_dwords, count, index_buffer_size,
                           static_cast<u32>(index_base), static_cast<u32>(index_base >> 32),
@@ -45827,7 +45827,7 @@ void CheckMeshDrawIndexGate0() {
       if (instances != 0 && groups > max_total / instances) {
         groups = max_total / instances;
       }
-      const u64 address = index_base + static_cast<u64>(r.start_index) * element_size;
+      const uint64_t address = index_base + static_cast<uint64_t>(r.start_index) * element_size;
       const u32 expected_record[8] = {clamped, r.base_vertex, r.start_instance, r.start_index,
                                       static_cast<u32>(address), static_cast<u32>(address >> 32),
                                       0, 0};
