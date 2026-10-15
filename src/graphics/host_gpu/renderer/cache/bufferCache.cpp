@@ -493,9 +493,8 @@ bool BufferCache::HostJoinPossible(const Buffer& new_buffer, const Buffer& overl
 	const auto first   = address >> CACHING_PAGEBITS;
 	const auto last    = (address + overlap.Size() - 1) >> CACHING_PAGEBITS;
 	for (auto page = first; page <= last; ++page) {
-		const auto found = m_gpu_write_ticks.find(page);
-		if (found != m_gpu_write_ticks.end()) {
-			if (found->second != 0 && !m_scheduler.IsFree(found->second)) {
+		if (const auto* stamp = m_gpu_write_ticks.Find(page); stamp != nullptr) {
+			if (*stamp != 0 && !m_scheduler.IsFree(*stamp)) {
 				return false; // a GPU write to the old buffer is still in flight
 			}
 			continue;
@@ -865,8 +864,9 @@ void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size, uint64_t tick) {
 	for (auto page = first; page <= last; ++page) {
 		// Monotonic: a later marking with an older (or 0 = complete) tick must not hide a write
 		// still in flight on the same 16 KiB entry (stale-buffer workflow 2026-10-13, fix 2).
-		auto& stamp = m_gpu_write_ticks[page];
-		stamp       = std::max(stamp, tick);
+		if (!m_gpu_write_ticks.Note(page, tick)) {
+			m_bar_block_tick = std::max(m_bar_block_tick, tick); // outside the guest range: block until done
+		}
 	}
 }
 
@@ -893,12 +893,12 @@ bool BufferCache::TryBarReadback(const Buffer& buffer, std::span<const vk::Buffe
 		const auto first = (address + copy.srcOffset) >> CACHING_PAGEBITS;
 		const auto last  = (address + copy.srcOffset + copy.size - 1) >> CACHING_PAGEBITS;
 		for (auto page = first; page <= last; ++page) {
-			const auto found = m_gpu_write_ticks.find(page);
-			if (found == m_gpu_write_ticks.end()) {
+			const auto* stamp = m_gpu_write_ticks.Find(page);
+			if (stamp == nullptr) {
 				m_last_bar_reason = 2;
 				return false; // marked by a path without a tick: keep the copy path
 			}
-			latest = std::max(latest, found->second);
+			latest = std::max(latest, *stamp);
 		}
 	}
 	if (latest != 0 && !m_scheduler.IsFree(latest)) {
@@ -1199,7 +1199,7 @@ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::HasGpuWriteStamp(uint64_t vaddr) const {
-	return m_gpu_write_ticks.contains(vaddr >> CACHING_PAGEBITS);
+	return m_gpu_write_ticks.Contains(vaddr >> CACHING_PAGEBITS);
 }
 
 uint64_t BufferCache::OwnerReadyTick(uint64_t vaddr) const {

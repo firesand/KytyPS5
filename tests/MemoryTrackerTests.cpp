@@ -2,6 +2,7 @@
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
+#include "graphics/host_gpu/renderer/cache/gpuWriteTicks.h"
 
 #include <algorithm>
 #include <functional>
@@ -15,6 +16,7 @@
 #include <semaphore>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -1391,6 +1393,46 @@ void TestSyncCandidateRunsMatchWholeRangeUpload() {
   Release(memory);
 }
 
+// GpuWriteTicks (paged array) must behave exactly like the unordered_map<page, tick> it replaced:
+// stamped-or-not, monotonic max, tick 0 still counts as stamped, out-of-range pages are rejected.
+void TestGpuWriteTicksMatchesMap() {
+  using Ticks = Libs::Graphics::GpuWriteTicks<14>;
+  Ticks ticks;
+  std::unordered_map<uint64_t, uint64_t> reference;
+  uint64_t state = 0x9E3779B97F4A7C15ull;
+  const auto next = [&]() {
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    return state;
+  };
+  constexpr uint64_t kPages = uint64_t{1} << 30;
+  std::vector<uint64_t> touched;
+  for (int i = 0; i < 20000; ++i) {
+    const uint64_t page = (i % 3 == 0 && !touched.empty()) ? touched[next() % touched.size()]
+                                                           : next() % kPages;
+    const uint64_t tick = next() % 5 == 0 ? 0 : next() % 1000;
+    Check(ticks.Note(page, tick), "valid page rejected");
+    auto &stamp = reference[page];
+    stamp = std::max(stamp, tick);
+    touched.push_back(page);
+  }
+  for (const auto page : touched) {
+    Check(ticks.Contains(page) && ticks.Get(page) == reference[page], "stamp differs from map");
+  }
+  for (int i = 0; i < 20000; ++i) {
+    const uint64_t page = next() % kPages;
+    const auto it = reference.find(page);
+    Check(ticks.Contains(page) == (it != reference.end()), "presence differs from map");
+    Check(ticks.Get(page) == (it != reference.end() ? it->second : 0), "value differs from map");
+  }
+  Check(!ticks.Note(kPages, 5) && !ticks.Contains(kPages) && ticks.Get(kPages) == 0,
+        "out-of-range page must be rejected and unstamped");
+  Ticks zero;
+  Check(zero.Note(7, 0) && zero.Contains(7) && zero.Get(7) == 0, "tick 0 must still be a stamp");
+  Check(zero.Note(7, 9) && zero.Note(7, 3) && zero.Get(7) == 9, "stamp must be monotonic");
+}
+
 int main(int argc, char **argv) {
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
@@ -1400,6 +1442,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   setenv("KYTY_HOT_DEMOTE_SYNCS", "3", 1); // read once, by the first sync that sees a hot page
+  TestGpuWriteTicksMatchesMap();
   TestGuestRange();
   TestRangeSet();
   TestHotPageSnapshotHash();
