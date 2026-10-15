@@ -40504,7 +40504,9 @@ void CheckMeshRecordEmission() {
   draw.base_vertex_slot = 5; // s13, read by the back shader
   const auto slotted = compile(draw);
   Require(name, "sgpr slot",
-          count(slotted.assembly, "OpConvertUToPtr") > count(record.assembly, "OpConvertUToPtr"),
+          slotted.assembly.find("BuiltIn BaseVertex") == std::string::npos &&
+              slotted.assembly.find("BuiltIn BaseInstance") == std::string::npos &&
+              count(slotted.assembly, "OpConvertUToPtr") > count(record.assembly, "OpConvertUToPtr"),
           "a packet-named SGPR slot must be served from the record scratch");
   // SRT guard: the V# in s[8:11] occupies plan bits 8..11 (base 0), so a packet naming slot 0 (s8)
   // must be rejected by the mask check; the unshifted slot bit (bit 0) would not see it.
