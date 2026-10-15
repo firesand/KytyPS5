@@ -40416,6 +40416,7 @@ void CheckMeshRecordEmission() {
   struct Compiled {
     std::string assembly;
     bool valid = false;
+    u64 plan_mask = 0; // ResourcePlan::user_data_mask of the program
   };
   const auto compile = [&](const ShaderDrawParameters &draw) {
     ShaderVertexInputInfo input{};
@@ -40443,7 +40444,7 @@ void CheckMeshRecordEmission() {
     options.stage = ShaderType::Mesh;
     options.input_info.vertex = &input;
     options.user_data = user_data;
-    options.user_data_base = 8;
+    options.user_data_base = 0; // production value for Mesh (pipelineCache.cpp)
     options.back_code = back;
     auto translated = ShaderRecompiler::TranslateProgram(front, options);
     auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
@@ -40462,6 +40463,7 @@ void CheckMeshRecordEmission() {
     ValidateSpirv(name, result.spirv);
     spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
     Compiled compiled;
+    compiled.plan_mask = plan.user_data_mask;
     compiled.valid = tools.Disassemble(result.spirv, &compiled.assembly);
     Require(name, "disassembly", compiled.valid, "failed to disassemble the mesh variant");
     return compiled;
@@ -40498,11 +40500,22 @@ void CheckMeshRecordEmission() {
   Require(name, "draw dwords", base_loads >= 3,
           "index count and index address dwords were not loaded from the record scratch");
 
-  draw.base_vertex_slot = 5; // register 8 + 5 = s13, read by the back shader
+  // Packet slot k is s(8 + k) in a mesh program (kMeshUserSgprBase).
+  draw.base_vertex_slot = 5; // s13, read by the back shader
   const auto slotted = compile(draw);
   Require(name, "sgpr slot",
           count(slotted.assembly, "OpConvertUToPtr") > count(record.assembly, "OpConvertUToPtr"),
           "a packet-named SGPR slot must be served from the record scratch");
+  // SRT guard: the V# in s[8:11] occupies plan bits 8..11 (base 0), so a packet naming slot 0 (s8)
+  // must be rejected by the mask check; the unshifted slot bit (bit 0) would not see it.
+  ShaderDrawParameters descriptor_slot;
+  descriptor_slot.active = true;
+  descriptor_slot.mesh_record = true;
+  descriptor_slot.base_vertex_slot = 0;
+  Require(name, "srt guard",
+          (DrawParameterSlotMask(descriptor_slot, kMeshUserSgprBase) & plain.plan_mask) != 0 &&
+              (DrawParameterSlotMask(descriptor_slot, 0) & plain.plan_mask) == 0,
+          "a packet naming the descriptor's SGPR must be rejected with the mesh slot offset");
   std::printf("[host]    %-32s ok\n", name);
 }
 

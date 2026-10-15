@@ -749,7 +749,8 @@ uint32_t EmitGetUserData(EmitterState& state, IR::ScalarReg reg) {
 	if (MeshRecordActive(state)) {
 		const auto& draw  = state.input_info.vertex->draw_parameters;
 		const auto  index = IR::RegIndex(reg);
-		const auto  base  = state.program.user_data_base;
+		// Packet slot k is register s(kMeshUserSgprBase + k) (see shader.h).
+		const auto  base  = state.program.user_data_base + kMeshUserSgprBase;
 		const auto  slot  = [&](uint32_t packet_slot, uint32_t field, uint32_t& result) {
 			if (packet_slot == ShaderDrawParameters::kNoSlot || index != base + packet_slot) {
 				return false;
@@ -767,7 +768,8 @@ uint32_t EmitGetUserData(EmitterState& state, IR::ScalarReg reg) {
 	// GPU-side indirect draws: the packet's vertex / instance offset SGPRs come from the draw
 	// parameters built-ins instead of the (unpatched) shader-data dword.
 	if (const auto* vertex = state.input_info.vertex;
-	    vertex != nullptr && vertex->draw_parameters.active) {
+	    vertex != nullptr && vertex->draw_parameters.active &&
+	    state.program.stage != ShaderType::Mesh) {
 		const auto& draw  = vertex->draw_parameters;
 		const auto  index = IR::RegIndex(reg);
 		const auto  base  = state.program.user_data_base;

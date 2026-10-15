@@ -1670,14 +1670,8 @@ bool RenderExecutor::CanDrawIndirectOnGpu(CommandBuffer& buffer, bool indexed,
 	// one of them would pick resources from a stale value. Unknown shaders take the host path once,
 	// which compiles them and records their mask.
 	uint64_t plan_mask = 0;
-	const auto slot_bit = [](uint32_t slot) {
-		return slot == ShaderDrawParameters::kNoSlot ? uint64_t {0}
-		                                             : (slot < 64u ? uint64_t {1} << slot : ~uint64_t {0});
-	};
 	if (!m_context.GetPipelineCache().GetVertexUserDataMask(shader_hash, plan_mask) ||
-	    (plan_mask & (slot_bit(parameters.base_vertex_slot) |
-	                  slot_bit(parameters.base_instance_slot) |
-	                  slot_bit(parameters.first_index_slot))) != 0) {
+	    (plan_mask & DrawParameterSlotMask(parameters, mesh ? kMeshUserSgprBase : 0u)) != 0) {
 		if (block != nullptr) {
 			*block = GpuIndirectBlock::Srt;
 		}
