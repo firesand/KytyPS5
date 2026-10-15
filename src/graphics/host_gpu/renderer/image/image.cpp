@@ -563,6 +563,14 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 			}
 		}
 	}
+	// The staging buffer is the shared device-local utility buffer (also LDS backing): make the
+	// transfer accesses available to every later user, as Upload and Download do.
+	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+	barrier.srcAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
+	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	barrier.size          = buffer.Size();
+	{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::BarrierGlobal); command.pipelineBarrier2(dependency); }
 	Transit(vk::ImageLayout::eGeneral,
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }

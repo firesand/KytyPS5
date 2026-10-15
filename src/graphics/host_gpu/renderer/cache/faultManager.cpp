@@ -126,7 +126,7 @@ void FaultManager::Process(bool write_faults) {
 	post_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
 	post_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
 	post_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-	post_barrier.dstAccessMask = vk::AccessFlagBits2::eShaderWrite;
+	post_barrier.dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
 
 	const vk::DescriptorBufferInfo infos[] {
 	    {m_fault_buffer.Handle(), write_faults ? bda_bytes : 0, write_faults ? write_bytes : bda_bytes},

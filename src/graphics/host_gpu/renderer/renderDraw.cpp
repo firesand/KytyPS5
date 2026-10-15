@@ -1583,12 +1583,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		if (shader_write_stages) {
 			BarrierProbe::NoteOld(BarrierProbe::DrawPost);
 		}
+		vk::PipelineStageFlags written_stages = tracked_stages;
 		if (LazyBarrierMode() == 1 && StrictPostDrawBarrier()) {
-			// The strict post-draw barrier below already covers shader_write_stages.
-			tracked_stages &= ~shader_write_stages;
+			// The strict post-draw barrier below already covers the bound-write stages' execution
+			// and memory; indirect-argument tracking still needs the full set.
+			written_stages &= ~shader_write_stages;
 		}
 		if (tracked_stages) {
-			hazards.written_stages |= tracked_stages;
+			hazards.written_stages |= written_stages;
 			hazards.indirect_write_stages |= tracked_stages;
 			hazards.written_access |= vk::AccessFlagBits::eShaderWrite;
 		}
@@ -1596,6 +1598,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (shader_write_stages && (LazyBarriersKeepOld() || StrictPostDrawBarrier())) {
 		m_context.GetCommandScheduler().EndRendering();
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
+		if (LazyBarrierMode() == 1) {
+			BarrierProbe::NoteEmitted(BarrierProbe::DrawPost); // strict bisection barrier
+		}
 	}
 	LogDrawPhase(draw.Name(), "DrawComplete");
 	if (!draw.IsIndexed()) {

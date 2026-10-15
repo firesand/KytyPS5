@@ -285,8 +285,8 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 		std::memcpy(input.workgroup_counts, reinterpret_cast<const void*>(indirect_args),
 		            sizeof(input.workgroup_counts));
 	}
-	// LDS has no contents to preserve between dispatches. The existing shader hazard
-	// barriers also order other users of this GPU-only utility buffer.
+	// LDS has no contents to preserve between dispatches. Other users of this GPU-only utility
+	// buffer (CopyImageWithBuffer) end with their own transfer -> all-commands buffer barrier.
 	auto& storage = cache.GetUtilityBuffer(MemoryUsage::DeviceLocal);
 	const auto limit = std::min<uint64_t>(storage.Size(),
 	    context.GetGraphics().GetPhysicalDeviceProperties().limits.maxStorageBufferRange);
