@@ -138,6 +138,9 @@ public:
 	                    bool pixel_active, std::array<ShaderVertexInputInfo, 3>& vertex_info,
 	                    ShaderPixelInputInfo& pixel_info,
 	                    const ShaderDrawParameters* draw_parameters = nullptr);
+	// Host-evaluated user-data registers of a vertex shader (bit i = register user_data_base + i),
+	// known once it has been compiled. False for a hash not seen yet.
+	[[nodiscard]] bool GetVertexUserDataMask(uint64_t shader_hash, uint64_t& mask) const;
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info);

@@ -738,6 +738,9 @@ struct PreparedIndexBuffer {
 	vk::Buffer     buffer = nullptr;
 	vk::DeviceSize offset = 0;
 	vk::IndexType  type   = vk::IndexType::eUint16;
+	// Non-zero: bind exactly this range (VK_KHR_maintenance5); with robustBufferAccess2 indices
+	// past it read as 0, matching the host path's INDEX_BUFFER_SIZE clamp.
+	vk::DeviceSize size   = 0;
 };
 
 static uint64_t VertexBufferDescriptorSize(int binding, const ShaderVertexInputInfo& info) {
@@ -1114,6 +1117,10 @@ static void CommitIndexBuffer(vk::CommandBuffer vk_buffer, const PreparedIndexBu
 	if (prepared.buffer == nullptr) {
 		return;
 	}
+	if (prepared.size != 0) {
+		vk_buffer.bindIndexBuffer2KHR(prepared.buffer, prepared.offset, prepared.size, prepared.type);
+		return;
+	}
 	vk_buffer.bindIndexBuffer(prepared.buffer, prepared.offset, prepared.type);
 }
 
@@ -1243,6 +1250,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		        (gpu_indirect->stride & 3u) != 0 || (gpu_indirect->args_addr & 3u) != 0);
 		indirect_args_bytes =
 		    static_cast<uint64_t>(gpu_indirect->draw_count - 1u) * gpu_indirect->stride + record_size;
+		const auto wait_begin = std::chrono::steady_clock::now();
 		cache.PrepareHostRead(gpu_indirect->args_addr, indirect_args_bytes);
 		indirect_barrier = cache.HasGpuDirtyBytes(gpu_indirect->args_addr, indirect_args_bytes) ||
 		                   cache.HasPendingUnboundedWrites();
@@ -1250,6 +1258,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			cache.PrepareHostRead(gpu_indirect->count_addr, sizeof(uint32_t));
 			indirect_barrier |= cache.HasGpuDirtyBytes(gpu_indirect->count_addr, sizeof(uint32_t));
 		}
+		HostReadProbe::AddGpuIndirectWait(static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(
+		        std::chrono::steady_clock::now() - wait_begin).count()));
 	}
 
 	if (mesh_active && draw.IsIndexed()) {
@@ -1280,6 +1291,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
+		if (gpu_indirect != nullptr && draw.IsIndexed() && index_binding.buffer != nullptr &&
+		    m_context.GetGraphics().maintenance5_enabled) {
+			index_binding.size = index_source.size;
+		}
 	}
 	std::pair<Buffer*, uint64_t> indirect_args {};
 	std::pair<Buffer*, uint64_t> indirect_count {};
@@ -1538,9 +1553,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 
 bool RenderExecutor::CanDrawIndirectOnGpu(CommandBuffer& buffer, bool indexed,
                                           uint32_t index_type_and_size, uint32_t draw_count,
-                                          bool* mesh_blocked) {
-	if (mesh_blocked != nullptr) {
-		*mesh_blocked = false;
+                                          const ShaderDrawParameters& parameters,
+                                          GpuIndirectBlock* block) {
+	if (block != nullptr) {
+		*block = GpuIndirectBlock::Other;
 	}
 	const auto& graphics = m_context.GetGraphics();
 	if (!graphics.gpu_indirect_draw_enabled ||
@@ -1562,11 +1578,32 @@ bool RenderExecutor::CanDrawIndirectOnGpu(CommandBuffer& buffer, bool indexed,
 	    primitive == Prospero::PrimitiveType::kQuadListLegacy) {
 		return false;
 	}
-	if (VertexShaderIsMesh(sh_ctx.GetVs(), buffer.GetRegisters())) {
-		if (mesh_blocked != nullptr) {
-			*mesh_blocked = true;
+	uint64_t shader_hash = 0;
+	if (VertexShaderIsMesh(sh_ctx.GetVs(), buffer.GetRegisters(), &shader_hash)) {
+		if (block != nullptr) {
+			*block = GpuIndirectBlock::Mesh;
 		}
 		return false;
+	}
+	// The host evaluates the resource plan (descriptor addresses, SRT reads, uniform branches) from
+	// the user-data snapshot. The GPU variant never patches the offset SGPRs, so a plan that reads
+	// one of them would pick resources from a stale value. Unknown shaders take the host path once,
+	// which compiles them and records their mask.
+	uint64_t plan_mask = 0;
+	const auto slot_bit = [](uint32_t slot) {
+		return slot == ShaderDrawParameters::kNoSlot ? uint64_t {0}
+		                                             : (slot < 64u ? uint64_t {1} << slot : ~uint64_t {0});
+	};
+	if (!m_context.GetPipelineCache().GetVertexUserDataMask(shader_hash, plan_mask) ||
+	    (plan_mask & (slot_bit(parameters.base_vertex_slot) |
+	                  slot_bit(parameters.base_instance_slot))) != 0) {
+		if (block != nullptr) {
+			*block = GpuIndirectBlock::Srt;
+		}
+		return false;
+	}
+	if (block != nullptr) {
+		*block = GpuIndirectBlock::None;
 	}
 	if (!indexed) {
 		return true;
@@ -1575,12 +1612,15 @@ bool RenderExecutor::CanDrawIndirectOnGpu(CommandBuffer& buffer, bool indexed,
 	switch (static_cast<Prospero::IndexType>(index_type_and_size)) {
 		case Prospero::IndexType::kIndex16: element_size = 2; break;
 		case Prospero::IndexType::kIndex32: element_size = 4; break;
-		default: return false; // 8-bit indices are widened on the host
+		default: // 8-bit indices are widened on the host
+			if (block != nullptr) *block = GpuIndirectBlock::Other;
+			return false;
 	}
 	// Mirrors ResolvePrimitiveRestart: only the all-ones restart index is native; any other value
 	// makes the host scan the index data.
 	const auto control = ucfg.GetPrimitiveResetControl();
 	if ((control & ~0x3u) != 0) {
+		if (block != nullptr) *block = GpuIndirectBlock::Other;
 		return false;
 	}
 	if ((control & 0x1u) != 0 && (primitive == Prospero::PrimitiveType::kLineStrip ||
@@ -1590,6 +1630,7 @@ bool RenderExecutor::CanDrawIndirectOnGpu(CommandBuffer& buffer, bool indexed,
 		const auto reset_index = buffer.GetRegisters().GetPrimitiveResetIndex();
 		if (!((control & 0x2u) != 0 && (reset_index & ~index_mask) != 0) &&
 		    (reset_index & index_mask) != index_mask) {
+			if (block != nullptr) *block = GpuIndirectBlock::Other;
 			return false;
 		}
 	}
@@ -1671,8 +1712,16 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	index_source.size = static_cast<uint64_t>(args.index_count) * index_source.guest_element_size;
 	// The host-side reads below (restart-marker scan, 8-bit widening) see GPU-built index data
 	// only once pending unbounded writes are published (host-read audit 2026-10-12).
-	if (args.index_addr != nullptr && index_source.size != 0 && args.gpu_indirect == nullptr) {
+	if (args.index_addr != nullptr && index_source.size != 0) {
+		// GPU-indirect draws keep this too: ObtainBuffer must not upload stale CPU bytes over
+		// GPU-built indices whose write-fault records are still unpublished.
+		const auto begin = std::chrono::steady_clock::now();
 		m_context.GetBufferCache().PrepareHostRead(index_source.address, index_source.size);
+		if (args.gpu_indirect != nullptr) {
+			HostReadProbe::AddGpuIndirectWait(static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::nanoseconds>(
+			        std::chrono::steady_clock::now() - begin).count()));
+		}
 	}
 	const bool primitive_restart = ResolvePrimitiveRestart(buffer, index_source);
 

@@ -32,7 +32,9 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& input_info, std::vector<u
 
 // True when PrepareProgram compiles the bound vertex-stage shader through the mesh path (merged or
 // native NGG). Same conditions, no side effects.
-bool VertexShaderIsMesh(const HW::VertexShaderInfo& regs, const HW::Context& context);
+// shader_hash, when given, receives the program-cache hash of the bound vertex-stage shader.
+bool VertexShaderIsMesh(const HW::VertexShaderInfo& regs, const HW::Context& context,
+                        uint64_t* shader_hash = nullptr);
 ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,
                             const HW::UserConfig& user_config, ShaderVertexInputInfo& input_info);
 std::array<ShaderParams, 3>

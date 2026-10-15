@@ -482,6 +482,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		provoking_vertex.pNext = supported_features2.pNext;
 		supported_features2.pNext = &provoking_vertex;
 	}
+	// Sized index-buffer binds for GPU-side indirect draws.
+	vk::PhysicalDeviceMaintenance5FeaturesKHR supported_maintenance5 {};
+	if (HasExtension(device_extensions, VK_KHR_MAINTENANCE_5_EXTENSION_NAME)) {
+		supported_maintenance5.pNext = supported_features2.pNext;
+		supported_features2.pNext    = &supported_maintenance5;
+	}
 	const bool image_atomic_int64_extension =
 	    HasExtension(device_extensions, VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME);
 	vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_atomic_int64 {};
@@ -495,6 +501,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	auto features12 = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported_features12.shaderSharedInt64Atomics;
 	// GPU-side indirect draws (KYTY_CP_GPU_INDIRECT) need all four; enable them together or not at all.
+	graphics.maintenance5_enabled = HasExtension(device_extensions, VK_KHR_MAINTENANCE_5_EXTENSION_NAME) &&
+	                                supported_maintenance5.maintenance5 == VK_TRUE;
 	graphics.gpu_indirect_draw_enabled =
 	    supported_features2.features.multiDrawIndirect == VK_TRUE &&
 	    supported_features2.features.drawIndirectFirstInstance == VK_TRUE &&
@@ -662,6 +670,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		image_atomic_int64.pNext = const_cast<void*>(create_info.pNext);
 		image_atomic_int64.sparseImageInt64Atomics = VK_FALSE;
 		create_info.pNext = &image_atomic_int64;
+	}
+	vk::PhysicalDeviceMaintenance5FeaturesKHR maintenance5 {};
+	if (graphics.maintenance5_enabled) {
+		maintenance5.maintenance5 = VK_TRUE;
+		maintenance5.pNext        = const_cast<void*>(create_info.pNext);
+		create_info.pNext         = &maintenance5;
 	}
 	// Device-loss diagnostics: faulting addresses and vendor codes (see ReportDeviceFault).
 	vk::PhysicalDeviceFaultFeaturesEXT device_fault {};
@@ -1152,7 +1166,8 @@ void WindowContext::CreateVulkan() {
 		                             VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME,
 		                             VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME,
 		                             VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME,
-		                             VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME}) {
+		                             VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME,
+		                             VK_KHR_MAINTENANCE_5_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}

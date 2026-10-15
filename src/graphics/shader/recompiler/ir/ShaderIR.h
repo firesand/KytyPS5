@@ -603,6 +603,10 @@ struct ResourcePlan {
 	uint64_t                      shader_hash     = 0;
 	uint32_t                      user_data_base  = 0;
 	uint32_t                      user_data_count = 64;
+	// Bit i: the plan (descriptor sources, SRT reads, resource control flow, uniform fill) evaluates
+	// user-data register user_data_base + i on the host. The host patch of an indirect draw's offset
+	// SGPRs is invisible to the GPU variant, so those registers cannot be draw parameters.
+	uint64_t                            user_data_mask = 0;
 	std::list<Inst>                     value_storage;
 	std::vector<MemoryInfo>             memory_info;
 	std::vector<DescriptorSource>       descriptor_sources;

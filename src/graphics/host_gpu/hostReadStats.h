@@ -43,13 +43,21 @@ struct HostReadProbe {
 	// KYTY_CP_GPU_INDIRECT accounting: draws issued with GPU-side arguments, and the indirect draws
 	// that stayed on the host path (first-index SGPR named, or any other reason; "mesh" is the
 	// subset of "other" caused by NGG/mesh vertex shaders).
-	enum GpuIndirect : uint32_t { GpuDraws = 0, FallbackIndexOffset, FallbackOther, FallbackMesh, GpuIndirectCount };
+	enum GpuIndirect : uint32_t { GpuDraws = 0, FallbackIndexOffset, FallbackOther, FallbackMesh, FallbackSrt, GpuIndirectCount };
 	struct Snapshot {
 		std::array<std::pair<uint64_t, uint64_t>, SiteCount> sites {}; // calls, nanoseconds
 		std::array<uint64_t, GpuIndirectCount>               gpu_indirect {};
+		uint64_t                                             gpu_indirect_wait_ns = 0;
 	};
 	inline static std::array<HostReadCounters, SiteCount> s_sites {};
 	inline static std::array<std::atomic<uint64_t>, GpuIndirectCount> s_gpu_indirect {};
+
+	// Time the GPU-indirect path spends in PrepareHostRead (args, count, index range): it blocks when
+	// the range intersects pending unbounded writes, which the `cp reads` counters no longer show.
+	inline static std::atomic<uint64_t> s_gpu_indirect_wait_ns {0};
+	static void AddGpuIndirectWait(uint64_t ns) noexcept {
+		s_gpu_indirect_wait_ns.fetch_add(ns, std::memory_order_relaxed);
+	}
 
 	static void CountGpuIndirect(GpuIndirect kind) noexcept {
 		s_gpu_indirect[kind].fetch_add(1, std::memory_order_relaxed);
@@ -68,6 +76,7 @@ struct HostReadProbe {
 		for (uint32_t i = 0; i < GpuIndirectCount; ++i) {
 			snapshot.gpu_indirect[i] = s_gpu_indirect[i].exchange(0, std::memory_order_relaxed);
 		}
+		snapshot.gpu_indirect_wait_ns = s_gpu_indirect_wait_ns.exchange(0, std::memory_order_relaxed);
 		return snapshot;
 	}
 	// Reads one dword per 4 KiB page of [vaddr, vaddr + size): a GPU-written range is published (and

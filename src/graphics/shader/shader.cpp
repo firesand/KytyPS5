@@ -724,9 +724,12 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 	key.push_back(static_cast<uint32_t>(info.tg_size_en));
 }
 
-bool VertexShaderIsMesh(const HW::VertexShaderInfo& regs, const HW::Context& context) {
+bool VertexShaderIsMesh(const HW::VertexShaderInfo& regs, const HW::Context& context,
+                        uint64_t* shader_hash) {
 	const auto [data, hash] = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoVS():");
-	(void)hash;
+	if (shader_hash != nullptr) {
+		*shader_hash = hash;
+	}
 	const bool merged = (context.GetShaderStages() & 0x20u) != 0;
 	return merged || (data.type == Prospero::ShaderBinaryType::kGs &&
 	                  regs.gs_regs.rsrc2.lds_size != 0);
