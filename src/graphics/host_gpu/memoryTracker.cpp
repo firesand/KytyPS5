@@ -91,6 +91,24 @@ bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	});
 }
 
+bool MemoryTracker::IsRegionCpuModifiedNotGpuModified(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	// Old form: !IsRegionGpuModified (any region GPU-dirty -> false) && IsRegionCpuModified (any
+	// region CPU-dirty). A region that does not exist yet is all CPU-dirty and has no GPU bits, so
+	// creating it here (the CPU query always did) cannot change the GPU verdict.
+	bool cpu_modified = false;
+	const bool gpu_modified =
+	    Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		    std::scoped_lock lock(manager->lock);
+		    if (manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
+			    return true;
+		    }
+		    cpu_modified = cpu_modified || manager->IsModified<DirtySource::Cpu>(offset, bytes);
+		    return false;
+	    });
+	return !gpu_modified && cpu_modified;
+}
+
 uint64_t HashTrackerPage(const void* page) noexcept {
 	return XXH3_64bits(page, TRACKER_PAGE_SIZE);
 }

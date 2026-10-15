@@ -1479,6 +1479,53 @@ void TestSlotVectorPaged() {
   Check(visited == slots.size(), "ForEach visit count");
 }
 
+// The fused stream-path query must equal !IsRegionGpuModified && IsRegionCpuModified in every
+// CPU/GPU state combination, for one page and for a range spanning two tracker regions.
+void TestFusedCpuNotGpuQuery() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 4);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto agree = [&](uint64_t begin, uint64_t size, const char *state) {
+    const bool old_form =
+        !tracker.IsRegionGpuModified(begin, size) && tracker.IsRegionCpuModified(begin, size);
+    Check(tracker.IsRegionCpuModifiedNotGpuModified(begin, size) == old_form, state);
+    return old_form;
+  };
+  // Fresh range: CPU-dirty, never GPU-owned.
+  Check(agree(address, page_size, "fused query disagrees on a fresh range"),
+        "a fresh range must be CPU-modified");
+  // Uploaded clean: neither.
+  tracker.ForEachUploadRange(
+      address, page_size * 4, false, [](uint64_t, uint64_t, const void *) noexcept {},
+      []() noexcept {});
+  Check(!agree(address, page_size, "fused query disagrees on a clean range"),
+        "a clean range must not be CPU-modified");
+  // GPU-owned page.
+  tracker.ForEachUploadRange(
+      address + page_size, page_size, true, [](uint64_t, uint64_t, const void *) noexcept {},
+      []() noexcept {});
+  Check(!agree(address + page_size, page_size, "fused query disagrees on a GPU page"),
+        "a GPU-owned page must not take the stream path");
+  // Mixed range: one GPU-owned page inside a wider range is GPU-modified overall.
+  Check(!agree(address, page_size * 4, "fused query disagrees on a mixed range"),
+        "a range holding a GPU-owned page must not take the stream path");
+  // CPU-dirty page next to the GPU one.
+  tracker.MarkRegionAsCpuModified(address + 2 * page_size, page_size);
+  Check(agree(address + 2 * page_size, page_size, "fused query disagrees on a CPU page"),
+        "a CPU-dirty page must take the stream path");
+  Check(!agree(address, page_size * 4, "fused query disagrees on CPU+GPU range"),
+        "CPU+GPU range must stay off the stream path");
+  tracker.UnmarkRegionAsGpuModified(address + page_size, page_size);
+  Check(agree(address, page_size * 4, "fused query disagrees after GPU release"),
+        "after the GPU page is released the CPU-dirty page qualifies");
+  tracker.MarkRegionAsCpuModified(address, page_size * 4);
+  tracker.UntrackMemory(address, page_size * 4);
+  Release(memory);
+}
+
 int main(int argc, char **argv) {
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
@@ -1490,6 +1537,7 @@ int main(int argc, char **argv) {
   setenv("KYTY_HOT_DEMOTE_SYNCS", "3", 1); // read once, by the first sync that sees a hot page
   TestGpuWriteTicksMatchesMap();
   TestSlotVectorPaged();
+  TestFusedCpuNotGpuQuery();
   TestGuestRange();
   TestRangeSet();
   TestHotPageSnapshotHash();

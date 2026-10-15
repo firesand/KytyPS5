@@ -26,6 +26,9 @@ public:
 
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// IsRegionCpuModified(...) && !IsRegionGpuModified(...) with one lock acquisition per region
+	// instead of two (BufferCache::ObtainBuffer's stream-path test, hot on the GPU thread).
+	[[nodiscard]] bool IsRegionCpuModifiedNotGpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	// Marks the range GPU-modified unless a page in it is CPU-dirty; returns false and leaves the
