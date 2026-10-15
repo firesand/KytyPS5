@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
+#include "graphics/host_gpu/renderer/gpuTimestamps.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -298,18 +299,18 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 	barriers[2].offset        = dispatches.front().params_offset;
 	barriers[2].size =
 	    dispatches.back().params_offset - dispatches.front().params_offset + sizeof(Push);
-	command.pipelineBarrier(
+	{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::BarrierBuffer); command.pipelineBarrier(
 	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
 	    vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer, {}, 0,
-	    nullptr, 3, barriers, 0, nullptr);
+	    nullptr, 3, barriers, 0, nullptr); }
 	if (clear_target) {
-		command.fillBuffer(target, target_offset, target_capacity, 0);
+		{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::Fill); command.fillBuffer(target, target_offset, target_capacity, 0); }
 		barriers[1].srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 		barriers[1].dstAccessMask =
 		    vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
-		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::BarrierBuffer); command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 		                        vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 1,
-		                        &barriers[1], 0, nullptr);
+		                        &barriers[1], 0, nullptr); }
 	}
 
 	const vk::DescriptorBufferInfo source_info {source, source_descriptor_offset, source_range};
@@ -329,8 +330,8 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
 		                             static_cast<uint32_t>(writes.size()), writes.data());
 		command.bindPipeline(vk::PipelineBindPoint::eCompute, GetPipeline(dispatch.pipeline_slot));
-		command.dispatch((dispatch.push.width + 7u) / 8u, (dispatch.push.height + 7u) / 8u,
-		                 dispatch.push.depth);
+		{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::CacheDispatch); command.dispatch((dispatch.push.width + 7u) / 8u, (dispatch.push.height + 7u) / 8u,
+		                 dispatch.push.depth); }
 		if (GpuDiagnostics::Enabled()) {
 			GpuDiagnosticEvent event;
 			event.kind = "utility-tiler";
@@ -344,9 +345,9 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eMemoryRead;
-	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+	{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::BarrierGlobal); command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
 	                        vk::PipelineStageFlagBits::eAllCommands, {}, 0, nullptr, 1,
-	                        &barriers[1], 0, nullptr);
+	                        &barriers[1], 0, nullptr); }
 }
 
 TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
@@ -522,9 +523,9 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 	                            vk::AccessFlagBits::eTransferWrite |
 	                            vk::AccessFlagBits::eShaderWrite;
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
-	command.pipelineBarrier(
+	{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::BarrierBuffer); command.pipelineBarrier(
 	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
-	    vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 2, barriers, 0, nullptr);
+	    vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 2, barriers, 0, nullptr); }
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
 	const auto& limits              = m_graphics.GetPhysicalDeviceProperties().limits;
 	const auto descriptor_alignment = std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
@@ -581,7 +582,7 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 			push.slice_bytes = static_cast<uint32_t>(layout.target_row_stride);
 			command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
 			                      sizeof(push), &push);
-			command.dispatch(static_cast<uint32_t>(groups_x), rows, 1);
+			{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::CacheDispatch); command.dispatch(static_cast<uint32_t>(groups_x), rows, 1); }
 			if (GpuDiagnostics::Enabled()) {
 				GpuDiagnosticEvent event;
 				event.kind = "utility-depth-conversion";
@@ -594,9 +595,9 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 	}
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eMemoryRead;
-	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+	{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::BarrierGlobal); command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
 	                        vk::PipelineStageFlagBits::eAllCommands, {}, 0, nullptr, 1,
-	                        &barriers[1], 0, nullptr);
+	                        &barriers[1], 0, nullptr); }
 }
 
 void TileManager::TransformColor(Result input, Result output, ColorTransform transform,
@@ -654,9 +655,9 @@ void TileManager::TransformColor(Result input, Result output, ColorTransform tra
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eShaderWrite;
 	m_scheduler.EndRendering();
 	auto command = m_scheduler.Current().Handle();
-	command.pipelineBarrier(
+	{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::BarrierBuffer); command.pipelineBarrier(
 	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
-	    vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 2, barriers, 0, nullptr);
+	    vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 2, barriers, 0, nullptr); }
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_color_transform);
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
 	                             static_cast<uint32_t>(writes.size()), writes.data());
@@ -668,7 +669,7 @@ void TileManager::TransformColor(Result input, Result output, ColorTransform tra
 	push.to_host         = to_host;
 	command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
 	                      &push);
-	command.dispatch((pixels + 63u) / 64u, 1, 1);
+	{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::CacheDispatch); command.dispatch((pixels + 63u) / 64u, 1, 1); }
 	if (GpuDiagnostics::Enabled()) {
 		GpuDiagnosticEvent event;
 		event.kind = "utility-color-transform";
@@ -679,9 +680,9 @@ void TileManager::TransformColor(Result input, Result output, ColorTransform tra
 	}
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eTransferRead;
-	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+	{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::BarrierGlobal); command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
 	                        vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &barriers[1],
-	                        0, nullptr);
+	                        0, nullptr); }
 }
 
 TileManager::Result TileManager::TransformColor(Result input, ColorTransform transform,

@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "graphics/host_gpu/renderer/gpuTimestamps.h"
 #include "common/common.h"
 #include "common/profiler.h"
 #include "common/threads.h"
@@ -103,7 +104,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pColorAttachments    = colors.data();
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
-	Handle().beginRendering(rendering);
+	{ GpuTimestampScope ts_scope(Handle(), GpuTimestamps::Kind::RenderPass); Handle().beginRendering(rendering); }
 	m_render_state = state;
 	m_rendering    = true;
 }
@@ -112,7 +113,7 @@ void CommandBuffer::EndRendering() const {
 	if (!m_rendering) {
 		return;
 	}
-	Handle().endRendering();
+	{ GpuTimestampScope ts_scope(Handle(), GpuTimestamps::Kind::RenderPass); Handle().endRendering(); }
 	m_rendering    = false;
 	m_render_state = {};
 }

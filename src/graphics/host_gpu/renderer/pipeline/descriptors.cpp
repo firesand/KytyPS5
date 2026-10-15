@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "graphics/host_gpu/renderer/gpuTimestamps.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -1188,11 +1189,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		if (descriptors.gds.buffer != nullptr) {
 			buffer.EndRendering();
 			const auto barrier = MakeGdsDependency(descriptors.gds.buffer);
-			vk_buffer.pipelineBarrier(
+			{ GpuTimestampScope ts_scope(vk_buffer, GpuTimestamps::Kind::BarrierBuffer); vk_buffer.pipelineBarrier(
 			    vk::PipelineStageFlagBits::eHost | vk::PipelineStageFlagBits::eTransfer |
 			        vk::PipelineStageFlagBits::eAllGraphics |
 			        vk::PipelineStageFlagBits::eComputeShader,
-			    shader_stages, vk::DependencyFlags {}, 0, nullptr, 1, &barrier, 0, nullptr);
+			    shader_stages, vk::DependencyFlags {}, 0, nullptr, 1, &barrier, 0, nullptr); }
 		}
 
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {

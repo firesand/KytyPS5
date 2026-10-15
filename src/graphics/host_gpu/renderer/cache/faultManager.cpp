@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
+#include "graphics/host_gpu/renderer/gpuTimestamps.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -145,7 +146,7 @@ void FaultManager::Process(bool write_faults) {
 	dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
 	dependency.bufferMemoryBarrierCount = 1;
 	dependency.pBufferMemoryBarriers    = &pre_barrier;
-	command.pipelineBarrier2(dependency);
+	{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::BarrierBuffer); command.pipelineBarrier2(dependency); }
 	command.bindPipeline(vk::PipelineBindPoint::eCompute,
 	                     write_faults ? m_write_process_pipeline : m_fault_process_pipeline);
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,
@@ -153,7 +154,7 @@ void FaultManager::Process(bool write_faults) {
 	const auto num_threads    = (write_faults ? BufferCache::WRITE_FAULT_NUMPAGES
 	                                          : BufferCache::CACHING_NUMPAGES) / 32;
 	const auto num_workgroups = (num_threads + 63) / 64;
-	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
+	{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::CacheDispatch); command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1); }
 	if (GpuDiagnostics::Enabled()) {
 		GpuDiagnosticEvent event;
 		event.kind = "utility-fault-process";
@@ -164,7 +165,7 @@ void FaultManager::Process(bool write_faults) {
 		m_scheduler.RecordGpuOperation(event);
 	}
 	dependency.pBufferMemoryBarriers = &post_barrier;
-	command.pipelineBarrier2(dependency);
+	{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::BarrierBuffer); command.pipelineBarrier2(dependency); }
 
 	const auto area = current_area;
 	if (write_faults) {

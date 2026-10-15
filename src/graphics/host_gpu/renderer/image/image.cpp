@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/gpuTimestamps.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -235,7 +236,7 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	vk::DependencyInfo dependency {};
 	dependency.imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size());
 	dependency.pImageMemoryBarriers    = barriers.data();
-	command_buffer.pipelineBarrier2(dependency);
+	{ GpuTimestampScope ts_scope(command_buffer, GpuTimestamps::Kind::BarrierImage); command_buffer.pipelineBarrier2(dependency); }
 }
 
 void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
@@ -262,9 +263,9 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
 	dependency.imageMemoryBarrierCount  = static_cast<uint32_t>(image_barriers.size());
 	dependency.pImageMemoryBarriers     = image_barriers.data();
 	auto command                        = m_scheduler.Current().Handle();
-	command.pipelineBarrier2(dependency);
-	command.copyBufferToImage(buffer, backing.image, vk::ImageLayout::eTransferDstOptimal,
-	                          static_cast<uint32_t>(copies.size()), copies.data());
+	{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::BarrierImage); command.pipelineBarrier2(dependency); }
+	{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::CopyImage); command.copyBufferToImage(buffer, backing.image, vk::ImageLayout::eTransferDstOptimal,
+	                          static_cast<uint32_t>(copies.size()), copies.data()); }
 	buffer_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
 	buffer_barrier.srcAccessMask = vk::AccessFlagBits2::eTransferRead;
 	buffer_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
@@ -272,7 +273,7 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
 	    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
 	dependency.imageMemoryBarrierCount = 0;
 	dependency.pImageMemoryBarriers    = nullptr;
-	command.pipelineBarrier2(dependency);
+	{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::BarrierImage); command.pipelineBarrier2(dependency); }
 	Transit(vk::ImageLayout::eGeneral,
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
@@ -302,9 +303,9 @@ void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buf
 	dependency.imageMemoryBarrierCount  = static_cast<uint32_t>(image_barriers.size());
 	dependency.pImageMemoryBarriers     = image_barriers.data();
 	auto command                        = m_scheduler.Current().Handle();
-	command.pipelineBarrier2(dependency);
-	command.copyImageToBuffer(backing.image, vk::ImageLayout::eTransferSrcOptimal, buffer,
-	                          static_cast<uint32_t>(copies.size()), copies.data());
+	{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::BarrierImage); command.pipelineBarrier2(dependency); }
+	{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::CopyImage); command.copyImageToBuffer(backing.image, vk::ImageLayout::eTransferSrcOptimal, buffer,
+	                          static_cast<uint32_t>(copies.size()), copies.data()); }
 	buffer_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eCopy;
 	buffer_barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
 	buffer_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
@@ -312,7 +313,7 @@ void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buf
 	    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
 	dependency.imageMemoryBarrierCount = 0;
 	dependency.pImageMemoryBarriers    = nullptr;
-	command.pipelineBarrier2(dependency);
+	{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::BarrierImage); command.pipelineBarrier2(dependency); }
 }
 
 std::pair<uint32_t, uint32_t> Image::SanitizeCopyLayers(const Image& source,
@@ -388,9 +389,9 @@ void Image::CopyImage(Image& source) {
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
-	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
+	{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::CopyImage); command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
 	                  vk::ImageLayout::eTransferDstOptimal, static_cast<uint32_t>(copies.size()),
-	                  copies.data());
+	                  copies.data()); }
 	Transit(vk::ImageLayout::eGeneral,
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
@@ -439,8 +440,8 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 		                         resolved_destination_range.base_level,
 		                         resolved_destination_range.base_layer, layers};
 		region.extent         = resolve_extent;
-		command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
-		                  vk::ImageLayout::eTransferDstOptimal, region);
+		{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::CopyImage); command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
+		                  vk::ImageLayout::eTransferDstOptimal, region); }
 	} else {
 		vk::ImageResolve region {};
 		region.srcSubresource = {vk::ImageAspectFlagBits::eColor, resolved_source_range.base_level,
@@ -449,8 +450,8 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 		                         resolved_destination_range.base_level,
 		                         resolved_destination_range.base_layer, layers};
 		region.extent         = resolve_extent;
-		command.resolveImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
-		                     backing.image, vk::ImageLayout::eTransferDstOptimal, region);
+		{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::CopyImage); command.resolveImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+		                     backing.image, vk::ImageLayout::eTransferDstOptimal, region); }
 	}
 }
 
@@ -540,10 +541,10 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 				barrier.size          = copy_size;
 				barrier.srcAccessMask = vk::AccessFlagBits2::eTransferRead;
 				barrier.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
-				command.pipelineBarrier2(dependency);
-				command.copyImageToBuffer(source.backing.image,
+				{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::BarrierGlobal); command.pipelineBarrier2(dependency); }
+				{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::CopyImage); command.copyImageToBuffer(source.backing.image,
 				                          vk::ImageLayout::eTransferSrcOptimal, buffer.Handle(),
-				                          source_copy);
+				                          source_copy); }
 				if (source_transform != target_transform) {
 					const TileManager::Result bytes {buffer.Handle(), 0, copy_size};
 					if (source_transform != ColorTransform::None) {
@@ -555,10 +556,10 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 				} else {
 					barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
 					barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
-					command.pipelineBarrier2(dependency);
+					{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::BarrierGlobal); command.pipelineBarrier2(dependency); }
 				}
-				command.copyBufferToImage(buffer.Handle(), backing.image,
-				                          vk::ImageLayout::eTransferDstOptimal, destination_copy);
+				{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::CopyImage); command.copyBufferToImage(buffer.Handle(), backing.image,
+				                          vk::ImageLayout::eTransferDstOptimal, destination_copy); }
 			}
 		}
 	}
@@ -593,8 +594,8 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
-	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
-	                  vk::ImageLayout::eTransferDstOptimal, copy_count, copies.data());
+	{ GpuTimestampScope ts_scope(command, GpuTimestamps::Kind::CopyImage); command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
+	                  vk::ImageLayout::eTransferDstOptimal, copy_count, copies.data()); }
 	Transit(vk::ImageLayout::eGeneral,
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }

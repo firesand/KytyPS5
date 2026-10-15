@@ -13,15 +13,34 @@
 namespace Libs::Graphics {
 
 namespace {
-const char* KindName(uint8_t kind) {
-	switch (static_cast<GpuTimestamps::Kind>(kind)) {
-		case GpuTimestamps::Kind::Draw: return "draw";
-		case GpuTimestamps::Kind::Dispatch: return "dispatch";
-		case GpuTimestamps::Kind::DispatchIndirect: return "dispatch-indirect";
-		default: return "?";
-	}
+constexpr size_t MaxInstances = 4;
+std::atomic<GpuTimestamps*> g_instances[MaxInstances] {};
+const char* const KindNames[] = {"draw",       "dispatch",   "dispatch-indirect", "barrier-global",
+                                 "barrier-buffer", "barrier-image", "copy-upload", "copy-image",
+                                 "blit",       "fill",       "clear",            "cache-dispatch",
+                                 "renderpass"};
+static_assert(sizeof(KindNames) / sizeof(KindNames[0]) ==
+              static_cast<size_t>(GpuTimestamps::Kind::Count));
+const char* KindNameOf(uint8_t kind) {
+	return kind < static_cast<uint8_t>(GpuTimestamps::Kind::Count) ? KindNames[kind] : "?";
 }
 } // namespace
+
+const char* GpuTimestamps::KindName(Kind kind) {
+	return KindNameOf(static_cast<uint8_t>(kind));
+}
+
+GpuTimestamps* GpuTimestamps::ForCommand(vk::CommandBuffer command) noexcept {
+	for (auto& slot: g_instances) {
+		auto* instance = slot.load(std::memory_order_acquire);
+		if (instance != nullptr &&
+		    instance->m_recording.load(std::memory_order_acquire) ==
+		        static_cast<VkCommandBuffer>(command)) {
+			return instance;
+		}
+	}
+	return nullptr;
+}
 
 bool GpuTimestamps::Enabled() noexcept {
 	static const bool enabled = [] {
@@ -58,11 +77,19 @@ GpuTimestamps::GpuTimestamps(GraphicContext& graphics): m_graphics(graphics) {
 	}
 	m_results.resize(QueriesPerSlot);
 	m_last_dump = std::chrono::steady_clock::now();
+	for (auto& slot: g_instances) {
+		GpuTimestamps* expected = nullptr;
+		if (slot.compare_exchange_strong(expected, this)) break;
+	}
 	LOGF("GpuTime: enabled, %u slots x %u queries, period %.3f ns, validBits %u\n", SlotCount,
 	     QueriesPerSlot, m_period_ns, bits);
 }
 
 GpuTimestamps::~GpuTimestamps() {
+	for (auto& slot: g_instances) {
+		GpuTimestamps* expected = this;
+		slot.compare_exchange_strong(expected, nullptr);
+	}
 	if (m_pool != nullptr) {
 		m_graphics.device.destroyQueryPool(m_pool, nullptr);
 	}
@@ -74,6 +101,8 @@ void GpuTimestamps::BeginCommand(vk::CommandBuffer command, uint64_t tick,
 	std::lock_guard lock(m_mutex);
 	m_current = -1;
 	m_op_open = false;
+	m_depth   = 0;
+	m_recording.store(static_cast<VkCommandBuffer>(command), std::memory_order_release);
 	auto find = [this] {
 		for (uint32_t i = 0; i < SlotCount; ++i) {
 			if (m_slots[i].state == SlotState::Free) return static_cast<int>(i);
@@ -105,18 +134,25 @@ void GpuTimestamps::BeginCommand(vk::CommandBuffer command, uint64_t tick,
 void GpuTimestamps::EndCommand(vk::CommandBuffer command) {
 	if (!Valid()) return;
 	std::lock_guard lock(m_mutex);
-	if (m_current < 0) return;
+	if (m_current < 0) {
+		m_recording.store(nullptr, std::memory_order_release);
+		return;
+	}
 	auto& slot = m_slots[static_cast<size_t>(m_current)];
 	command.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, m_pool,
 	                       static_cast<uint32_t>(m_current) * QueriesPerSlot + 1);
 	slot.state = SlotState::Pending;
 	m_current  = -1;
 	m_op_open  = false;
+	m_depth    = 0;
+	m_recording.store(nullptr, std::memory_order_release);
 }
 
 void GpuTimestamps::BeginOp(vk::CommandBuffer command, Kind kind, uint64_t hash, uint64_t hash2) {
 	if (!Valid()) return;
 	std::lock_guard lock(m_mutex);
+	// Nested scopes (a copy helper that issues its own barrier) fold into the outermost one.
+	if (m_depth++ != 0) return;
 	m_op_open = false;
 	if (m_current < 0) return;
 	auto& slot = m_slots[static_cast<size_t>(m_current)];
@@ -133,6 +169,7 @@ void GpuTimestamps::BeginOp(vk::CommandBuffer command, Kind kind, uint64_t hash,
 void GpuTimestamps::EndOp(vk::CommandBuffer command) {
 	if (!Valid()) return;
 	std::lock_guard lock(m_mutex);
+	if (m_depth == 0 || --m_depth != 0) return;
 	if (!m_op_open || m_current < 0) return;
 	auto&          slot  = m_slots[static_cast<size_t>(m_current)];
 	const uint32_t query = static_cast<uint32_t>(m_current) * QueriesPerSlot + slot.used + 1;
@@ -166,9 +203,11 @@ void GpuTimestamps::HarvestLocked(uint64_t completed_tick) {
 		for (const auto& op : slot.ops) {
 			const uint64_t ns = delta(m_results[op.query], m_results[op.query + 1]);
 			sum += ns;
-			auto& shader = m_acc.shaders[{static_cast<uint8_t>(op.kind), op.hash, op.hash2}];
-			shader.ns += ns;
-			++shader.count;
+			if (HasShader(op.kind) || op.hash != 0) {
+				auto& shader = m_acc.shaders[{static_cast<uint8_t>(op.kind), op.hash, op.hash2}];
+				shader.ns += ns;
+				++shader.count;
+			}
 			auto& kind = m_acc.kinds[static_cast<size_t>(op.kind)];
 			kind.ns += ns;
 			++kind.count;
@@ -212,21 +251,38 @@ std::string GpuTimestamps::Format(const Snapshot& s) {
 		if (kind == static_cast<uint8_t>(Kind::Draw)) {
 			std::snprintf(buffer, sizeof(buffer),
 			              " %016" PRIx64 "/%016" PRIx64 " %s %.2f (%" PRIu64 ")",
-			              std::get<1>(key), std::get<2>(key), KindName(kind),
+			              std::get<1>(key), std::get<2>(key), KindNameOf(kind),
 			              static_cast<double>(entry.ns) / 1e6, entry.count);
 		} else {
 			std::snprintf(buffer, sizeof(buffer), " %016" PRIx64 " %s %.2f (%" PRIu64 ")",
-			              std::get<1>(key), KindName(kind), static_cast<double>(entry.ns) / 1e6,
+			              std::get<1>(key), KindNameOf(kind), static_cast<double>(entry.ns) / 1e6,
 			              entry.count);
 		}
 		line += buffer;
 	}
-	line += " | kinds:";
+	// Everything that is not a draw/dispatch, sorted by time: cost per command = ms / count.
+	std::vector<std::pair<size_t, Entry>> others;
 	for (size_t k = 0; k < s.kinds.size(); ++k) {
+		if (!HasShader(static_cast<Kind>(k)) && s.kinds[k].count != 0) {
+			others.push_back({k, s.kinds[k]});
+		}
+	}
+	std::sort(others.begin(), others.end(),
+	          [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+	line += " | other:";
+	for (const auto& [k, entry]: others) {
 		std::snprintf(buffer, sizeof(buffer), " %s %.2f (%" PRIu64 ")",
-		              KindName(static_cast<uint8_t>(k)), static_cast<double>(s.kinds[k].ns) / 1e6,
-		              s.kinds[k].count);
+		              KindNameOf(static_cast<uint8_t>(k)), static_cast<double>(entry.ns) / 1e6,
+		              entry.count);
 		line += buffer;
+	}
+	for (size_t k = 0; k < s.kinds.size(); ++k) {
+		if (HasShader(static_cast<Kind>(k))) {
+			std::snprintf(buffer, sizeof(buffer), " | %s %.2f (%" PRIu64 ")",
+			              KindNameOf(static_cast<uint8_t>(k)),
+			              static_cast<double>(s.kinds[k].ns) / 1e6, s.kinds[k].count);
+			line += buffer;
+		}
 	}
 	line += "\n";
 	return line;
@@ -253,6 +309,16 @@ GpuTimestampScope::GpuTimestampScope(CommandScheduler& scheduler, vk::CommandBuf
 	if (!GpuTimestamps::Enabled()) return;
 	auto* timestamps = scheduler.Timestamps();
 	if (timestamps == nullptr || !timestamps->Valid()) return;
+	m_timestamps = timestamps;
+	m_timestamps->BeginOp(command, kind, hash, hash2);
+}
+
+GpuTimestampScope::GpuTimestampScope(vk::CommandBuffer command, GpuTimestamps::Kind kind,
+                                     uint64_t hash, uint64_t hash2) noexcept
+    : m_command(command) {
+	if (!GpuTimestamps::Enabled()) return;
+	auto* timestamps = GpuTimestamps::ForCommand(command);
+	if (timestamps == nullptr) return;
 	m_timestamps = timestamps;
 	m_timestamps->BeginOp(command, kind, hash, hash2);
 }

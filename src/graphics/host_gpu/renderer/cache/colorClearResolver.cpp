@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/colorClearResolver.h"
+#include "graphics/host_gpu/renderer/gpuTimestamps.h"
 
 #include "gpu_tiler_shaders/color_clear_check_spv.h"
 #include "common/alignment.h"
@@ -130,7 +131,7 @@ void ColorClearResolver::Resolve(CommandBuffer& command, const Request& request)
 		vk::DependencyInfo dependency {};
 		dependency.bufferMemoryBarrierCount = 2;
 		dependency.pBufferMemoryBarriers    = barriers;
-		cmd.pipelineBarrier2(dependency);
+		{ GpuTimestampScope ts_scope(cmd, GpuTimestamps::Kind::BarrierBuffer); cmd.pipelineBarrier2(dependency); }
 	}
 
 	cmd.bindPipeline(vk::PipelineBindPoint::eCompute, m_pipeline);
@@ -148,7 +149,7 @@ void ColorClearResolver::Resolve(CommandBuffer& command, const Request& request)
 	cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0, writes);
 	const CheckPush push {request.slice_bytes / 4u, request.slice_count, request.valid_mask, 0u};
 	cmd.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
-	cmd.dispatch(request.slice_count, 1, 1);
+	{ GpuTimestampScope ts_scope(cmd, GpuTimestamps::Kind::CacheDispatch); cmd.dispatch(request.slice_count, 1, 1); }
 
 	// Flags feed the predicates; the expanded metadata is visible to everything after.
 	{
@@ -169,7 +170,7 @@ void ColorClearResolver::Resolve(CommandBuffer& command, const Request& request)
 		vk::DependencyInfo dependency {};
 		dependency.bufferMemoryBarrierCount = 2;
 		dependency.pBufferMemoryBarriers    = barriers;
-		cmd.pipelineBarrier2(dependency);
+		{ GpuTimestampScope ts_scope(cmd, GpuTimestamps::Kind::BarrierBuffer); cmd.pipelineBarrier2(dependency); }
 	}
 
 	vk::RenderingAttachmentInfo attachment {};
@@ -182,6 +183,7 @@ void ColorClearResolver::Resolve(CommandBuffer& command, const Request& request)
 	rendering.layerCount           = request.slice_count;
 	rendering.colorAttachmentCount = 1;
 	rendering.pColorAttachments    = &attachment;
+	GpuTimestampScope clear_scope(cmd, GpuTimestamps::Kind::Clear);
 	cmd.beginRendering(&rendering);
 	for (uint32_t slice = 0; slice < request.slice_count; ++slice) {
 		for (uint32_t code = 0; code < CodeSlots; ++code) {

@@ -5,6 +5,8 @@
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <array>
+#include <atomic>
+#include <string>
 #include <chrono>
 #include <cstdint>
 #include <map>
@@ -22,10 +24,32 @@ namespace Libs::Graphics {
 // bounded by the span and the remainder is "unattributed" (barriers, copies, idle waits).
 class GpuTimestamps {
 public:
-	enum class Kind : uint8_t { Draw = 0, Dispatch = 1, DispatchIndirect = 2, Count = 3 };
+	enum class Kind : uint8_t {
+		Draw = 0,
+		Dispatch,
+		DispatchIndirect,
+		BarrierGlobal,
+		BarrierBuffer,
+		BarrierImage,
+		CopyUpload,
+		CopyImage,
+		Blit,
+		Fill,
+		Clear,
+		CacheDispatch,
+		RenderPass,
+		Count
+	};
+	// Kinds that carry a shader hash and appear in the "top" list.
+	static bool HasShader(Kind kind) noexcept {
+		return kind == Kind::Draw || kind == Kind::Dispatch || kind == Kind::DispatchIndirect;
+	}
+	static const char* KindName(Kind kind);
+	// The instance currently recording into this command buffer, or null.
+	static GpuTimestamps* ForCommand(vk::CommandBuffer command) noexcept;
 
-	static constexpr uint32_t SlotCount      = 16;
-	static constexpr uint32_t QueriesPerSlot = 8192;
+	static constexpr uint32_t SlotCount      = 32;
+	static constexpr uint32_t QueriesPerSlot = 16384;
 	static constexpr uint32_t TopEntries     = 12;
 
 	struct Entry {
@@ -97,6 +121,8 @@ private:
 	std::mutex                            m_mutex;
 	std::array<Slot, SlotCount>           m_slots;
 	int                                   m_current  = -1;
+	uint32_t                              m_depth    = 0;
+	std::atomic<VkCommandBuffer>          m_recording {nullptr};
 	bool                                  m_op_open  = false;
 	Snapshot                              m_acc;
 	std::chrono::steady_clock::time_point m_last_dump {};
@@ -110,6 +136,9 @@ class GpuTimestampScope {
 public:
 	GpuTimestampScope(CommandScheduler& scheduler, vk::CommandBuffer command,
 	                  GpuTimestamps::Kind kind, uint64_t hash, uint64_t hash2 = 0) noexcept;
+	// Command-buffer-only form for sites without a scheduler at hand (barriers, copies, ...).
+	GpuTimestampScope(vk::CommandBuffer command, GpuTimestamps::Kind kind, uint64_t hash = 0,
+	                  uint64_t hash2 = 0) noexcept;
 	~GpuTimestampScope();
 	GpuTimestampScope(const GpuTimestampScope&)            = delete;
 	GpuTimestampScope& operator=(const GpuTimestampScope&) = delete;
