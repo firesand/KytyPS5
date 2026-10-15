@@ -11940,6 +11940,30 @@ public:
                       Hex(actual[i]));
         }
       }
+      // Cross-command-buffer WAR: a draw records only `read_stages |= eAllGraphics`
+      // (RenderExecutor::ExecutePreparedDraw); the tracker state is set as that draw sets it
+      // because no fixture draw is reachable from this harness. Submitting the buffer must resolve
+      // that read (CommandBuffer::End), since the next buffer's writing dispatch cannot see it.
+      {
+        scheduler.Finish();
+        scheduler.CheckActive();
+        close_window();
+        scheduler.Current().Hazards().read_stages |= vk::PipelineStageFlagBits::eAllGraphics;
+        scheduler.Flush();
+        store(x_address, 0x5au); // first writing dispatch of the next command buffer
+        if (counted) {
+          close_window();
+          expect("graphics read resolved at the buffer end", Probe::FlushSubmit, 1, 0);
+          expect("no dispatch barrier in the next buffer", Probe::DispatchDirect, 0, 1);
+        }
+        cache.ReadMemory(x_address, 4);
+        u32 x = 0;
+        Require(name, "cross-buffer readback",
+                LibKernel::Memory::TryReadBacking(x_address, &x, sizeof(x)),
+                "cross-buffer result could not be read back");
+        Require(name, "cross-buffer WAR result", x == 0x5au,
+                "X holds " + Hex(x) + ", expected 0x5a");
+      }
       context.UnmapMemory(base, allocation_size);
       scheduler.Finish();
     });
@@ -46343,6 +46367,7 @@ int main(int argc, char **argv) {
     setenv("KYTY_LAZY_BARRIERS", "1", 0); // an explicit 0/2 from the caller wins
     VulkanHarness vulkan;
     vulkan.CheckLazyBarriers();
+    vulkan.CheckRasterization(false); // draw-hazard leg (mode 1) lives here
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--htile-clear-only") == 0) {
