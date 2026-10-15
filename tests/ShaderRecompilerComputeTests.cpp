@@ -290,6 +290,24 @@ struct TextureCacheTestAccess {
     return result;
   }
 
+  // InvalidateMemoryFromGPU's candidate set for a large write: the all-slots scan and the
+  // page-table query must return the same images.
+  static std::vector<ImageId> WriteOverlaps(TextureCache &cache, uint64_t address,
+                                            uint64_t size, bool use_page_table) {
+    std::lock_guard lock(cache.m_lock);
+    std::vector<ImageId> ids;
+    for (const auto &entry :
+         cache.CollectWriteOverlaps(address, size, use_page_table)) {
+      ids.push_back(entry.second);
+    }
+    std::sort(ids.begin(), ids.end());
+    return ids;
+  }
+
+  static bool PageQueryFits(uint64_t address, uint64_t size) {
+    return TextureCache::WriteOverlapPageQueryFits(address, size);
+  }
+
   static size_t PageOwnerCount(TextureCache &cache, uint64_t address) {
     std::lock_guard lock(cache.m_lock);
     const auto *owners = cache.m_image_page_table.Find(static_cast<size_t>(
@@ -5635,6 +5653,72 @@ public:
               TextureCacheTestAccess::PageOwnerCount(
                   texture_cache, shared_info.data.address) == 0,
               "the final shared owner remained registered");
+
+      {
+        // InvalidateMemoryFromGPU candidate set: slot scan == page-table query, including
+        // exact aliases (two images on the same bytes), page-straddling neighbours, exact-end
+        // adjacency and ranges that touch an image's 1 MiB page without sharing a byte.
+        const auto big_a = TextureCacheTestAccess::InsertImage(
+            texture_cache, MakeOwnershipInfo(base + 0x100000, 0x300000));
+        const auto big_b = TextureCacheTestAccess::InsertImage(
+            texture_cache, MakeOwnershipInfo(base + 0x100000, 0x300000));
+        const auto straddle = TextureCacheTestAccess::InsertImage(
+            texture_cache, MakeOwnershipInfo(base + 0x2ff000, 0x2000));
+        const auto adjacent = TextureCacheTestAccess::InsertImage(
+            texture_cache, MakeOwnershipInfo(base + 0x400000, 0x1000));
+        const auto tiny = TextureCacheTestAccess::InsertImage(
+            texture_cache, MakeOwnershipInfo(base + 0x600000, 0x1000));
+        const auto deleted = TextureCacheTestAccess::InsertImage(
+            texture_cache, MakeOwnershipInfo(base + 0x700000, 0x80000));
+        TextureCacheTestAccess::DeleteImage(texture_cache, deleted);
+        struct Range {
+          uint64_t address;
+          uint64_t size;
+        };
+        const Range ranges[] = {
+            {base, 0x1000000},           // every live image
+            {base + 0x180000, 0x80000},  // inside the alias pair
+            {base + 0x3ff000, 0x2000},   // alias pair + straddle + adjacent
+            {base + 0x400000, 0x1000},   // exact end of the pair: only the neighbour
+            {base + 0x401000, 0x10000},  // same MiB page as `adjacent`, no byte shared
+            {base + 0x2ff800, 0x100},    // pair + straddle
+            {base + 0x5f0000, 0x20000},  // reaches `tiny`
+            {base + 0x4fffff, 0x100001}, // ends one byte before `tiny`
+            {base + 0x700000, 0x80000},  // deleted image left no membership
+            {base + 0x2000000, 0x20000}, // empty region
+        };
+        for (const auto &range : ranges) {
+          const auto scan = TextureCacheTestAccess::WriteOverlaps(
+              texture_cache, range.address, range.size, false);
+          const auto pages = TextureCacheTestAccess::WriteOverlaps(
+              texture_cache, range.address, range.size, true);
+          Require(name, "InvalidateMemoryFromGPU candidate sets",
+                  TextureCacheTestAccess::PageQueryFits(range.address, range.size) &&
+                      scan == pages,
+                  "slot scan and page-table query found different images");
+        }
+        const auto pair_set = TextureCacheTestAccess::WriteOverlaps(
+            texture_cache, base + 0x180000, 0x80000, true);
+        const auto adjacent_set = TextureCacheTestAccess::WriteOverlaps(
+            texture_cache, base + 0x400000, 0x1000, true);
+        const auto touch_only = TextureCacheTestAccess::WriteOverlaps(
+            texture_cache, base + 0x401000, 0x10000, true);
+        const auto deleted_set = TextureCacheTestAccess::WriteOverlaps(
+            texture_cache, base + 0x700000, 0x80000, true);
+        Require(name, "InvalidateMemoryFromGPU candidate contents",
+                pair_set.size() == 2 &&
+                    std::find(pair_set.begin(), pair_set.end(), big_a) != pair_set.end() &&
+                    std::find(pair_set.begin(), pair_set.end(), big_b) != pair_set.end() &&
+                    IsOnlyImage(adjacent_set, adjacent) && touch_only.empty() &&
+                    deleted_set.empty(),
+                "alias, adjacency or deletion semantics of the candidate set changed");
+        Require(name, "InvalidateMemoryFromGPU huge ranges use the scan",
+                !TextureCacheTestAccess::PageQueryFits(base, 1ull << 40),
+                "an unbounded write range must not walk the page table");
+        for (const auto id : {big_a, big_b, straddle, adjacent, tiny}) {
+          TextureCacheTestAccess::DeleteImage(texture_cache, id);
+        }
+      }
 
       constexpr uint64_t large_owner_size = 64ull * 1024 * 1024;
       const auto large_info =

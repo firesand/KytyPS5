@@ -172,6 +172,11 @@ private:
 	// Caller holds m_lock; it also serializes the per-image query epoch.
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
 	                                               bool page_overlap) const;
+	// Registered images overlapping the byte range, (tick_accessed_last, id), unsorted; the slot scan
+	// and the page-table query return the same set (see the definition). Caller holds m_lock.
+	[[nodiscard]] std::vector<std::pair<uint64_t, ImageId>> CollectWriteOverlaps(
+	    uint64_t address, uint64_t size, bool use_page_table) const;
+	[[nodiscard]] static bool WriteOverlapPageQueryFits(uint64_t address, uint64_t size);
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
 	                                           ImageId cached, ImageId merged);
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,

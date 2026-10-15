@@ -2480,6 +2480,37 @@ bool TextureCache::HasGpuOwnedImageIn(uint64_t address, uint64_t size) {
 	return false;
 }
 
+// Registered images whose bytes overlap [address, address + size), as (tick_accessed_last, id).
+// The scan visits every image slot; the page-table query visits only the 1 MiB pages of the range.
+// Both return the same set: RegisterImage adds an image to every page of info.data (and
+// UnregisterImage removes it, EXITing on a missing membership), the page query filters by the same
+// exact-byte Image::Overlaps, and only registered images are ever in the page table.
+// Texture-cache lock held.
+std::vector<std::pair<uint64_t, ImageId>> TextureCache::CollectWriteOverlaps(
+    uint64_t address, uint64_t size, bool use_page_table) const {
+	std::vector<std::pair<uint64_t, ImageId>> result;
+	if (use_page_table) {
+		for (const auto id: FindImagesInRegion(address, size, false)) {
+			result.emplace_back(m_slot_images[id].tick_accessed_last, id);
+		}
+	} else {
+		m_slot_images.ForEach([&](ImageId id, const Image& image) {
+			if (image.registered && image.Overlaps(address, size)) {
+				result.emplace_back(image.tick_accessed_last, id);
+			}
+		});
+	}
+	return result;
+}
+
+bool TextureCache::WriteOverlapPageQueryFits(uint64_t address, uint64_t size) {
+	// A page walk costs about one table lookup per 1 MiB; keep huge unbounded writes on the scan.
+	constexpr uint64_t MaxPages = 256;
+	ImagePageTable::PageRange pages {};
+	return ImagePageTable::TryGetPageRange(address, size, pages) &&
+	       pages.last_exclusive - pages.first <= MaxPages;
+}
+
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, bool write_pending,
                                            std::span<const std::pair<uint64_t, uint64_t>> recorded,
                                            GpuWriteCoverage coverage) {
@@ -2499,12 +2530,8 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, bool
 	// the buffer last and wins. This is not a per-byte authority proof among image aliases.
 	std::vector<std::pair<uint64_t, ImageId>> ordered;
 	if (overlap && size > SmallWrite) {
-		// Bounded by cached image slots, not by the number of guest pages in a large write range.
-		m_slot_images.ForEach([&](ImageId id, const Image& image) {
-			if (image.registered && image.Overlaps(address, size)) {
-				ordered.emplace_back(image.tick_accessed_last, id);
-			}
-		});
+		// Bounded by cached image slots (scan) or by the 1 MiB pages of the range (page table).
+		ordered = CollectWriteOverlaps(address, size, WriteOverlapPageQueryFits(address, size));
 	} else {
 		for (const auto id: FindImagesInRegion(address, overlap ? size : 1, true)) {
 			ordered.emplace_back(m_slot_images[id].tick_accessed_last, id);
