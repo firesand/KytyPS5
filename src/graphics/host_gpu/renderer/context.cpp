@@ -70,7 +70,8 @@ void CommandBuffer::End() const {
 	EndRendering();
 	// The unconditional post-dispatch barrier also ordered a command buffer's last shader writes
 	// before the next submission; resolve whatever is still pending before the buffer closes.
-	if (LazyBarriersActive() && m_hazards.NeedsExternalFlush()) {
+	// Graphics reads are included: the next buffer's writing dispatch must be ordered after them.
+	if (LazyBarriersActive() && (m_hazards.NeedsExternalFlush() || m_hazards.read_stages)) {
 		FlushHazards(BarrierProbe::FlushSubmit);
 	}
 	auto buffer = RawHandle();
