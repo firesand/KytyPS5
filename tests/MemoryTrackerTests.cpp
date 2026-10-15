@@ -1,4 +1,5 @@
 #include "common/hostException.h"
+#include "common/slotVector.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
@@ -1433,6 +1434,49 @@ void TestGpuWriteTicksMatchesMap() {
   Check(zero.Note(7, 9) && zero.Note(7, 3) && zero.Get(7) == 9, "stamp must be monotonic");
 }
 
+// SlotVector (paged storage): stable addresses across growth, generation checks, free-list reuse and
+// index-ordered ForEach, across several 4096-entry pages.
+void TestSlotVectorPaged() {
+  struct Item {
+    explicit Item(int v) : value(v) {}
+    Item(const Item &) = delete;
+    int value;
+  };
+  Common::SlotVector<Item> slots;
+  std::vector<Common::SlotId> ids;
+  std::vector<const Item *> addresses;
+  constexpr int kCount = 3 * 4096 + 17;
+  for (int i = 0; i < kCount; ++i) {
+    ids.push_back(slots.insert(i));
+    addresses.push_back(&slots[ids.back()]);
+  }
+  Check(slots.size() == static_cast<size_t>(kCount) && slots.capacity() == static_cast<size_t>(kCount),
+        "slot count after inserts");
+  for (int i = 0; i < kCount; ++i) {
+    Check(slots.try_get(ids[i]) == addresses[i] && slots[ids[i]].value == i,
+          "slot address moved or value changed while growing");
+  }
+  for (int i = 0; i < kCount; i += 3) slots.erase(ids[i]);
+  for (int i = 0; i < kCount; ++i) {
+    Check((slots.try_get(ids[i]) != nullptr) == (i % 3 != 0), "erased slot still allocated");
+  }
+  Check(slots.try_get(Common::SlotId{}) == nullptr &&
+            slots.try_get(Common::SlotId{static_cast<uint32_t>(kCount), 1}) == nullptr,
+        "invalid ids must not resolve");
+  const auto reused = slots.insert(-1);
+  Check(reused.index == ids[kCount - 1 - ((kCount - 1) % 3)].index && reused.generation == 2,
+        "free list must reuse the last erased index with a new generation");
+  Check(slots.try_get(ids[reused.index]) == nullptr, "stale generation must not resolve");
+  int previous = -1;
+  size_t visited = 0;
+  slots.ForEach([&](Common::SlotId id, const Item &) {
+    Check(static_cast<int>(id.index) > previous, "ForEach must visit in index order");
+    previous = static_cast<int>(id.index);
+    ++visited;
+  });
+  Check(visited == slots.size(), "ForEach visit count");
+}
+
 int main(int argc, char **argv) {
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
@@ -1443,6 +1487,7 @@ int main(int argc, char **argv) {
   }
   setenv("KYTY_HOT_DEMOTE_SYNCS", "3", 1); // read once, by the first sync that sees a hot page
   TestGpuWriteTicksMatchesMap();
+  TestSlotVectorPaged();
   TestGuestRange();
   TestRangeSet();
   TestHotPageSnapshotHash();
