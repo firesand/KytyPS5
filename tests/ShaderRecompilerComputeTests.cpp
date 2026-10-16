@@ -37463,6 +37463,7 @@ TestCase ImageSampleLzOffsetNeighbourTapsCase(bool runtime_offset) {
     test.required_spirv = {"OpImageQuerySizeLod"};
   } else {
     test.required_spirv = {"ConstOffset"};
+    test.forbidden_spirv = {"OpImageQuerySizeLod"};
   }
   return test;
 }
@@ -37495,6 +37496,119 @@ void CheckSampleRuntimeOffsetNonLzFails() {
   test.has_user_data = true;
   test.compile_only = true;
   ExpectFatal("ImageSampleRuntimeOffsetNonLzFails", [&] { (void)CompileCase(test); });
+}
+#endif
+
+// Per-lane offset shapes (review F1). Wave32 x 32 threads keeps the entry exec the immediate true, so
+// the exec gate of a VGPR write folds away and per-lane SelectU32s reach the emitter bare.
+// kind 0: v_cndmask 63/1 on vcc (lanes 0-1 +1, others -1): must NOT be taken as a constant.
+// kind 1: masked v_mov (saveexec) with exec restored before the sample: not a constant either.
+// kind 2: v_mov gated by saveexec with the sample in the same exec region: ConstOffset.
+// kind 3: image_sample_d_o with an immediate offset (Grad + ConstOffset word order).
+TestCase ImageSampleLzOffsetLaneVariant(u32 kind) {
+  using O = ShaderOpcode;
+
+  const auto Bits = [](float value) {
+    u32 bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+  };
+  constexpr u32 threads = 32;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 21, 0x3f200000u); // 0.625 = centre of texel 2 of 4.
+  AppendVMovLiteral(&code, 22, 0x3f200000u);
+  if (kind == 3) {
+    AppendVMovU32(&code, 20, 1);
+    AppendVMovU32(&code, 21, 0); // dudx, dvdx, dudy, dvdy = 0
+    AppendVMovU32(&code, 22, 0);
+    AppendVMovU32(&code, 23, 0);
+    AppendVMovU32(&code, 24, 0);
+    AppendVMovLiteral(&code, 25, 0x3f200000u);
+    AppendVMovLiteral(&code, 26, 0x3f200000u);
+    code.push_back(EncodeMimg0(0x32, 0x1)); // image_sample_d_o
+    code.push_back(EncodeMimg1(1, 20));
+  } else {
+    if (kind == 0) {
+      AppendVMovU32(&code, 24, 1);
+      code.push_back(EncodeVopc(0xc4, InlineU32(2), 0)); // v_cmp_gt_u32 vcc, 2, v0
+      code.push_back(EncodeVop2(0x01, 20, InlineU32(63), 24)); // v_cndmask_b32 v20, 63, v24, vcc
+    } else if (kind == 1) {
+      AppendVMovU32(&code, 20, 63);
+      code.push_back(EncodeVopc(0xc4, InlineU32(2), 0));
+      code.push_back(EncodeSop1(0x3c, 0, 106)); // s_and_saveexec_b32 s0, vcc_lo
+      AppendVMovU32(&code, 20, 1);
+      code.push_back(EncodeSMovB32(126, 0)); // s_mov_b32 exec_lo, s0
+    } else {
+      AppendVMovU32(&code, 1, 0);
+      code.push_back(EncodeVopc(0xc4, InlineU32(2), 0));
+      code.push_back(EncodeSop1(0x3c, 0, 106));
+      AppendVMovU32(&code, 20, 1);
+    }
+    code.push_back(EncodeMimg0(0x37, 0x1)); // image_sample_lz_o
+    code.push_back(EncodeMimg1(1, 20));
+    if (kind == 2) code.push_back(EncodeSMovB32(126, 0));
+  }
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 0);
+  AppendEnd(&code);
+
+  auto image = MakeRgbaImage(4, 4);
+  for (u32 y = 0; y < 4u; y++) {
+    for (u32 x = 0; x < 4u; x++) {
+      SetRgbaPixel(&image, 4, x, y, Bits(static_cast<float>(1u + x + 4u * y)), 0, 0, 0);
+    }
+  }
+
+  static const char *const names[] = {
+      "ImageSampleLzOffsetCndmaskPerLaneOnGpu", "ImageSampleLzOffsetMaskedMovExecRestoredOnGpu",
+      "ImageSampleLzOffsetExecGatedMovConstOnGpu", "ImageSampleDerivativeOffsetConstOnGpu"};
+  TestCase test;
+  test.name = names[kind];
+  test.code = code;
+  for (u32 lane = 0; lane < threads; lane++) {
+    const bool low = lane < 2u;
+    test.expected.push_back(kind == 3 ? Bits(12.0f)
+                            : kind == 2 ? (low ? Bits(12.0f) : 0u)
+                                        : Bits(low ? 12.0f : 10.0f));
+  }
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.sampled_image_rgba = image;
+  test.compute_info.threads_num[0] = threads;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 32;
+  test.has_compute_info = true;
+  if (kind == 2 || kind == 3) test.required_spirv = {"ConstOffset"};
+  if (kind == 2) test.forbidden_spirv = {"OpImageQuerySizeLod"};
+  return test;
+}
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+// image_sample_l_o (0x34) with an SGPR offset and LOD 1.0: the runtime fold only knows level 0, so
+// it must be rejected rather than divide by the mip-0 size (review F2).
+void CheckSampleRuntimeOffsetNonZeroLodFails() {
+  std::vector<u32> code;
+  code.push_back(EncodeVop1(0x01, 20, 16)); // v_mov_b32 v20, s16
+  AppendVMovLiteral(&code, 21, 0x3e800000u);
+  AppendVMovLiteral(&code, 22, 0x3e800000u);
+  AppendVMovLiteral(&code, 23, 0x3f800000u); // LOD 1.0
+  code.push_back(EncodeMimg0(0x34, 0x1));
+  code.push_back(EncodeMimg1(0, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ImageSampleRuntimeOffsetNonZeroLodFails";
+  test.code = code;
+  test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_SAMPLE,
+                  ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+  test.sampled_image_rgba = MakeRgbaImage(4, 4);
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32_32_32_32Float);
+  test.user_data[16] = 1u;
+  test.has_user_data = true;
+  test.compile_only = true;
+  ExpectFatal("ImageSampleRuntimeOffsetNonZeroLodFails", [&] { (void)CompileCase(test); });
 }
 #endif
 
@@ -46324,7 +46438,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   if ((argc == 2 || argc == 3) && std::strcmp(argv[1], "--sample-offset-only") == 0) {
-    // Optional case index (0=A16, 1=neighbour taps, 2=runtime lz fold, 3=non-lz runtime offset must fail): a failing case aborts.
+    // Optional case index (0=A16, 1=neighbour taps, 2=runtime lz fold, 3=non-lz runtime offset must fail, 4=cndmask per lane, 5=masked mov exec restored, 6=exec-gated mov const, 7=_d_o const, 8=non-zero LOD must fail): a failing case aborts.
     const int only = argc == 3 ? std::atoi(argv[2]) : -1;
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
     if (only < 0 || only == 3) CheckSampleRuntimeOffsetNonLzFails();
@@ -46333,6 +46447,14 @@ int main(int argc, char **argv) {
     if (only < 0 || only == 0) RunCase(&vulkan, ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu());
     if (only < 0 || only == 1) RunCase(&vulkan, ImageSampleLzOffsetNeighbourTapsOnGpu());
     if (only < 0 || only == 2) RunCase(&vulkan, ImageSampleLzOffsetRuntimeFoldsIntoCoordOnGpu());
+    for (u32 kind = 0; kind < 4u; kind++) {
+      if (only < 0 || only == static_cast<int>(4 + kind)) {
+        RunCase(&vulkan, ImageSampleLzOffsetLaneVariant(kind));
+      }
+    }
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+    if (only < 0 || only == 8) CheckSampleRuntimeOffsetNonZeroLodFails();
+#endif
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--wave64-only") == 0) {
