@@ -40538,6 +40538,68 @@ void CheckMeshRecordEmission() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// Regression (ng-91/94/98): a compute program compiled with a vertex input_info carrying active
+// draw parameters used to emit OpLoad from the BaseVertex/BaseInstance variable, which DefineInputs
+// only declares for the Vertex stage, so the pointer operand was id 0 and NVIDIA's SPIR-V front end
+// crashed. Walk the emitted words: no OpLoad may have a null pointer, and spirv-val must pass.
+void CheckComputeDrawParametersLoads() {
+  using namespace Libs::Graphics;
+  const char *name = "ComputeDrawParametersLoads";
+  const u32 code[] = {
+      EncodeVop1(0x01, 9, 5), // user s5 (draw.base_vertex_slot)
+      EncodeMubuf0(0x1c), EncodeMubuf1(9, 2, 5),
+      EncodeSopp(0x01),
+  };
+  ShaderVertexInputInfo input{};
+  input.logical_stage = ShaderType::Compute;
+  input.draw_parameters.active = true;
+  input.draw_parameters.base_vertex_slot = 5;
+  input.draw_parameters.base_instance_slot = 6;
+  ShaderComputeInputInfo compute_info{};
+  compute_info.threads_num[0] = compute_info.threads_num[1] = compute_info.threads_num[2] = 1;
+  compute_info.wave_size = 32;
+  compute_info.host_subgroup_size = 32;
+  std::array<u32, 14> user_data{};
+  user_data[2] = 0x10000008u;
+  user_data[3] = 4u << 16u;
+  user_data[4] = 64u;
+  user_data[5] = 0x00027000u;
+  ShaderRecompiler::CompileOptions options{};
+  options.stage = ShaderType::Compute;
+  options.input_info.compute = &compute_info;
+  options.input_info.vertex = &input;
+  options.user_data = user_data;
+  options.user_data_base = 0;
+  auto translated = ShaderRecompiler::TranslateProgram(code, options);
+  auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+  ShaderRecompiler::IR::ResourceSnapshot resources;
+  ShaderRecompiler::IR::ResourceSpecialization specialization;
+  const ShaderRecompiler::IR::SrtRuntime runtime{
+      .user_data = options.user_data,
+      .shader_base = reinterpret_cast<uint64_t>(code),
+  };
+  Require(name, "resource materialization",
+          ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization),
+          "test resources did not materialize");
+  auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
+  uint32_t loads = 0;
+  for (size_t at = 5; at < result.spirv.size();) {
+    const uint32_t count = result.spirv[at] >> 16u;
+    const uint32_t op    = result.spirv[at] & 0xffffu;
+    Require(name, "instruction length", count != 0 && at + count <= result.spirv.size(),
+            "malformed SPIR-V instruction stream");
+    if (op == 61 /*OpLoad*/) {
+      loads++;
+      Require(name, "OpLoad pointer", count >= 4 && result.spirv[at + 3] != 0,
+              "OpLoad with pointer id 0 at word " + std::to_string(at));
+    }
+    at += count;
+  }
+  Require(name, "has loads", loads != 0, "walker found no OpLoad");
+  ValidateSpirv(name, result.spirv);
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckEmbeddedFetchVertexOffset() {
   const auto MakeFetch = [](std::initializer_list<std::pair<u32, u32>> adds,
                             std::optional<std::pair<u32, u32>> late_add = {},
@@ -46719,6 +46781,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--draw-offset-only") == 0) {
     CheckEmbeddedFetchVertexOffset();
     CheckMeshRecordEmission();
+    CheckComputeDrawParametersLoads();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--depth-feedback-only") == 0) {
