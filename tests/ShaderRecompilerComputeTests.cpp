@@ -18008,7 +18008,7 @@ public:
       for (uint32_t y = 0; y < extent; y++) {
         for (uint32_t x = 0; x < extent; x++) {
           for (uint32_t c = 0; c < 4; c++) {
-            reinterpret_cast<float *>(color_texel_address)[(y * extent + x) * 4 + c] =
+            reinterpret_cast<float *>(color_texel_address)[(y * 16 + x) * 4 + c] =
                 initial_depth(x, y);
           }
         }
@@ -18145,12 +18145,15 @@ public:
 
     RenderColorInfo color{};
     color.desc.type = BindingType::RenderTarget;
-    color.desc.info.data = {depth_address + 0x10000, extent * extent * 16};
-    color.desc.info.mip_layout[0] = {0, color.desc.info.data.size, extent, extent};
+    // Linear 128bpp texture descriptors pitch-align the row to 16 texels; match it so the sampled
+    // view resolves to this very image.
+    const uint32_t color_pitch = color_feedback ? 16 : extent;
+    color.desc.info.data = {depth_address + 0x10000, color_pitch * extent * 16};
+    color.desc.info.mip_layout[0] = {0, color.desc.info.data.size, color_pitch, extent};
     color.desc.info.pixel_format = vk::Format::eR32G32B32A32Sfloat;
     color.desc.info.guest_format = Prospero::BufferFormat::k32_32_32_32Float;
     color.desc.info.extent = {extent, extent, 1};
-    color.desc.info.pitch = extent;
+    color.desc.info.pitch = color_pitch;
     color.desc.info.bytes_per_block = 16;
     color.desc.view_info.format = color.desc.info.pixel_format;
     color.desc.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
