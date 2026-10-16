@@ -66,7 +66,9 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 		state.builder.AddFunction(spv::OpLoad, TypeI32(state), value, variable);
 		state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
 		// GPU-side indirect draw, native fetch: the guest id excludes the draw's base.
-		const auto* vertex = state.input_info.vertex;
+		// input_info is a union of per-stage pointers: only Vertex may read `.vertex`.
+		const auto* vertex =
+		    state.program.stage == ShaderType::Vertex ? state.input_info.vertex : nullptr;
 		if (vertex != nullptr && vertex->draw_parameters.active &&
 		    vertex->draw_parameters.rebase_ids &&
 		    (kind == IR::StageInputKind::VertexIndex || kind == IR::StageInputKind::InstanceIndex)) {
@@ -700,7 +702,9 @@ uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
 uint32_t EmitGetUserData(EmitterState& state, IR::ScalarReg reg) {
 	// GPU-side indirect draws: the packet's vertex / instance offset SGPRs come from the draw
 	// parameters built-ins instead of the (unpatched) shader-data dword.
-	if (const auto* vertex = state.input_info.vertex;
+	// Same stage gate as DefineInputs, which declares the built-ins only for Vertex.
+	if (const auto* vertex =
+	        state.program.stage == ShaderType::Vertex ? state.input_info.vertex : nullptr;
 	    vertex != nullptr && vertex->draw_parameters.active) {
 		const auto& draw  = vertex->draw_parameters;
 		const auto  index = IR::RegIndex(reg);
