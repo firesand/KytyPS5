@@ -1239,7 +1239,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 
 	if (gpu_indirect != nullptr) {
 		EXIT_IF(mesh_active != gpu_indirect->parameters.mesh_record);
-		EXIT_IF(mesh_active && (!draw.IsIndexed() || gpu_indirect->count_addr != 0 ||
+		EXIT_IF(mesh_active && (gpu_indirect->count_addr != 0 ||
 		                        state.vertex_info[0].mesh.fast_launch ||
 		                        !MeshIndirectTranslator::Fits(gpu_indirect->draw_count)));
 	}
@@ -1371,6 +1371,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		request.args_bytes           = indirect_args_bytes;
 		request.count                = gpu_indirect->draw_count;
 		request.stride               = gpu_indirect->stride;
+		request.indexed              = draw.IsIndexed();
 		request.index_buffer_size    = gpu_indirect->index_buffer_size;
 		request.index_base           = gpu_indirect->index_base;
 		request.element_size         = index_source.guest_element_size;
@@ -1384,7 +1385,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		mesh_indirect                = m_mesh_indirect->Translate(vk_buffer, request);
 		draw_data[0] = static_cast<uint32_t>(mesh_indirect.records_address);
 		draw_data[1] = static_cast<uint32_t>(mesh_indirect.records_address >> 32u);
-		draw_data[2] = index_source.guest_element_size;
+		draw_data[2] = draw.IsIndexed() ? index_source.guest_element_size : 0u;
 		draw_data[3] = draw_data[4] = draw_data[5] = 0;
 	} else if (indirect_barrier) {
 		// Barriers are illegal inside dynamic rendering: close it, order the GPU-built records
@@ -1678,9 +1679,9 @@ bool RenderExecutor::CanDrawIndirectOnGpu(CommandBuffer& buffer, bool indexed,
 	uint64_t shader_hash = 0;
 	const bool mesh = VertexShaderIsMesh(sh_ctx.GetVs(), buffer.GetRegisters(), &shader_hash);
 	if (mesh) {
-		// Indexed NGG draws take the translation prepass (parameters.mesh_record); anything the
+		// Indexed and non-indexed NGG draws take the translation prepass (parameters.mesh_record); anything the
 		// prepass cannot reproduce stays on the host path.
-		if (!parameters.mesh_record || !indexed || !graphics.mesh_shader_enabled ||
+		if (!parameters.mesh_record || !graphics.mesh_shader_enabled ||
 		    !MeshIndirectTranslator::Fits(draw_count)) {
 			if (block != nullptr) {
 				*block = GpuIndirectBlock::MeshDisabled;

@@ -29,7 +29,7 @@ struct TranslatePush {
 	uint32_t max_groups_total;
 	uint32_t command_dword;
 	uint32_t record_dword;
-	uint32_t padding;
+	uint32_t non_indexed;
 };
 static_assert(sizeof(TranslatePush) == 64);
 
@@ -89,8 +89,9 @@ MeshIndirectTranslator::~MeshIndirectTranslator() {
 
 MeshIndirectTranslator::Result MeshIndirectTranslator::Translate(vk::CommandBuffer cmd,
                                                                  const Request& request) {
-	EXIT_IF(!Fits(request.count) || request.stride < 20u || (request.stride & 3u) != 0 ||
-	        (request.args_offset & 3u) != 0 || request.index_buffer_size == 0 ||
+	EXIT_IF(!Fits(request.count) || request.stride < (request.indexed ? 20u : 16u) ||
+	        (request.stride & 3u) != 0 || (request.args_offset & 3u) != 0 ||
+	        (request.indexed && request.index_buffer_size == 0) ||
 	        request.primitives_per_group == 0 || request.primitive_step == 0 ||
 	        request.args_buffer == nullptr);
 	const auto bytes = ScratchBytes(request.count);
@@ -174,7 +175,7 @@ MeshIndirectTranslator::Result MeshIndirectTranslator::Translate(vk::CommandBuff
 	    .max_groups_total  = request.max_groups_total,
 	    .command_dword     = static_cast<uint32_t>(base / 4u),
 	    .record_dword      = static_cast<uint32_t>((base + command_bytes) / 4u),
-	    .padding           = 0,
+	    .non_indexed       = request.indexed ? 0u : 1u,
 	};
 	cmd.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
 	{

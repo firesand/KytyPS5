@@ -13,7 +13,7 @@ class CommandScheduler;
 struct GraphicContext;
 
 // Mesh-stage GPU-side indirect draws (KYTY_CP_GPU_INDIRECT). A compute pass turns the guest's
-// DrawIndexedIndirect records into VkDrawMeshTasksIndirectCommandEXT commands and a per-record
+// DrawIndexedIndirect (or DrawIndirect) records into VkDrawMeshTasksIndirectCommandEXT commands and a per-record
 // scratch (8 dwords, ShaderRecompiler::IR::MeshRecord*) that the mesh_record shader variant reads
 // through DrawIndex. Output lives in a GPU-internal ring; every pass is ordered after the previous
 // readers of the ring slot, so a wrap is safe.
@@ -28,7 +28,9 @@ public:
 		uint64_t   args_offset = 0; // bytes into args_buffer, 4-aligned
 		uint64_t   args_bytes  = 0; // bytes from args_offset through the end of the last record
 		uint32_t   count       = 0;
-		uint32_t   stride      = 0; // bytes, 4-aligned, >= 20
+		uint32_t   stride      = 0; // bytes, 4-aligned, >= 20 (indexed) / >= 16 (non-indexed)
+		// false: records are 4-dword DrawIndirectArgs; index_* fields are ignored.
+		bool       indexed     = true;
 		uint32_t   index_buffer_size = 0; // elements
 		uint64_t   index_base  = 0;
 		uint32_t   element_size = 0;      // guest index bytes

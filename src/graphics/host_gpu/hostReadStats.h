@@ -52,7 +52,8 @@ struct HostReadProbe {
 	enum GpuIndirect : uint32_t { GpuDraws = 0, FallbackIndexOffset, FallbackOther, FallbackMesh, FallbackSrt,
 	                              GpuMeshDraws, FallbackMeshSrt, StaleMeshState,
 	                              // Why mesh packets fell back (FallbackMesh stays the total). One site each:
-	                              // MeshNonIndexed   graphicsRun.cpp `mesh && !indexed` (checked first)
+	                              // MeshNonIndexed   graphicsRun.cpp `mesh && !indexed && count_addr` (the GPU path takes the rest)
+	                              //   (now only counted on the fallback path: mesh packets with a count buffer, non-indexed or not)
 	                              //   split by fast_launch: MeshNonIndexedFl / NoFl / UnknownFl (memo miss)
 	                              // MeshCount        indexed packet with a count buffer
 	                              // MeshDisabled     renderDraw.cpp !mesh_record / !mesh_shader_enabled / !Fits
@@ -60,15 +61,18 @@ struct HostReadProbe {
 	                              // MeshPpg0         renderDraw.cpp primitives_per_group == 0
 	                              // MeshCaps         graphicsRun.cpp args/index range cap or unmapped range
 	                              MeshNonIndexed, MeshNonIndexedFl, MeshNonIndexedNoFl, MeshNonIndexedUnknownFl,
-	                              MeshCount, MeshDisabled, MeshFastLaunch, MeshPpg0, MeshCaps, GpuIndirectCount };
+	                              MeshCount, MeshDisabled, MeshFastLaunch, MeshPpg0, MeshCaps,
+	                              // GpuMeshNonIndexed: non-indexed mesh packets taken by the GPU path (subset of
+	                              // GpuMeshDraws; not a fallback)
+	                              GpuMeshNonIndexed, GpuIndirectCount };
 	// Short names, one per enumerator in order; the size is deduced, so the static_assert fails to
 	// compile when an enumerator is added without a name (and vice versa).
 	static constexpr auto kGpuIndirectNames = std::to_array<const char*>(
 	    {"gpu", "index_offset", "other", "mesh", "srt", "mesh-gpu", "mesh-srt", "stale",
 	     "mesh-nonindexed", "mesh-nonindexed-fl", "mesh-nonindexed-nofl", "mesh-nonindexed-unknown-fl",
-	     "mesh-count", "mesh-fits/disabled", "mesh-fastlaunch", "mesh-ppg0", "mesh-caps"});
+	     "mesh-count", "mesh-fits/disabled", "mesh-fastlaunch", "mesh-ppg0", "mesh-caps", "mesh-gpu-nonindexed"});
 	static_assert(kGpuIndirectNames.size() == GpuIndirectCount, "GpuIndirect enum / name table mismatch");
-	static_assert(kGpuIndirectNames.size() == MeshCaps + 1, "MeshCaps must be the last enumerator");
+	static_assert(kGpuIndirectNames.size() == GpuMeshNonIndexed + 1, "GpuMeshNonIndexed must be the last enumerator");
 	struct Snapshot {
 		std::array<std::pair<uint64_t, uint64_t>, SiteCount> sites {}; // calls, nanoseconds
 		std::array<uint64_t, GpuIndirectCount>               gpu_indirect {};

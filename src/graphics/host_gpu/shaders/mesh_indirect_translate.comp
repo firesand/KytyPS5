@@ -31,7 +31,7 @@ layout(push_constant) uniform push {
     uint max_groups_total;
     uint command_dword;     // VkDrawMeshTasksIndirectCommandEXT array, in dwords of scratch
     uint record_dword;      // 8-dword records, in dwords of scratch
-    uint padding;
+    uint non_indexed;       // 1: 4-dword DrawIndirectArgs {vertex_count, instances, first_vertex, first_instance}
 } pc;
 
 void main() {
@@ -40,13 +40,17 @@ void main() {
         return;
     }
     const uint record = pc.args_dword + i * pc.stride_dwords;
+    const bool non_indexed = pc.non_indexed != 0u;
     const uint index_count = args[record + 0u];
     const uint instances = args[record + 1u];
-    const uint start_index = args[record + 2u];
-    const uint base_vertex = args[record + 3u];
-    const uint start_instance = args[record + 4u];
+    // Indexed: {index_count, instances, start_index, base_vertex, start_instance}.
+    // Non-indexed: {vertex_count, instances, first_vertex, first_instance}; the host path does not
+    // clamp the vertex count and writes first_vertex / first_instance into the batch SGPRs.
+    const uint start_index = non_indexed ? 0u : args[record + 2u];
+    const uint base_vertex = non_indexed ? args[record + 2u] : args[record + 3u];
+    const uint start_instance = non_indexed ? args[record + 3u] : args[record + 4u];
 
-    const uint clamped = min(index_count, pc.index_buffer_size);
+    const uint clamped = non_indexed ? index_count : min(index_count, pc.index_buffer_size);
     const uint primitives = clamped < pc.prim_size ? 0u : (clamped - pc.prim_size) / pc.prim_step + 1u;
     uint groups = (primitives == 0u || instances == 0u) ? 0u : (primitives - 1u) / pc.prims_per_group + 1u;
     groups = min(groups, pc.max_groups_x);

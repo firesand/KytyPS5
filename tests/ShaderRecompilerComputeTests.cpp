@@ -45681,18 +45681,33 @@ void CheckMeshDrawIndexGate0() {
   // Phase 2: the translation prepass (the product's SPIR-V) over synthetic DrawIndexedIndirect
   // records, then a mesh shader that loads each draw's record through a physical storage buffer
   // pointer keyed by DrawIndex. Mirrors the host formulas (index clamp, mesh_groups, limits).
-  {
-    const char *phase = "MeshIndirectPrepass";
+  // Cases: the indexed triangle list, then non-indexed DrawIndirectArgs records for a point list with
+  // ppg 1 (Zero Company's packets: op 0xc0032400, stride 16, prim 1, ppg 1) and a triangle list with
+  // ppg 62 (a stride-padded record array).
+  struct PrepassCase {
+    const char *name;
+    bool non_indexed;
+    Prospero::PrimitiveType primitive;
+    u32 primitives_per_group;
+    u32 stride_dwords;
+  };
+  const PrepassCase prepass_cases[] = {
+      {"MeshIndirectPrepass", false, Prospero::PrimitiveType::kTriList, 62, 8},
+      {"MeshIndirectPrepassNonIndexedPoints", true, Prospero::PrimitiveType::kPointList, 1, 4},
+      {"MeshIndirectPrepassNonIndexedTris", true, Prospero::PrimitiveType::kTriList, 62, 6},
+  };
+  for (const auto &cfg : prepass_cases) {
+    const char *phase = cfg.name;
     constexpr u32 count = 7;
-    constexpr u32 stride_dwords = 8; // padded records: stride 32 bytes
+    const u32 stride_dwords = cfg.stride_dwords; // padded records: stride 32 bytes (indexed)
     constexpr u32 args_offset_dwords = 3; // the argument range does not start at the buffer start
     constexpr u32 index_buffer_size = 1000;
     constexpr u32 element_size = 2;
-    constexpr u32 primitives_per_group = 62;
+    const u32 primitives_per_group = cfg.primitives_per_group;
     constexpr u32 max_x = 4, max_y = 3, max_total = 8;
     constexpr uint64_t index_base = 0x00000001ffffff00ull;
     struct Record { u32 index_count, instances, start_index, base_vertex, start_instance; };
-    const Record records[count] = {
+    const Record indexed_records[count] = {
         {186, 1, 0, 0, 0},                // exactly one group
         {5000, 2, 0, 0, 0},               // clamped to INDEX_BUFFER_SIZE, group count clamped to x
         {0, 1, 0, 0, 0},                  // no primitives
@@ -45701,6 +45716,18 @@ void CheckMeshDrawIndexGate0() {
         {2, 1, 0, 0, 0},                  // fewer vertices than a triangle
         {3, 1, 0x7fffffffu, 0xfffffff0u, 7}, // index address carries into the high dword
     };
+    // Non-indexed {vertex_count, instances, first_vertex, first_instance} (start_index = first_vertex,
+    // base_vertex = first_instance): counts above INDEX_BUFFER_SIZE are NOT clamped.
+    const Record nonindexed_records[count] = {
+        {186, 1, 0, 0, 0},
+        {5000, 2, 0, 0, 0},               // group count clamped to x
+        {0, 1, 0, 0, 0},                  // no primitives
+        {3000, 0, 0, 0, 0},               // no instances
+        {1000, 5, 0, 0, 0},               // instances clamped to y, then the total limit
+        {2, 1, 9, 0, 0},                  // fewer vertices than a triangle
+        {3, 1, 0xfffffff0u, 7, 0},        // first_vertex / first_instance pass through
+    };
+    const Record *records = cfg.non_indexed ? nonindexed_records : indexed_records;
     vk::Buffer in_buffer{}, scratch_buffer{}, result_buffer{};
     vk::DeviceMemory in_memory{}, scratch_memory{}, result_memory{};
     void *in_map = nullptr, *scratch_map = nullptr, *result_map = nullptr;
@@ -45723,7 +45750,9 @@ void CheckMeshDrawIndexGate0() {
       record[1] = records[i].instances;
       record[2] = records[i].start_index;
       record[3] = records[i].base_vertex;
-      record[4] = records[i].start_instance;
+      if (!cfg.non_indexed) {
+        record[4] = records[i].start_instance;
+      }
     }
     std::memset(scratch_map, 0xcd, scratch_bytes);
     std::memset(result_map, 0, (count * 8 + count) * 4);
@@ -45832,8 +45861,10 @@ void CheckMeshDrawIndexGate0() {
 
     const u32 push[16] = {args_offset_dwords, stride_dwords, count, index_buffer_size,
                           static_cast<u32>(index_base), static_cast<u32>(index_base >> 32),
-                          element_size, 3, 3, primitives_per_group, max_x, max_y, max_total,
-                          0, static_cast<u32>(command_bytes / 4), 0};
+                          element_size, cfg.primitive == Prospero::PrimitiveType::kPointList ? 1u : 3u,
+                          cfg.primitive == Prospero::PrimitiveType::kPointList ? 1u : 3u,
+                          primitives_per_group, max_x, max_y, max_total,
+                          0, static_cast<u32>(command_bytes / 4), cfg.non_indexed ? 1u : 0u};
     const u32 mesh_pushes[4] = {static_cast<u32>(records_address),
                                 static_cast<u32>(records_address >> 32), count, 0};
 
@@ -45883,14 +45914,14 @@ void CheckMeshDrawIndexGate0() {
 
     // Host reference: same formulas as graphicsRun.cpp / ExecutePreparedDraw, limits as clamps.
     ShaderMeshInputInfo mesh_info{};
-    mesh_info.input_primitive = static_cast<u32>(Prospero::PrimitiveType::kTriList);
+    mesh_info.input_primitive = static_cast<u32>(cfg.primitive);
     const u32 *commands = static_cast<const u32 *>(scratch_map);
     const u32 *scratch_records = commands + command_bytes / 4;
     const u32 *result = static_cast<const u32 *>(result_map);
     bool ok = true;
     for (u32 i = 0; i < count; i++) {
       const auto &r = records[i];
-      const u32 clamped = std::min(r.index_count, index_buffer_size);
+      const u32 clamped = cfg.non_indexed ? r.index_count : std::min(r.index_count, index_buffer_size);
       const u32 primitives = mesh_info.InputPrimitiveCount(clamped);
       u32 groups = (primitives == 0 || r.instances == 0)
                        ? 0u : (primitives - 1u) / primitives_per_group + 1u;
@@ -45900,12 +45931,14 @@ void CheckMeshDrawIndexGate0() {
         groups = max_total / instances;
       }
       const uint64_t address = index_base + static_cast<uint64_t>(r.start_index) * element_size;
-      const u32 expected_record[8] = {clamped, r.base_vertex, r.start_instance, r.start_index,
-                                      static_cast<u32>(address), static_cast<u32>(address >> 32),
-                                      0, 0};
+      const std::array<u32, 8> expected_record =
+          cfg.non_indexed
+              ? std::array<u32, 8>{clamped, r.start_index, r.base_vertex, 0, 0, 0, 0, 0}
+              : std::array<u32, 8>{clamped, r.base_vertex, r.start_instance, r.start_index,
+                                   static_cast<u32>(address), static_cast<u32>(address >> 32), 0, 0};
       const u32 expected_command[3] = {groups, instances, 1};
       bool command_ok = std::equal(expected_command, expected_command + 3, commands + i * 3);
-      bool record_ok = std::equal(expected_record, expected_record + 8, scratch_records + i * 8);
+      bool record_ok = std::equal(expected_record.begin(), expected_record.end(), scratch_records + i * 8);
       const u32 launched = groups * instances;
       bool mesh_ok = result[8 * count + i] == launched;
       for (u32 k = 0; k < 8; k++) {
@@ -45964,6 +45997,7 @@ static void CheckGpuIndirectReasonNames() {
     }
   }
   EXIT_IF(Probe::MeshNonIndexed != Probe::StaleMeshState + 1);
+  EXIT_IF(Probe::GpuMeshNonIndexed + 1 != Probe::GpuIndirectCount);
   printf("gpu-indirect reason names OK (%u)\n", static_cast<uint32_t>(Probe::GpuIndirectCount));
 }
 

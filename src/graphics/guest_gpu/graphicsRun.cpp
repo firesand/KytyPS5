@@ -1218,7 +1218,7 @@ bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_c
                                             bool indexed, uint32_t cmd_id) {
 	auto& executor = m_renderer.GetRenderExecutor();
 	// NGG / mesh vertex stages: the translation prepass serves every batch SGPR (including the
-	// first-index one) from the record, but only for indexed draws without a count buffer.
+	// first-index one) from the record, for indexed and non-indexed draws without a count buffer.
 	const bool mesh = executor.DrawUsesMeshVertexStage(CurrentBuffer());
 	// The vertex variant has no first-index draw-parameter built-in.
 	if (!mesh && registers.index_offset != Pm4::SH_NOP) {
@@ -1234,7 +1234,7 @@ bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_c
 		// 32 distinct tuples. Runs before the early returns so non-indexed packets are covered.
 		const auto probe = executor.ProbeMeshPacket(CurrentBuffer());
 		LogMeshTuple(probe, indexed, stride_in_bytes, cmd_id, count_addr != nullptr);
-		if (!indexed || count_addr != nullptr) {
+		if (count_addr != nullptr) {
 			HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackMesh);
 			if (!indexed) {
 				HostReadProbe::CountGpuIndirect(HostReadProbe::MeshNonIndexed);
@@ -1298,7 +1298,18 @@ bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_c
 		return fallback();
 	}
 
-	if (mesh) {
+	if (mesh && !indexed) {
+		// Non-indexed: no index buffer is read or registered; only the 4-dword argument records
+		// bound by the prepass need the range cap.
+		constexpr uint64_t MeshArgsRangeCap = 128ull << 20;
+		const uint64_t     args_span =
+		    uint64_t {max_count_or_count - 1u} * stride_in_bytes + sizeof(DrawIndirectArgs);
+		if (args_span > MeshArgsRangeCap) {
+			HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackMesh);
+			HostReadProbe::CountGpuIndirect(HostReadProbe::MeshCaps);
+			return fallback();
+		}
+	} else if (mesh) {
 		// The placeholder draw registers, prepares and syncs the whole INDEX_BUFFER_SIZE range at
 		// the index base on every packet (the mesh shader reads indices through BDA). A huge or
 		// partly unmapped range would EXIT in the cache or sync megabytes per packet: keep those on
@@ -1359,6 +1370,9 @@ bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_c
 	if (mesh) {
 		m_mesh_state_stale = true;
 		HostReadProbe::CountGpuIndirect(HostReadProbe::GpuMeshDraws);
+		if (!indexed) {
+			HostReadProbe::CountGpuIndirect(HostReadProbe::GpuMeshNonIndexed);
+		}
 	}
 	return true;
 }

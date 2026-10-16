@@ -227,7 +227,7 @@ struct FaultSampler {
 		                    " | gpu-indirect {} draws {} fallback(index_offset) {} fallback(other) ({} of which mesh) {} fallback(srt)"
 		                    " {} ms waited | mesh-gpu {} draws {} fallback(mesh-srt) {} stale(mesh-state)"
 		                    " | mesh-fallback-reasons: nonindexed {} (fl {} nofl {} unknown-fl {}) count {}"
-		                    " fits/disabled {} fastlaunch {} ppg0 {} caps {}",
+		                    " fits/disabled {} fastlaunch {} ppg0 {} caps {} | mesh-gpu-nonindexed {}",
 		                    syncs_all.calls, syncs_all.regions, sync_all.copy_batches, sync_all.copy_buffers,
 		                    rs[HostReadProbe::DrawArgs].first,
 		                    rs[HostReadProbe::DrawArgs].second / 1000000,
@@ -253,7 +253,8 @@ struct FaultSampler {
 		                    reads_all.gpu_indirect[HostReadProbe::MeshDisabled],
 		                    reads_all.gpu_indirect[HostReadProbe::MeshFastLaunch],
 		                    reads_all.gpu_indirect[HostReadProbe::MeshPpg0],
-		                    reads_all.gpu_indirect[HostReadProbe::MeshCaps]);
+		                    reads_all.gpu_indirect[HostReadProbe::MeshCaps],
+		                    reads_all.gpu_indirect[HostReadProbe::GpuMeshNonIndexed]);
 		line += fmt::format(" | host-resident binds {} bytes {} KiB fallbacks {}", resident_all.binds,
 		                    resident_all.bytes >> 10, resident_all.fallbacks);
 		const auto& bc = budget_all.categories;
