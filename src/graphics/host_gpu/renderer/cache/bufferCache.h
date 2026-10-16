@@ -163,6 +163,7 @@ public:
 	struct SyncStats {
 		uint64_t obtain_calls = 0, obtain_bytes = 0, obtain_pages = 0;
 		uint64_t range_calls = 0, range_bytes = 0, range_pages = 0;
+		uint64_t range_repasses = 0, range_repass_pages = 0; // KYTY_SYNC_REPASS extra passes / pages
 		uint64_t download_calls = 0, download_wait_ns = 0, read_memory_calls = 0;
 		uint64_t copy_batches = 0; // barrier pairs recorded around staging copies
 		uint64_t copy_buffers = 0; // SynchronizeBuffer calls that recorded or queued a staging copy
@@ -171,6 +172,8 @@ public:
 		uint64_t gpu_joins  = 0; // replaced buffers copied on the GPU (in flight)
 	};
 	[[nodiscard]] SyncStats TakeSyncStats() { return std::exchange(m_sync_stats, {}); }
+	// Monotonic bytes uploaded by SynchronizeBuffersInRange (never reset; SyncProbe takes deltas).
+	[[nodiscard]] uint64_t RangeBytesTotal() const { return m_range_bytes_total; }
 	void SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	// Upload batching (CPU-write synchronization): between Begin and End, SynchronizeBuffer queues
 	// its staging copies instead of recording each with its own full-pipeline barrier pair; End
@@ -260,6 +263,25 @@ private:
 		uint64_t finish = 0;
 	};
 	std::unordered_map<uint32_t, SyncOwner>                        m_sync_owners; // keyed by slot index
+	// Page-driven sync, split in two steps (test seam): CollectSyncOwners snapshots the candidate
+	// runs of [vaddr, vaddr + size) and builds the per-owner hulls; SyncCollectedOwners uploads
+	// them, then (KYTY_SYNC_REPASS, default on) re-snapshots up to two more times and uploads the
+	// pages that became dirty after the previous snapshot outside every hull already synced.
+	void CollectSyncOwners(uint64_t vaddr, uint64_t size);
+	void SyncCollectedOwners();
+	template <typename Func>
+	void ForEachSyncOwnerPiece(uint64_t from, uint64_t to, Func&& func);
+	static bool ReadSyncRepassEnv();
+	struct SyncPiece {
+		BufferId id;
+		uint64_t start  = 0;
+		uint64_t finish = 0;
+	};
+	std::vector<SyncPiece>                     m_sync_pieces;
+	std::vector<std::pair<uint64_t, uint64_t>> m_sync_done; // synced hulls/segments, sorted, disjoint
+	uint64_t                                   m_sync_vaddr = 0, m_sync_size = 0;
+	bool                                       m_sync_repass = ReadSyncRepassEnv();
+	uint64_t                                   m_range_bytes_total = 0;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;

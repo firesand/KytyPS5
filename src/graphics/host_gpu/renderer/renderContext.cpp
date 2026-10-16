@@ -139,6 +139,8 @@ struct FaultSampler {
 		sync_sum.range_calls += sync.range_calls;
 		sync_sum.range_bytes += sync.range_bytes;
 		sync_sum.range_pages += sync.range_pages;
+		sync_sum.range_repasses += sync.range_repasses;
+		sync_sum.range_repass_pages += sync.range_repass_pages;
 		sync_sum.download_calls += sync.download_calls;
 		sync_sum.download_wait_ns += sync.download_wait_ns;
 		sync_sum.read_memory_calls += sync.read_memory_calls;
@@ -214,9 +216,10 @@ struct FaultSampler {
 			                    page_count, describe(page));
 		}
 		line += fmt::format(" | syncs: obtain {} calls {} ranges {} KiB, range {} calls {} ranges {} KiB"
-		                    " | downloads {} ({} ms waited), ReadMemory {}",
+		                    " (repass {} passes {} pages) | downloads {} ({} ms waited), ReadMemory {}",
 		                    sync_all.obtain_calls, sync_all.obtain_pages, sync_all.obtain_bytes >> 10,
 		                    sync_all.range_calls, sync_all.range_pages, sync_all.range_bytes >> 10,
+		                    sync_all.range_repasses, sync_all.range_repass_pages,
 		                    sync_all.download_calls, sync_all.download_wait_ns / 1000000,
 		                    sync_all.read_memory_calls);
 		line += fmt::format(" | protect {} calls {} KiB | hot hashed {} skipped {} demoted {} rehash-miss {}",
