@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -406,31 +407,22 @@ uint32_t ConstOffsetOperand(EmitterState& state, const SampleOffset& offset, uin
 	                                              values[0], values[1], values[2]);
 }
 
-// Explicit-LOD fallback: coord += offset / size(level), per spatial component. Array layers
-// (coordinate components beyond the spatial ones) are left alone.
+// Runtime-offset fallback: coord += offset / size(level), per spatial component. Only valid when a
+// single mip level is sampled, so the caller restricts it to lz forms and to explicit-LOD forms
+// whose LOD is a compile-time integral constant (`level`). Array layers are left alone. The size
+// is queried on the same selected descriptor (`array_index`) the sample itself uses.
 uint32_t FoldOffsetIntoCoord(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                              const IR::Inst& address, const ImageSampleLayout& layout,
-                             uint32_t resource, uint32_t coord, uint32_t lod_f32) {
+                             uint32_t resource, uint32_t array_index, uint32_t coord,
+                             uint32_t level_value) {
 	auto&       state      = ctx.state;
 	const auto& image      = state.program.info.images[resource];
 	const auto& info       = ImageDimensionInfoFor(image.dimension);
 	const auto  spatial    = info.spatial_components;
 	const auto  components = info.coordinate_components;
 	state.builder.RequireCapability(spv::CapabilityImageQuery);
-	uint32_t level = ConstantU32(state, 0);
-	if (lod_f32 != 0u && image.mip_count > 1u) {
-		const auto clamped = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state),
-		                          GLSLstd450FMax, lod_f32, ZeroF32(state));
-		const auto floored = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpExtInst, TypeF32(state), floored, GlslStd450(state),
-		                          GLSLstd450Floor, clamped);
-		const auto as_uint = Unary(state, spv::OpConvertFToU, TypeU32(state), floored);
-		level              = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpExtInst, TypeU32(state), level, GlslStd450(state),
-		                          GLSLstd450UMin, as_uint, ConstantU32(state, image.mip_count - 1u));
-	}
-	const auto descriptor = LoadImageDescriptor(state, resource);
+	const auto level = ConstantU32(state, std::min(level_value, std::max(image.mip_count, 1u) - 1u));
+	const auto descriptor = LoadImageDescriptor(state, resource, 0u, array_index);
 	const auto size       = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpImageQuerySizeLod, ImageViewSizeType(state, image.dimension),
 	                          size, descriptor, level);
@@ -990,7 +982,6 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		}
 		std::array<uint32_t, 4> operands {};
 		size_t operand_count = 0;
-		uint32_t lod_value = 0;
 		if (HasFlag(mem, Decoder::ImageSampleFlagDerivative)) {
 			operands[0] = spv::ImageOperandsGradMask;
 			operands[1] = CoordF32(ctx, mem, *address, layout.grad_x, dimension_info.spatial_components);
@@ -1004,12 +995,12 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			operands[0] = spv::ImageOperandsLodMask;
 			operands[1] = lod;
 			operand_count = 2;
-			lod_value = lod;
 		} else if (layout.bias != NoImageComponent) {
 			operands[0] = spv::ImageOperandsBiasMask;
 			operands[1] = AddressF32(ctx, mem, *address, layout.bias);
 			operand_count = 2;
 		}
+		uint32_t fold_level = 0;
 		const auto sample_offset =
 		    ResolveSampleOffset(mem, *address, layout, dimension_info.spatial_components);
 		if (sample_offset.kind != SampleOffsetKind::None) {
@@ -1018,14 +1009,31 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				return;
 			}
 			if (sample_offset.kind == SampleOffsetKind::Runtime) {
-				if (!explicit_lod) {
-					ctx.Fail(inst, "has a non-constant or out-of-range texel offset on an "
-					               "implicit-LOD sample");
-					return;
+				// The fold is exact only for one sampled mip level: lz, or a constant integral LOD.
+				bool fold_ok = false;
+				if (HasFlag(mem, Decoder::ImageSampleFlagLevelZero)) {
+					fold_ok = true;
+				} else if (HasFlag(mem, Decoder::ImageSampleFlagLod) &&
+				           !HasFlag(mem, Decoder::ImageSampleFlagDerivative) &&
+				           layout.lod != NoImageComponent && mem.image_address_components > layout.lod) {
+					const auto lod_layout =
+					    Decoder::ImageAddressComponentLayout(mem.image_sample_flags, layout.lod);
+					const auto packed = lod_layout.bit_offset / 32u;
+					if (lod_layout.bit_width == 32u && packed < address->NumArgs()) {
+						const auto lod = address->Arg(packed).Resolve();
+						if (lod.IsImmediate() && lod.GetType() == IR::Type::U32) {
+							const float value = std::bit_cast<float>(lod.U32());
+							if (value >= 0.0f && value < 16.0f && value == std::floor(value)) {
+								fold_ok    = true;
+								fold_level = static_cast<uint32_t>(value);
+							}
+						}
+					}
 				}
-				if (HasFlag(mem, Decoder::ImageSampleFlagDerivative)) {
-					ctx.Fail(inst, "has a non-constant or out-of-range texel offset on a "
-					               "gradient sample");
+				if (!fold_ok) {
+					ctx.Fail(inst, "has a non-constant or out-of-range texel offset that needs an "
+					               "lz or constant-integral-LOD sample (implicit, bias, gradient "
+					               "and fractional-LOD forms are unsupported)");
 					return;
 				}
 			}
@@ -1056,7 +1064,8 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				local_operands[local_operand_count++] = ConstOffsetOperand(
 				    state, sample_offset, ImageDimensionInfoFor(candidate.dimension).spatial_components);
 			} else if (sample_offset.kind == SampleOffsetKind::Runtime) {
-				coord = FoldOffsetIntoCoord(ctx, mem, *address, layout, resource, coord, lod_value);
+				coord = FoldOffsetIntoCoord(ctx, mem, *address, layout, resource, array_index, coord,
+				                         fold_level);
 			}
 			const auto sampled = MakeSampledImage(state, resource, sampler_id, 0u, array_index,
 			                                      sampler_index != 0u);

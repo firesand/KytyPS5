@@ -37467,6 +37467,37 @@ TestCase ImageSampleLzOffsetNeighbourTapsCase(bool runtime_offset) {
   return test;
 }
 
+// Negative: a runtime texel offset is only foldable for lz / constant-integral-LOD forms. A plain
+// image_sample_o (0x30; no lz, no Lod word) with an SGPR offset must be rejected, not dropped. The
+// emitter's ctx.Fail terminates the process (exit status 321), so it runs in a forked child.
+// The message text ("has a non-constant or out-of-range texel offset ...") goes to the fatal log
+// and is not captured here. Dynamic image selection with differently sized descriptors (the
+// FoldOffsetIntoCoord array_index fix) has no GPU harness here and is covered by review only.
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+void CheckSampleRuntimeOffsetNonLzFails() {
+  std::vector<u32> code;
+  code.push_back(EncodeVop1(0x01, 20, 16)); // v_mov_b32 v20, s16 (runtime offset)
+  AppendVMovLiteral(&code, 21, 0x3f200000u);
+  AppendVMovLiteral(&code, 22, 0x3f200000u);
+  code.push_back(EncodeMimg0(0x30, 0x1)); // image_sample_o
+  code.push_back(EncodeMimg1(0, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ImageSampleRuntimeOffsetNonLzFails";
+  test.code = code;
+  test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_SAMPLE,
+                  ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+  test.sampled_image_rgba = MakeRgbaImage(4, 4);
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32_32_32_32Float);
+  test.user_data[16] = 1u;
+  test.has_user_data = true;
+  test.compile_only = true;
+  ExpectFatal("ImageSampleRuntimeOffsetNonLzFails", [&] { (void)CompileCase(test); });
+}
+#endif
+
 TestCase ImageSampleLzOffsetNeighbourTapsOnGpu() {
   return ImageSampleLzOffsetNeighbourTapsCase(false);
 }
@@ -46293,8 +46324,11 @@ int main(int argc, char **argv) {
     return 0;
   }
   if ((argc == 2 || argc == 3) && std::strcmp(argv[1], "--sample-offset-only") == 0) {
-    // Optional case index (0=A16, 1=neighbour taps, 2=runtime fold): a failing case aborts.
+    // Optional case index (0=A16, 1=neighbour taps, 2=runtime lz fold, 3=non-lz runtime offset must fail): a failing case aborts.
     const int only = argc == 3 ? std::atoi(argv[2]) : -1;
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+    if (only < 0 || only == 3) CheckSampleRuntimeOffsetNonLzFails();
+#endif
     VulkanHarness vulkan;
     if (only < 0 || only == 0) RunCase(&vulkan, ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu());
     if (only < 0 || only == 1) RunCase(&vulkan, ImageSampleLzOffsetNeighbourTapsOnGpu());
