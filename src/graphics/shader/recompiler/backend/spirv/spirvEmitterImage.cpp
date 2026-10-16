@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -356,6 +357,133 @@ uint32_t PackedOffset(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR
 	} else {
 		ctx.state.builder.AddFunction(spv::OpCompositeConstruct, TypeI32Vector(ctx.state, 2),
 		                              result, values[0], values[1]);
+	}
+	return result;
+}
+
+enum class SampleOffsetKind { None, Constant, Runtime };
+
+struct SampleOffset {
+	SampleOffsetKind kind = SampleOffsetKind::None;
+	int32_t          fields[3] {};
+};
+
+// Resolves a VGPR value that holds a compile-time constant that is the same for every lane that
+// executes the sample. Every VGPR write lowers to SelectU32(exec, value, old)
+// (Translator::WriteRawU32), and the gate only disappears when exec is the immediate true. A
+// SelectU32 is therefore accepted only when its condition is the very SSA value of the exec live
+// at the sample (`sample_exec`, ImageSampleRaw's U1 operand): a lane active at the sample was
+// active at the write and holds the constant, and inactive lanes' results are discarded. Any other
+// condition (v_cndmask compare, v_movreld's lane match, an exec that changed between the write and
+// the sample) is per-lane and is rejected.
+bool ResolveConstantU32(const IR::Value& input, const IR::Value& sample_exec, uint32_t* out) {
+	const auto value = input.Resolve();
+	if (value.IsImmediate()) {
+		if (value.GetType() != IR::Type::U32) return false;
+		*out = value.U32();
+		return true;
+	}
+	const auto* inst = value.ResolveInstruction();
+	if (inst == nullptr || inst->GetOpcode() != IR::ValueOpcode::SelectU32) return false;
+	if (!(inst->Arg(0).Resolve() == sample_exec.Resolve())) return false;
+	const auto taken = inst->Arg(1).Resolve();
+	if (!taken.IsImmediate() || taken.GetType() != IR::Type::U32) return false;
+	*out = taken.U32();
+	return true;
+}
+
+// RDNA2 MIMG _o: the first address dword packs x[5:0], y[13:8], z[21:16] as 6-bit two's
+// complement. Constant offsets in [-8, 7] (Vulkan minTexelOffset/maxTexelOffset guarantee) become
+// the ConstOffset image operand; anything else needs the runtime coordinate fold.
+SampleOffset ResolveSampleOffset(const IR::MemoryInfo& mem, const IR::Inst& address,
+                                 const IR::Value& sample_exec, const ImageSampleLayout& layout,
+                                 uint32_t spatial) {
+	SampleOffset result;
+	if (layout.offset == NoImageComponent || mem.image_address_components <= layout.offset) {
+		return result;
+	}
+	const auto packed = Decoder::ImageAddressComponentLayout(mem.image_sample_flags, layout.offset)
+	                        .bit_offset / 32u;
+	if (packed >= address.NumArgs()) return result;
+	const auto value = address.Arg(packed).Resolve();
+	result.kind      = SampleOffsetKind::Runtime;
+	uint32_t bits = 0;
+	if (!ResolveConstantU32(value, sample_exec, &bits)) return result;
+	bool           in_range = true;
+	for (uint32_t index = 0; index < 3u; index++) {
+		result.fields[index] = static_cast<int32_t>(((bits >> (index * 8u)) & 0x3fu) ^ 0x20u) - 0x20;
+		if (index < spatial && (result.fields[index] < -8 || result.fields[index] > 7)) {
+			in_range = false;
+		}
+	}
+	if (in_range) result.kind = SampleOffsetKind::Constant;
+	return result;
+}
+
+uint32_t ConstOffsetOperand(EmitterState& state, const SampleOffset& offset, uint32_t spatial) {
+	if (spatial == 1u) return ConstantI32(state, offset.fields[0]);
+	uint32_t values[3] {};
+	for (uint32_t index = 0; index < spatial; index++) {
+		values[index] = ConstantI32(state, offset.fields[index]);
+	}
+	return spatial == 2u ? state.builder.Constant(spv::OpConstantComposite, TypeI32Vector(state, 2),
+	                                              values[0], values[1])
+	                     : state.builder.Constant(spv::OpConstantComposite, TypeI32Vector(state, 3),
+	                                              values[0], values[1], values[2]);
+}
+
+// Runtime-offset fallback: coord += offset / size(level), per spatial component. Only valid when a
+// single mip level is sampled, so the caller restricts it to lz forms and to explicit-LOD forms
+// whose LOD is a compile-time constant 0. Array layers are left alone. The size
+// is queried on the same selected descriptor (`array_index`) the sample itself uses.
+uint32_t FoldOffsetIntoCoord(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
+                             const IR::Inst& address, const ImageSampleLayout& layout,
+                             uint32_t resource, uint32_t array_index, uint32_t coord) {
+	auto&       state      = ctx.state;
+	const auto& image      = state.program.info.images[resource];
+	const auto& info       = ImageDimensionInfoFor(image.dimension);
+	const auto  spatial    = info.spatial_components;
+	const auto  components = info.coordinate_components;
+	state.builder.RequireCapability(spv::CapabilityImageQuery);
+	// Level 0 only: ImageResource::mip_count is 1 for non-gather sampled images although the host
+	// view carries every level, so a higher level cannot be bounded or sized here.
+	const auto level = ConstantU32(state, 0);
+	const auto descriptor = LoadImageDescriptor(state, resource, 0u, array_index);
+	const auto size       = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpImageQuerySizeLod, ImageViewSizeType(state, image.dimension),
+	                          size, descriptor, level);
+	const auto packed = Unary(state, spv::OpBitcast, TypeI32(state),
+	                          AddressU32(ctx, mem, address, layout.offset));
+	uint32_t   parts[3] {};
+	for (uint32_t index = 0; index < components; index++) {
+		parts[index] = coord;
+		if (components != 1u) {
+			parts[index] = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), parts[index], coord,
+			                          index);
+		}
+		if (index >= spatial) continue;
+		auto dim = size;
+		if (components != 1u) {
+			dim = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), dim, size, index);
+		}
+		const auto field = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpBitFieldSExtract, TypeI32(state), field, packed,
+		                          ConstantU32(state, index * 8u), ConstantU32(state, 6));
+		const auto delta = Binary(state, spv::OpFDiv, TypeF32(state),
+		                          Unary(state, spv::OpConvertSToF, TypeF32(state), field),
+		                          Unary(state, spv::OpConvertUToF, TypeF32(state), dim));
+		parts[index]     = Binary(state, spv::OpFAdd, TypeF32(state), parts[index], delta);
+	}
+	if (components == 1u) return parts[0];
+	const auto result = state.builder.AllocateId();
+	if (components == 3u) {
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 3), result,
+		                          parts[0], parts[1], parts[2]);
+	} else {
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), result,
+		                          parts[0], parts[1]);
 	}
 	return result;
 }
@@ -878,7 +1006,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				dref_value = AddressF32(ctx, mem, *address, layout.dref);
 			}
 		}
-		std::array<uint32_t, 3> operands {};
+		std::array<uint32_t, 4> operands {};
 		size_t operand_count = 0;
 		if (HasFlag(mem, Decoder::ImageSampleFlagDerivative)) {
 			operands[0] = spv::ImageOperandsGradMask;
@@ -898,6 +1026,41 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			operands[1] = AddressF32(ctx, mem, *address, layout.bias);
 			operand_count = 2;
 		}
+		const auto sample_offset =
+		    ResolveSampleOffset(mem, *address, inst.Arg(3), layout,
+		                        dimension_info.spatial_components);
+		if (sample_offset.kind != SampleOffsetKind::None) {
+			if (image.cube) {
+				ctx.Fail(inst, "has a texel offset on a cube image");
+				return;
+			}
+			if (sample_offset.kind == SampleOffsetKind::Runtime) {
+				// The fold is exact only at mip level 0: lz, or a constant LOD of exactly 0.
+				bool fold_ok = false;
+				if (HasFlag(mem, Decoder::ImageSampleFlagLevelZero)) {
+					fold_ok = true;
+				} else if (HasFlag(mem, Decoder::ImageSampleFlagLod) &&
+				           !HasFlag(mem, Decoder::ImageSampleFlagDerivative) &&
+				           layout.lod != NoImageComponent && mem.image_address_components > layout.lod) {
+					const auto lod_layout =
+					    Decoder::ImageAddressComponentLayout(mem.image_sample_flags, layout.lod);
+					const auto packed = lod_layout.bit_offset / 32u;
+					if (lod_layout.bit_width == 32u && packed < address->NumArgs()) {
+						uint32_t lod_bits = 0;
+						if (ResolveConstantU32(address->Arg(packed), inst.Arg(3), &lod_bits)) {
+							const float value = std::bit_cast<float>(lod_bits);
+							if (value == 0.0f) fold_ok = true; // +0.0 or -0.0 only
+						}
+					}
+				}
+				if (!fold_ok) {
+					ctx.Fail(inst, "has a non-constant or out-of-range texel offset that needs an "
+					               "lz or constant-LOD-0 sample (implicit, bias, gradient "
+					               "and non-zero-LOD forms are unsupported)");
+					return;
+				}
+			}
+		}
 		const auto& samplers = state.program.info.samplers.at(mem.sampler).indirect_resources;
 		uint32_t sampler_index = 0;
 		if (!samplers.empty()) {
@@ -911,16 +1074,41 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler, sampler_index);
 		const auto EmitSample = [&](uint32_t resource, uint32_t array_index) {
 			const auto& candidate = state.program.info.images[resource];
-			const auto coord =
+			auto coord =
 			    CoordF32(ctx, mem, *address, layout.coord,
 			             ImageDimensionInfoFor(candidate.dimension).coordinate_components,
 			             candidate.cube);
+			if (sample_offset.kind != SampleOffsetKind::None) {
+				// Dynamic descriptor selection: each candidate may differ from the root image.
+				if (candidate.cube) ctx.Fail(inst, "has a texel offset on a cube image candidate");
+				if (sample_offset.kind == SampleOffsetKind::Constant) {
+					const auto candidate_spatial =
+					    ImageDimensionInfoFor(candidate.dimension).spatial_components;
+					for (uint32_t index = 0; index < candidate_spatial; index++) {
+						if (sample_offset.fields[index] < -8 || sample_offset.fields[index] > 7) {
+							ctx.Fail(inst, "has a constant texel offset outside [-8, 7] for an image "
+							               "candidate");
+						}
+					}
+				}
+			}
+			auto local_operands      = operands;
+			auto local_operand_count = operand_count;
+			if (sample_offset.kind == SampleOffsetKind::Constant) {
+				// Image operand words follow mask-bit order: Bias, Lod, Grad, then ConstOffset.
+				if (local_operand_count == 0u) local_operand_count = 1u;
+				local_operands[0] |= spv::ImageOperandsConstOffsetMask;
+				local_operands[local_operand_count++] = ConstOffsetOperand(
+				    state, sample_offset, ImageDimensionInfoFor(candidate.dimension).spatial_components);
+			} else if (sample_offset.kind == SampleOffsetKind::Runtime) {
+				coord = FoldOffsetIntoCoord(ctx, mem, *address, layout, resource, array_index, coord);
+			}
 			const auto sampled = MakeSampledImage(state, resource, sampler_id, 0u, array_index,
 			                                      sampler_index != 0u);
 			const auto sample = state.builder.AllocateId();
 			state.builder.AddFunction(opcode, result_type, sample, sampled, coord,
 			                          std::span(&dref_value, dref ? 1u : 0u),
-			                          std::span<const uint32_t>(operands).first(operand_count));
+			                          std::span<const uint32_t>(local_operands).first(local_operand_count));
 			return sample;
 		};
 		auto result = EmitImageAccess(ctx, inst, result_type, EmitSample);
