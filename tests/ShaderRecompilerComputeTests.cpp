@@ -37536,18 +37536,18 @@ TestCase ImageSampleLzOffsetLaneVariant(u32 kind) {
     } else if (kind == 1) {
       AppendVMovU32(&code, 20, 63);
       code.push_back(EncodeVopc(0xc4, InlineU32(2), 0));
-      code.push_back(EncodeSop1(0x3c, 0, 106)); // s_and_saveexec_b32 s0, vcc_lo
+      code.push_back(EncodeSop1(0x3c, 24, 106)); // s_and_saveexec_b32 s24, vcc_lo
       AppendVMovU32(&code, 20, 1);
-      code.push_back(EncodeSMovB32(126, 0)); // s_mov_b32 exec_lo, s0
+      code.push_back(EncodeSMovB32(126, 24)); // s_mov_b32 exec_lo, s24
     } else {
       AppendVMovU32(&code, 1, 0);
       code.push_back(EncodeVopc(0xc4, InlineU32(2), 0));
-      code.push_back(EncodeSop1(0x3c, 0, 106));
+      code.push_back(EncodeSop1(0x3c, 24, 106));
       AppendVMovU32(&code, 20, 1);
     }
     code.push_back(EncodeMimg0(0x37, 0x1)); // image_sample_lz_o
     code.push_back(EncodeMimg1(1, 20));
-    if (kind == 2) code.push_back(EncodeSMovB32(126, 0));
+    if (kind == 2) code.push_back(EncodeSMovB32(126, 24));
   }
   AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 0);
   AppendEnd(&code);
