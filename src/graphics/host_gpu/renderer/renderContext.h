@@ -65,11 +65,12 @@ public:
 		++m_bda_sync_epoch;
 		m_wait_pass_pending = false;
 	}
-	// A WAIT_REG_MEM (or conditional-IB compare) passed without suspending: the guest acquired a
-	// label inside this stream, so CPU writes made before the label must be visible to later BDA /
-	// unbounded consumers. Starts a new sync epoch (KYTY_SYNC_ON_WAIT_PASS: 0 off (default), 1 on,
-	// 2 only when the label's page is CPU-dirty; label_addr 0 = unknown, treated as dirty).
-	void               NoteGuestAcquire(uint64_t label_addr = 0);
+	// The command processor observed guest memory without suspending (a WAIT_REG_MEM that passed,
+	// a conditional-IB compare, COND_EXEC, SET_PREDICATION): CPU writes made before the value it
+	// saw must be visible to later BDA / unbounded consumers in this stream. Starts a new sync
+	// epoch when the current one was already consumed. KYTY_SYNC_ON_WAIT_PASS: 0 (default) only
+	// counts, 1 bumps the epoch.
+	void               NoteGuestAcquire();
 	// Test hook: overrides the KYTY_SYNC_ON_WAIT_PASS mode read from the environment.
 	static void        SetSyncOnWaitPassMode(int mode);
 	void               RunGarbageCollector();

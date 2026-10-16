@@ -200,8 +200,10 @@ struct CpuTimes {
 };
 
 struct SyncProbe {
-	// wait_pass_*: KYTY_SYNC_ON_WAIT_PASS accounting. passes = WAIT_REG_MEM / conditional-IB checks
-	// that passed without suspending while the stream's sync epoch was already consumed;
+	// wait_pass_*: KYTY_SYNC_ON_WAIT_PASS accounting. passes = guest-memory observations that did
+	// not suspend (WAIT_REG_MEM that passed with func != 0, conditional-IB compare, COND_EXEC,
+	// SET_PREDICATION) while the stream's sync epoch was already consumed. Not counted: func 0
+	// ("always") waits, and waits re-executed after a resume (fresh, unconsumed epoch);
 	// consumed = a BDA/unbounded consumer sync was requested later in that same epoch (with the
 	// switch off this is a sync the guest's acquire would have required, but that was skipped);
 	// extra = such syncs that actually ran (switch on) and uploaded > 0 bytes; bytes = their bytes.

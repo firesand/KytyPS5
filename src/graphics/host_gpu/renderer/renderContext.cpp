@@ -140,7 +140,7 @@ struct FaultSampler {
 		sync_sum.range_bytes += sync.range_bytes;
 		sync_sum.range_pages += sync.range_pages;
 		sync_sum.range_repasses += sync.range_repasses;
-		sync_sum.range_repass_pages += sync.range_repass_pages;
+		sync_sum.range_repass_ranges += sync.range_repass_ranges;
 		sync_sum.download_calls += sync.download_calls;
 		sync_sum.download_wait_ns += sync.download_wait_ns;
 		sync_sum.read_memory_calls += sync.read_memory_calls;
@@ -220,10 +220,10 @@ struct FaultSampler {
 			                    page_count, describe(page));
 		}
 		line += fmt::format(" | syncs: obtain {} calls {} ranges {} KiB, range {} calls {} ranges {} KiB"
-		                    " (repass {} passes {} pages) | downloads {} ({} ms waited), ReadMemory {}",
+		                    " (repass {} passes {} ranges) | downloads {} ({} ms waited), ReadMemory {}",
 		                    sync_all.obtain_calls, sync_all.obtain_pages, sync_all.obtain_bytes >> 10,
 		                    sync_all.range_calls, sync_all.range_pages, sync_all.range_bytes >> 10,
-		                    sync_all.range_repasses, sync_all.range_repass_pages,
+		                    sync_all.range_repasses, sync_all.range_repass_ranges,
 		                    sync_all.download_calls, sync_all.download_wait_ns / 1000000,
 		                    sync_all.read_memory_calls);
 		line += fmt::format(" | protect {} calls {} KiB | hot hashed {} skipped {} demoted {} rehash-miss {}",
@@ -383,7 +383,9 @@ void RenderContext::PrepareBda() {
 static std::atomic<int>& SyncOnWaitPassMode() {
 	static std::atomic<int> mode = [] {
 		const char* value = std::getenv("KYTY_SYNC_ON_WAIT_PASS");
-		return value == nullptr ? 0 : std::atoi(value);
+		const int   on    = value != nullptr && value[0] == '1' ? 1 : 0;
+		LOGF("RenderContext: sync on wait-pass %s\n", on != 0 ? "on" : "off (measure only)");
+		return on;
 	}();
 	return mode;
 }
@@ -392,18 +394,16 @@ void RenderContext::SetSyncOnWaitPassMode(int mode) {
 	SyncOnWaitPassMode().store(mode);
 }
 
-void RenderContext::NoteGuestAcquire(uint64_t label_addr) {
-	SyncProbe::NoteWaitPass();
+void RenderContext::NoteGuestAcquire() {
 	const int mode = SyncOnWaitPassMode().load();
-	// Nothing to do when this epoch has not synced yet: the first consumer syncs anyway.
+	// Nothing to do when this epoch has not synced yet (the first consumer syncs anyway). This also
+	// excludes a wait re-executed after a resume: BeginCommandStream started a fresh epoch.
 	if (m_bda_synced_epoch != m_bda_sync_epoch) {
 		return;
 	}
-	// Mode 0 only measures: the consumer is counted, the sync is not made.
-	if (mode == 2 && label_addr != 0 && !m_buffer_cache.IsRegionCpuModified(label_addr, 4)) {
-		return;
-	}
+	SyncProbe::NoteWaitPass();
 	m_wait_pass_pending = true;
+	// Mode 0 only measures: the consumer is counted, the sync is not made.
 	if (mode != 0) {
 		++m_bda_sync_epoch;
 	}

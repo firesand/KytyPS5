@@ -1442,7 +1442,9 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 	EXIT_NOT_IMPLEMENTED(payload_dw + exec_count >= dw);
 
 	cp.PrepareHostRead(addr, sizeof(uint32_t));
-	if (*reinterpret_cast<const volatile uint32_t*>(addr) == 0) {
+	const bool skip = *reinterpret_cast<const volatile uint32_t*>(addr) == 0;
+	cp.NoteGuestAcquire(); // the label read is an acquire point on both outcomes
+	if (skip) {
 		return payload_dw + exec_count;
 	}
 
@@ -1478,12 +1480,14 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 
 	cp.PrepareHostRead(reinterpret_cast<uint64_t>(compare_addr), sizeof(uint64_t));
 	const bool take_then = TestWaitRegMemValue(*compare_addr, reference, mask, function);
+	if (function != 0) {
+		cp.NoteGuestAcquire(); // the compare observed the label, whichever branch is taken
+	}
 	if (::Log::VerboseEnabled()) LOGF("\t branch: take=%u then=0x%016" PRIx64 "/%" PRIu32 " else=0x%016" PRIx64 "/%" PRIu32 "\n",
 	     take_then ? 1u : 0u, reinterpret_cast<uint64_t>(then_buffer), then_num_dw,
 	     reinterpret_cast<uint64_t>(else_buffer), else_num_dw);
 
 	if (take_then) {
-		cp.NoteGuestAcquire(reinterpret_cast<uint64_t>(compare_addr));
 		cp.ProcessIndirectBuffer({then_buffer, then_num_dw}, true);
 	} else if (mode == 2 && else_num_dw != 0) {
 		EXIT_NOT_IMPLEMENTED(else_buffer == nullptr);
