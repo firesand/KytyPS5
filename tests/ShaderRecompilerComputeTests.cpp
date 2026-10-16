@@ -31,6 +31,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/hostReadStats.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -189,6 +190,18 @@ struct BufferCacheTestAccess {
   static bool SynchronizeBufferFromImage(BufferCache &cache, Buffer &buffer,
                                          uint64_t address, uint64_t size) {
     return cache.SynchronizeBufferFromImage(buffer, address, size);
+  }
+
+  static void CollectSyncOwners(BufferCache &cache, uint64_t vaddr, uint64_t size) {
+    cache.CollectSyncOwners(vaddr, size);
+  }
+
+  static void SyncCollectedOwners(BufferCache &cache) {
+    cache.SyncCollectedOwners();
+  }
+
+  static void SetSyncRepass(BufferCache &cache, bool on) {
+    cache.m_sync_repass = on;
   }
 
   static BufferId PageOwner(const BufferCache &cache, uint64_t address) {
@@ -9806,6 +9819,167 @@ public:
           Require(name, "batched sync contents", batch_a == 0xa11ce5edu && batch_b == 0xb0bbe5edu,
                   "a batched range synchronization did not deliver both owners' CPU bytes");
         }
+      }
+
+      // F1 (KYTY_SYNC_REPASS): a page that becomes CPU-dirty after the candidate snapshot, outside
+      // every hull already synced, is uploaded by the repass of the same synchronization (and
+      // waits for the next one without it). Scenario 0/1: the dirty page at the snapshot is in the
+      // lower/higher slot and the sentinel page in the other buffer; scenario 2: both pages are in
+      // one buffer and the sentinel lies outside the first hull.
+      for (const bool repass : {true, false}) {
+        for (uint32_t scenario = 0; scenario < 3; ++scenario) {
+          auto &cache = resources.GetBufferCache();
+          const uint64_t p_offset = 0x2d80000 + scenario * 0x80000;
+          const uint64_t q_offset = p_offset + 0x40000;
+          constexpr uint64_t owner_size = 0x8000;
+          constexpr uint32_t initial = 0x22222222u;
+          constexpr uint32_t first_value = 0xd1d1d1d1u;
+          constexpr uint32_t sentinel = 0x5e17e1e1u;
+          for (uint64_t offset = 0; offset < owner_size; offset += sizeof(initial)) {
+            std::memcpy(memory + p_offset + offset, &initial, sizeof(initial));
+            std::memcpy(memory + q_offset + offset, &initial, sizeof(initial));
+          }
+          const auto first_owner = cache.ObtainBuffer(base + p_offset, owner_size, false);
+          const auto second_owner = scenario == 2 ? first_owner
+                                                  : cache.ObtainBuffer(base + q_offset, owner_size, false);
+          Require(name, "repass owners",
+                  first_owner.first != nullptr && second_owner.first != nullptr &&
+                      (scenario == 2 || first_owner.first != second_owner.first),
+                  "the repass scenario buffers were not created");
+          // Slot order: scenario 0 dirties the first-created buffer's page first, scenario 1 the second.
+          const uint64_t first_address =
+              base + (scenario == 1 ? q_offset : p_offset) + 0x1000;
+          const uint64_t sentinel_address =
+              scenario == 2 ? base + p_offset + 0x5000
+                            : base + (scenario == 1 ? p_offset : q_offset) + 0x3000;
+          BufferCacheTestAccess::SetSyncRepass(cache, repass);
+          *reinterpret_cast<volatile uint32_t *>(first_address) = first_value;
+          const uint64_t range_begin = base + p_offset;
+          const uint64_t range_size = q_offset + owner_size - p_offset;
+          BufferCacheTestAccess::CollectSyncOwners(cache, range_begin, range_size);
+          *reinterpret_cast<volatile uint32_t *>(sentinel_address) = sentinel; // after the snapshot
+          (void)cache.TakeSyncStats();
+          cache.BeginUploadBatch();
+          BufferCacheTestAccess::SyncCollectedOwners(cache);
+          cache.EndUploadBatch();
+          const auto repass_stats = cache.TakeSyncStats();
+          scheduler.FlushAndWait();
+          uint32_t first_device = 0, sentinel_device = 0;
+          const bool visible =
+              cache.PeekDeviceCopy(first_address, &first_device, sizeof(first_device)) &&
+              cache.PeekDeviceCopy(sentinel_address, &sentinel_device, sizeof(sentinel_device));
+          if (visible) {
+            Require(name, "repass first page", first_device == first_value,
+                    "the page dirty at the snapshot was not uploaded");
+            Require(name, "repass sentinel page",
+                    sentinel_device == (repass ? sentinel : initial),
+                    repass ? "KYTY_SYNC_REPASS=1 did not upload the page dirtied after the snapshot"
+                           : "KYTY_SYNC_REPASS=0 uploaded the page dirtied after the snapshot");
+          } else {
+            std::printf("[host]    %s: repass contents: device copy not host-visible, skipped\n", name);
+          }
+          Require(name, "repass counters",
+                  repass_stats.range_repass_ranges == (repass ? 1u : 0u) &&
+                      repass_stats.range_repasses == (repass ? 1u : 0u),
+                  "the repass counters did not match the switch");
+          Require(name, "repass leaves the sentinel pending",
+                  cache.IsRegionCpuModified(sentinel_address, sizeof(sentinel)) == !repass,
+                  "the sentinel page's dirtiness did not match the switch");
+          // The next ordinary synchronization delivers it in both modes.
+          cache.SynchronizeBuffersInRange(range_begin, range_size);
+          scheduler.FlushAndWait();
+          if (visible) {
+            Require(name, "repass next sync", cache.PeekDeviceCopy(sentinel_address, &sentinel_device,
+                                                                 sizeof(sentinel_device)) &&
+                                                   sentinel_device == sentinel,
+                    "the next synchronization did not deliver the sentinel page");
+          }
+          BufferCacheTestAccess::SetSyncRepass(cache, true);
+        }
+      }
+
+      // A hot page inside a pass-1 hull is visited exactly once per synchronization even when the
+      // repass uploads a second page of the same owner outside that hull (a pass-k piece merged
+      // into the owner's hull would visit the hot page twice and advance its unchanged counter twice).
+      {
+        auto &cache = resources.GetBufferCache();
+        constexpr uint64_t hot_offset = 0x2fa0000;
+        constexpr uint64_t hot_size = 0x10000;
+        for (uint64_t offset = 0; offset < hot_size; offset += sizeof(uint32_t)) {
+          const uint32_t zero = 0;
+          std::memcpy(memory + hot_offset + offset, &zero, sizeof(zero));
+        }
+        const auto hot_owner = cache.ObtainBuffer(base + hot_offset, hot_size, false);
+        Require(name, "hot visit owner", hot_owner.first != nullptr, "the hot-visit buffer was not created");
+        BufferCacheTestAccess::SetSyncRepass(cache, true);
+        const uint64_t hot_page = base + hot_offset + 0x1000;
+        const uint64_t dirty_page = base + hot_offset + 0x5000;
+        const uint64_t late_page = base + hot_offset + 0xb000;
+        // KYTY_HOT_PAGE_FAULTS (default 8) CPU-dirty transitions make the page hot.
+        for (uint32_t round = 0; round < 8; ++round) {
+          *reinterpret_cast<volatile uint32_t *>(hot_page) = 0x40000000u + round;
+          cache.SynchronizeBuffersInRange(base + hot_offset, hot_size);
+        }
+        cache.SynchronizeBuffersInRange(base + hot_offset, hot_size);
+        *reinterpret_cast<volatile uint32_t *>(dirty_page) = 0x1u; // in pass 1, after the hot page
+        (void)MemoryTracker::TakeHotStats();
+        (void)cache.TakeSyncStats();
+        BufferCacheTestAccess::CollectSyncOwners(cache, base + hot_offset, hot_size);
+        *reinterpret_cast<volatile uint32_t *>(late_page) = 0x2u; // after the snapshot, outside the hull
+        cache.BeginUploadBatch();
+        BufferCacheTestAccess::SyncCollectedOwners(cache);
+        cache.EndUploadBatch();
+        const auto hot_stats = MemoryTracker::TakeHotStats();
+        const auto hot_sync = cache.TakeSyncStats();
+        scheduler.FlushAndWait();
+        Require(name, "hot page repass ran", hot_sync.range_repasses == 1,
+                "the late page was not uploaded by the repass");
+        Require(name, "hot page visited once per sync",
+                hot_stats.hashed == 1, // every hot-page visit hashes once; skipped is a subset
+                "the hot page was visited more than once in one synchronization");
+      }
+
+      // F2 (KYTY_SYNC_ON_WAIT_PASS): a passing WAIT_REG_MEM must start a new sync epoch so the
+      // next BDA / unbounded consumer publishes the CPU write that preceded the label.
+      for (const int wait_mode : {1, 0}) {
+        auto &cache = resources.GetBufferCache();
+        const uint64_t x_offset = 0x2f00000 + static_cast<uint64_t>(wait_mode) * 0x10000;
+        constexpr uint32_t initial = 0x33333333u;
+        constexpr uint32_t written = 0xacc01adeu;
+        for (uint64_t offset = 0; offset < 0x8000; offset += sizeof(initial)) {
+          std::memcpy(memory + x_offset + offset, &initial, sizeof(initial));
+        }
+        const uint64_t x_address = base + x_offset + 0x1000;
+        const auto x_owner = cache.ObtainBuffer(base + x_offset, 0x8000, false);
+        Require(name, "wait-pass owner", x_owner.first != nullptr, "the consumer buffer was not created");
+        RenderContext::SetSyncOnWaitPassMode(wait_mode);
+        context.BeginCommandStream();
+        context.SyncCpuWrites(); // the stream's sync: consumes the epoch
+        scheduler.FlushAndWait();
+        (void)Libs::Graphics::SyncProbe::Take();
+        *reinterpret_cast<volatile uint32_t *>(x_address) = written; // after the sync, before the label
+        context.NoteGuestAcquire(); // the satisfied WAIT_REG_MEM
+        context.SyncCpuWrites();    // the BDA / unbounded consumer
+        scheduler.FlushAndWait();
+        const auto probe = Libs::Graphics::SyncProbe::Take();
+        uint32_t x_device = 0;
+        if (cache.PeekDeviceCopy(x_address, &x_device, sizeof(x_device))) {
+          Require(name, "wait-pass contents", x_device == (wait_mode != 0 ? written : initial),
+                  wait_mode != 0 ? "KYTY_SYNC_ON_WAIT_PASS=1 left the consumer with a stale copy"
+                                 : "KYTY_SYNC_ON_WAIT_PASS=0 published the write without a new epoch");
+        } else {
+          std::printf("[host]    %s: wait-pass contents: device copy not host-visible, skipped\n", name);
+        }
+        Require(name, "wait-pass counters",
+                probe.wait_passes == 1 && probe.wait_consumed == 1 &&
+                    probe.wait_extra == (wait_mode != 0 ? 1u : 0u) &&
+                    (wait_mode != 0) == (probe.wait_bytes != 0),
+                "the wait-pass counters did not match the switch");
+        // Deliver the stale write for the next iteration and restore the default.
+        context.BeginCommandStream();
+        context.SyncCpuWrites();
+        scheduler.FlushAndWait();
+        RenderContext::SetSyncOnWaitPassMode(0);
       }
 
       resources.UnmapMemory(base, allocation_size);

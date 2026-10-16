@@ -1394,6 +1394,89 @@ void TestSyncCandidateRunsMatchWholeRangeUpload() {
   Release(memory);
 }
 
+// F1 (KYTY_SYNC_REPASS) relies on these semantics: a page that becomes CPU-dirty after the candidate
+// snapshot, outside the runs already uploaded, stays CPU-dirty and re-arms the region's pending flag;
+// a second candidate listing minus the synced hull is exactly that page; a hot page reappears in the
+// second listing (it stays CPU-dirty) but lies inside the synced hull and is subtracted.
+void TestPostSnapshotDirtyStaysPending() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  constexpr uint64_t page = Libs::Graphics::TRACKER_PAGE_SIZE;
+  constexpr uint64_t pages = 64;
+  uint8_t *memory = Allocate(harness.page_manager, pages);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto size = pages * page;
+  constexpr uint64_t kA = 2, kB = 40;
+
+  auto candidate_pages = [&] {
+    std::vector<uint64_t> result;
+    tracker.ForEachSyncCandidateRun(
+        address, size, [&](uint64_t run_address, uint64_t run_size) noexcept {
+          for (uint64_t p = (run_address - address) / page; p < (run_address - address + run_size) / page; ++p) {
+            result.push_back(p);
+          }
+        });
+    return result;
+  };
+  auto upload = [&](uint64_t first, uint64_t count) {
+    tracker.ForEachUploadRange(
+        address + first * page, count * page, false,
+        [](uint64_t, uint64_t, const void *) noexcept {}, []() noexcept {});
+  };
+  auto take_pending = [&] {
+    int regions = 0;
+    tracker.ForEachBdaSyncPendingRegion([&](uint64_t, uint64_t) { ++regions; });
+    return regions;
+  };
+  auto fault = [&](uint64_t first) { tracker.InvalidateRegion(address + first * page, page, [] {}); };
+  auto minus = [](std::vector<uint64_t> from, uint64_t hull_first, uint64_t hull_count) {
+    from.erase(std::remove_if(from.begin(), from.end(),
+                              [&](uint64_t p) { return p >= hull_first && p < hull_first + hull_count; }),
+               from.end());
+    return from;
+  };
+
+  // Create the region and drain its fresh-region dirtiness.
+  upload(0, pages);
+  Check(candidate_pages().empty(), "drained region still had sync candidates");
+  (void)take_pending();
+
+  // 1-5: page A dirty at the snapshot; S3 already took the pending flag.
+  fault(kA);
+  (void)take_pending();
+  Check(candidate_pages() == std::vector<uint64_t>{kA}, "snapshot did not list exactly page A");
+  // 2: page B faults after the snapshot.
+  fault(kB);
+  // 3: only A's run is uploaded.
+  upload(kA, 1);
+  // 4: B is still CPU-dirty and the region is pending again; A is clean.
+  Check(tracker.IsRegionCpuModified(address + kB * page, page), "page B lost its CPU-dirty state");
+  Check(!tracker.IsRegionCpuModified(address + kA * page, page), "page A stayed CPU-dirty");
+  Check(take_pending() == 1, "the post-snapshot fault did not re-arm the pending flag");
+  // 5: second listing minus A's hull is exactly B.
+  Check(minus(candidate_pages(), kA, 1) == std::vector<uint64_t>{kB},
+        "second candidate pass minus A's hull was not exactly page B");
+  upload(kB, 1);
+  Check(candidate_pages().empty(), "uploading B left candidates");
+
+  // Hot A: KYTY_HOT_PAGE_FAULTS (default 8) fault/sync rounds. It stays CPU-dirty and a candidate.
+  for (int i = 0; i < 8; i++) {
+    fault(kA);
+    upload(kA, 1);
+  }
+  (void)take_pending();
+  Check(candidate_pages() == std::vector<uint64_t>{kA}, "hot page A was not a candidate");
+  fault(kB);
+  upload(kA, 1); // pass 1 syncs A's hull only
+  const auto second = candidate_pages();
+  Check(second == std::vector<uint64_t>({kA, kB}), "hot A did not reappear next to B in pass 2");
+  Check(minus(second, kA, 1) == std::vector<uint64_t>{kB}, "hot A was not subtracted by its hull");
+
+  upload(kB, 1);
+  tracker.UntrackMemory(address, size);
+  Release(memory);
+}
+
 // GpuWriteTicks (paged array) must behave exactly like the unordered_map<page, tick> it replaced:
 // stamped-or-not, monotonic max, tick 0 still counts as stamped, out-of-range pages are rejected.
 void TestGpuWriteTicksMatchesMap() {
@@ -1542,6 +1625,7 @@ int main(int argc, char **argv) {
   TestRangeSet();
   TestHotPageSnapshotHash();
   TestSyncCandidateRunsMatchWholeRangeUpload();
+  TestPostSnapshotDirtyStaysPending();
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();

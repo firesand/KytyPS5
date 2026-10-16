@@ -353,6 +353,10 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	(void)poll;
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
 		SuspendPm4("wait_reg_mem", reinterpret_cast<uint64_t>(addr), ref, mask, func, sizeof(T));
+	} else if (func != 0) {
+		// The resume path of a suspended wait starts a new epoch; a wait that passes does not.
+		// func 0 ("always") observes no value, so it is not an acquire.
+		NoteGuestAcquire();
 	}
 }
 
@@ -1099,6 +1103,8 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 			break;
 		default: EXIT("unknown predication op: 0x%08" PRIx32 "\n", op);
 	}
+	// The command processor read the result: acquire point for later BDA / unbounded consumers.
+	NoteGuestAcquire();
 	switch (condition) {
 		case 0x00: m_predicate_skip = (value != 0); break;
 		case 0x01: m_predicate_skip = (value == 0); break;
