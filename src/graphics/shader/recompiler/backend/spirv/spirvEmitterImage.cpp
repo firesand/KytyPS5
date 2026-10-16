@@ -1078,6 +1078,20 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			    CoordF32(ctx, mem, *address, layout.coord,
 			             ImageDimensionInfoFor(candidate.dimension).coordinate_components,
 			             candidate.cube);
+			if (sample_offset.kind != SampleOffsetKind::None) {
+				// Dynamic descriptor selection: each candidate may differ from the root image.
+				if (candidate.cube) ctx.Fail(inst, "has a texel offset on a cube image candidate");
+				if (sample_offset.kind == SampleOffsetKind::Constant) {
+					const auto candidate_spatial =
+					    ImageDimensionInfoFor(candidate.dimension).spatial_components;
+					for (uint32_t index = 0; index < candidate_spatial; index++) {
+						if (sample_offset.fields[index] < -8 || sample_offset.fields[index] > 7) {
+							ctx.Fail(inst, "has a constant texel offset outside [-8, 7] for an image "
+							               "candidate");
+						}
+					}
+				}
+			}
 			auto local_operands      = operands;
 			auto local_operand_count = operand_count;
 			if (sample_offset.kind == SampleOffsetKind::Constant) {
