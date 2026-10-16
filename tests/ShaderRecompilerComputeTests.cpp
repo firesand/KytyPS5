@@ -9935,7 +9935,7 @@ public:
         Require(name, "hot page repass ran", hot_sync.range_repasses == 1,
                 "the late page was not uploaded by the repass");
         Require(name, "hot page visited once per sync",
-                hot_stats.hashed + hot_stats.skipped == 1,
+                hot_stats.hashed == 1, // every hot-page visit hashes once; skipped is a subset
                 "the hot page was visited more than once in one synchronization");
       }
 
