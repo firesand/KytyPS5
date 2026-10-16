@@ -434,19 +434,20 @@ uint32_t ConstOffsetOperand(EmitterState& state, const SampleOffset& offset, uin
 
 // Runtime-offset fallback: coord += offset / size(level), per spatial component. Only valid when a
 // single mip level is sampled, so the caller restricts it to lz forms and to explicit-LOD forms
-// whose LOD is a compile-time integral constant (`level`). Array layers are left alone. The size
+// whose LOD is a compile-time constant 0. Array layers are left alone. The size
 // is queried on the same selected descriptor (`array_index`) the sample itself uses.
 uint32_t FoldOffsetIntoCoord(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                              const IR::Inst& address, const ImageSampleLayout& layout,
-                             uint32_t resource, uint32_t array_index, uint32_t coord,
-                             uint32_t level_value) {
+                             uint32_t resource, uint32_t array_index, uint32_t coord) {
 	auto&       state      = ctx.state;
 	const auto& image      = state.program.info.images[resource];
 	const auto& info       = ImageDimensionInfoFor(image.dimension);
 	const auto  spatial    = info.spatial_components;
 	const auto  components = info.coordinate_components;
 	state.builder.RequireCapability(spv::CapabilityImageQuery);
-	const auto level = ConstantU32(state, std::min(level_value, std::max(image.mip_count, 1u) - 1u));
+	// Level 0 only: ImageResource::mip_count is 1 for non-gather sampled images although the host
+	// view carries every level, so a higher level cannot be bounded or sized here.
+	const auto level = ConstantU32(state, 0);
 	const auto descriptor = LoadImageDescriptor(state, resource, 0u, array_index);
 	const auto size       = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpImageQuerySizeLod, ImageViewSizeType(state, image.dimension),
@@ -1025,7 +1026,6 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			operands[1] = AddressF32(ctx, mem, *address, layout.bias);
 			operand_count = 2;
 		}
-		uint32_t fold_level = 0;
 		const auto sample_offset =
 		    ResolveSampleOffset(mem, *address, inst.Arg(3), layout,
 		                        dimension_info.spatial_components);
@@ -1035,7 +1035,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				return;
 			}
 			if (sample_offset.kind == SampleOffsetKind::Runtime) {
-				// The fold is exact only for one sampled mip level: lz, or a constant integral LOD.
+				// The fold is exact only at mip level 0: lz, or a constant LOD of exactly 0.
 				bool fold_ok = false;
 				if (HasFlag(mem, Decoder::ImageSampleFlagLevelZero)) {
 					fold_ok = true;
@@ -1049,17 +1049,14 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 						uint32_t lod_bits = 0;
 						if (ResolveConstantU32(address->Arg(packed), inst.Arg(3), &lod_bits)) {
 							const float value = std::bit_cast<float>(lod_bits);
-							if (value >= 0.0f && value < 16.0f && value == std::floor(value)) {
-								fold_ok    = true;
-								fold_level = static_cast<uint32_t>(value);
-							}
+							if (value == 0.0f) fold_ok = true; // +0.0 or -0.0 only
 						}
 					}
 				}
 				if (!fold_ok) {
 					ctx.Fail(inst, "has a non-constant or out-of-range texel offset that needs an "
-					               "lz or constant-integral-LOD sample (implicit, bias, gradient "
-					               "and fractional-LOD forms are unsupported)");
+					               "lz or constant-LOD-0 sample (implicit, bias, gradient "
+					               "and non-zero-LOD forms are unsupported)");
 					return;
 				}
 			}
@@ -1090,8 +1087,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				local_operands[local_operand_count++] = ConstOffsetOperand(
 				    state, sample_offset, ImageDimensionInfoFor(candidate.dimension).spatial_components);
 			} else if (sample_offset.kind == SampleOffsetKind::Runtime) {
-				coord = FoldOffsetIntoCoord(ctx, mem, *address, layout, resource, array_index, coord,
-				                         fold_level);
+				coord = FoldOffsetIntoCoord(ctx, mem, *address, layout, resource, array_index, coord);
 			}
 			const auto sampled = MakeSampledImage(state, resource, sampler_id, 0u, array_index,
 			                                      sampler_index != 0u);
