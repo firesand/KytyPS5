@@ -9879,7 +9879,7 @@ public:
             std::printf("[host]    %s: repass contents: device copy not host-visible, skipped\n", name);
           }
           Require(name, "repass counters",
-                  repass_stats.range_repass_pages == (repass ? 1u : 0u) &&
+                  repass_stats.range_repass_ranges == (repass ? 1u : 0u) &&
                       repass_stats.range_repasses == (repass ? 1u : 0u),
                   "the repass counters did not match the switch");
           Require(name, "repass leaves the sentinel pending",
@@ -9896,6 +9896,47 @@ public:
           }
           BufferCacheTestAccess::SetSyncRepass(cache, true);
         }
+      }
+
+      // A hot page inside a pass-1 hull is visited exactly once per synchronization even when the
+      // repass uploads a second page of the same owner outside that hull (a pass-k piece merged
+      // into the owner's hull would visit the hot page twice and advance its unchanged counter twice).
+      {
+        auto &cache = resources.GetBufferCache();
+        constexpr uint64_t hot_offset = 0x2fa0000;
+        constexpr uint64_t hot_size = 0x10000;
+        for (uint64_t offset = 0; offset < hot_size; offset += sizeof(uint32_t)) {
+          const uint32_t zero = 0;
+          std::memcpy(memory + hot_offset + offset, &zero, sizeof(zero));
+        }
+        const auto hot_owner = cache.ObtainBuffer(base + hot_offset, hot_size, false);
+        Require(name, "hot visit owner", hot_owner.first != nullptr, "the hot-visit buffer was not created");
+        BufferCacheTestAccess::SetSyncRepass(cache, true);
+        const uint64_t hot_page = base + hot_offset + 0x1000;
+        const uint64_t dirty_page = base + hot_offset + 0x5000;
+        const uint64_t late_page = base + hot_offset + 0xb000;
+        // KYTY_HOT_PAGE_FAULTS (default 8) CPU-dirty transitions make the page hot.
+        for (uint32_t round = 0; round < 8; ++round) {
+          *reinterpret_cast<volatile uint32_t *>(hot_page) = 0x40000000u + round;
+          cache.SynchronizeBuffersInRange(base + hot_offset, hot_size);
+        }
+        cache.SynchronizeBuffersInRange(base + hot_offset, hot_size);
+        *reinterpret_cast<volatile uint32_t *>(dirty_page) = 0x1u; // in pass 1, after the hot page
+        (void)MemoryTracker::TakeHotStats();
+        (void)cache.TakeSyncStats();
+        BufferCacheTestAccess::CollectSyncOwners(cache, base + hot_offset, hot_size);
+        *reinterpret_cast<volatile uint32_t *>(late_page) = 0x2u; // after the snapshot, outside the hull
+        cache.BeginUploadBatch();
+        BufferCacheTestAccess::SyncCollectedOwners(cache);
+        cache.EndUploadBatch();
+        const auto hot_stats = MemoryTracker::TakeHotStats();
+        const auto hot_sync = cache.TakeSyncStats();
+        scheduler.FlushAndWait();
+        Require(name, "hot page repass ran", hot_sync.range_repasses == 1,
+                "the late page was not uploaded by the repass");
+        Require(name, "hot page visited once per sync",
+                hot_stats.hashed + hot_stats.skipped == 1,
+                "the hot page was visited more than once in one synchronization");
       }
 
       // F2 (KYTY_SYNC_ON_WAIT_PASS): a passing WAIT_REG_MEM must start a new sync epoch so the
