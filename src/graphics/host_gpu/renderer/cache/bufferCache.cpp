@@ -1129,7 +1129,9 @@ void BufferCache::ProcessFaultBuffer() {
 
 bool BufferCache::ReadSyncRepassEnv() {
 	const char* value = std::getenv("KYTY_SYNC_REPASS");
-	return value == nullptr || value[0] != '0';
+	const bool on = value == nullptr || value[0] != '0';
+	LOGF("BufferCache: sync repass %s\n", on ? "on" : "off");
+	return on;
 }
 
 // Calls func(owner, start, finish) for every cached buffer piece inside [from, to).
@@ -1241,7 +1243,7 @@ void BufferCache::SyncCollectedOwners() {
 		m_sync_stats.range_repasses++;
 		for (const auto& piece: m_sync_pieces) {
 			sync_one(piece.id, piece.start, piece.finish);
-			m_sync_stats.range_repass_pages += m_last_upload_pages;
+			m_sync_stats.range_repass_ranges += m_last_upload_pages;
 			m_sync_done.emplace_back(piece.start, piece.finish);
 		}
 		std::sort(m_sync_done.begin(), m_sync_done.end());

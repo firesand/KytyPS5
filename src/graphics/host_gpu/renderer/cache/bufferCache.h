@@ -163,7 +163,7 @@ public:
 	struct SyncStats {
 		uint64_t obtain_calls = 0, obtain_bytes = 0, obtain_pages = 0;
 		uint64_t range_calls = 0, range_bytes = 0, range_pages = 0;
-		uint64_t range_repasses = 0, range_repass_pages = 0; // KYTY_SYNC_REPASS extra passes / pages
+		uint64_t range_repasses = 0, range_repass_ranges = 0; // KYTY_SYNC_REPASS extra passes / copy ranges
 		uint64_t download_calls = 0, download_wait_ns = 0, read_memory_calls = 0;
 		uint64_t copy_batches = 0; // barrier pairs recorded around staging copies
 		uint64_t copy_buffers = 0; // SynchronizeBuffer calls that recorded or queued a staging copy
