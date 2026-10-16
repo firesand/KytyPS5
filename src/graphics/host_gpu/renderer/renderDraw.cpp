@@ -511,12 +511,21 @@ static void NoteRenderTargetExtent(uint32_t width, uint32_t height, uint32_t slo
 	max_w = max_h = max0_w = max0_h = draws = 0; distinct.clear(); last = now;
 }
 
+// KYTY_COLOR_FEEDBACK (default 1): declare the colour feedback loop (VK_EXT_attachment_feedback_loop_
+// dynamic_state) when a colour attachment's image is also bound as a sampled/storage input of the draw.
+// 0 restores the old behaviour (eGeneral layout, feedback loop left disabled for colour).
+static bool ColorFeedbackEnabled() {
+	const char* value = std::getenv("KYTY_COLOR_FEEDBACK");
+	return value == nullptr || value[0] != '0';
+}
+
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
                                                  uint32_t color_count, RenderDepthInfo& depth,
                                                  vk::ImageAspectFlags& feedback_aspects,
                                                  std::span<PreparedBindings* const> stages) {
 	EXIT_IF(colors == nullptr || color_count > RENDER_COLOR_ATTACHMENTS_MAX);
 	feedback_aspects = {};
+	const bool  color_feedback = ColorFeedbackEnabled();
 	auto&       cache = m_context.GetTextureCache();
 	RenderState state {};
 	state.width                 = std::numeric_limits<uint32_t>::max();
@@ -535,8 +544,23 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		auto&      image      = cache.GetImage(target.image_id);
 		EXIT_IF(image.backing.samples != target.desc.info.samples || image_view == nullptr);
 		const auto& view   = target.desc.view_info;
-		const auto  layout = image.binding.is_bound ? vk::ImageLayout::eGeneral
-		                                            : vk::ImageLayout::eColorAttachmentOptimal;
+		bool        target_feedback = false;
+		if (color_feedback && m_context.GetGraphics().attachment_feedback_loop_enabled) {
+			for (const auto* stage: stages) {
+				for (const auto& binding: stage->images) {
+					if (binding.image_id == target.image_id && ImageRangeOverlaps(binding.desc.view_info.base_level, binding.desc.view_info.level_count, view.base_level, view.level_count) &&
+					    ImageRangeOverlaps(binding.desc.view_info.base_layer, binding.desc.view_info.layer_count, view.base_layer, view.layer_count)) {
+						feedback_aspects |= vk::ImageAspectFlagBits::eColor;
+						target_feedback = true;
+					}
+				}
+			}
+		}
+		// The sampled read of a feedback-loop colour image uses eGeneral too (CommitBindings takes
+		// binding.attachment_layout for target images).
+		const auto  layout = (image.binding.is_bound || target_feedback)
+		                         ? vk::ImageLayout::eGeneral
+		                         : vk::ImageLayout::eColorAttachmentOptimal;
 		image.binding.attachment_layout = layout;
 		image.binding.attachment_access =
 		    vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite;

@@ -17939,8 +17939,10 @@ public:
 
   void CheckRasterization(
       bool depth_feedback,
-      Prospero::BufferFormat color_format = Prospero::BufferFormat::k32_32_32_32Float) {
+      Prospero::BufferFormat color_format = Prospero::BufferFormat::k32_32_32_32Float,
+      bool color_feedback = false) {
     const char *name = depth_feedback ? "DepthAttachmentFeedback" : "PolygonModeRasterization";
+    if (color_feedback) name = "ColorAttachmentFeedback";
     uint32_t packed_color = 0;
     std::array<float, 4> packed_expected{};
     switch (color_format) {
@@ -17957,7 +17959,7 @@ public:
       default: break;
     }
     const bool packed_vertex_color = color_format != Prospero::BufferFormat::k32_32_32_32Float;
-    const uint32_t extent = depth_feedback ? 8 : 32;
+    const uint32_t extent = (depth_feedback || color_feedback) ? 8 : 32;
     constexpr uintptr_t depth_address = 0x0000000204400000ull;
     constexpr uint64_t allocation_size = 0x40000;
     constexpr uint64_t rect_address = depth_address + 0x8000;
@@ -18000,7 +18002,19 @@ public:
         static_cast<float *>(mapped)[y * 64 + x] = initial_depth(x, y);
       }
     }
-    if (!depth_feedback && !packed_vertex_color) {
+    constexpr uintptr_t color_texel_address = depth_address + 0x10000;
+    if (color_feedback) {
+      // The colour attachment doubles as the sampled input: every fragment reads its own texel.
+      for (uint32_t y = 0; y < extent; y++) {
+        for (uint32_t x = 0; x < extent; x++) {
+          for (uint32_t c = 0; c < 4; c++) {
+            reinterpret_cast<float *>(color_texel_address)[(y * extent + x) * 4 + c] =
+                initial_depth(x, y);
+          }
+        }
+      }
+    }
+    if (!depth_feedback && !packed_vertex_color && !color_feedback) {
       // Rectangle input contains three position/UV records.
       constexpr std::array<float, 24> rect_vertices{
           -0.75f, -0.75f, 0, 0, 0, 0, 0, 0,
@@ -18059,10 +18073,12 @@ public:
     GraphicsCase test;
     test.name = name;
     test.pixel_depth_export = depth_feedback;
-    if (depth_feedback) {
+    if (depth_feedback || color_feedback) {
+      const uintptr_t sampled_address = color_feedback ? color_texel_address : depth_address;
       const ShaderTextureResource descriptor{{
-          static_cast<uint32_t>(depth_address >> 8u),
-          (static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u) |
+          static_cast<uint32_t>(sampled_address >> 8u),
+          (static_cast<uint32_t>(color_feedback ? Prospero::BufferFormat::k32_32_32_32Float
+                                                : Prospero::BufferFormat::k32Float) << 20u) |
               (((extent - 1u) & 3u) << 30u),
           ((extent - 1u) >> 2u) | ((extent - 1u) << 14u),
           DstSel(4, 4, 4, 4) |
@@ -18078,9 +18094,14 @@ public:
       test.fragment_code.push_back(EncodeMimg0(0x27, 1));
       test.fragment_code.push_back(EncodeMimg1(0, 20, 0, 2));
       AppendVMovLiteral(&test.fragment_code, 1, 0x3e000000u);
-      test.fragment_code.push_back(EncodeVop2(0x03, 1, Vgpr(0), 1));
-      test.fragment_code.push_back(EncodeExp0(0x08, 0x1, false));
-      test.fragment_code.push_back(EncodeExp1(1, 1, 1, 1));
+      if (color_feedback) {
+        // Colour out = own texel + 0.125 (a neighbour read would race with earlier fragments).
+        test.fragment_code.push_back(EncodeVop2(0x03, 0, Vgpr(0), 1));
+      } else {
+        test.fragment_code.push_back(EncodeVop2(0x03, 1, Vgpr(0), 1));
+        test.fragment_code.push_back(EncodeExp0(0x08, 0x1, false));
+        test.fragment_code.push_back(EncodeExp1(1, 1, 1, 1));
+      }
     } else {
       test.pixel_interpolator_settings = {0x400u};
       for (uint32_t component = 0; component < (packed_vertex_color ? 4u : 1u); component++) {
@@ -18137,7 +18158,7 @@ public:
     std::array<float, 18> vertices{
         -0.75f, -0.75f, 1, 1, 1, 1, 0.75f, -0.75f, 0.5f, 1, 1, 1,
         0.0f, 0.75f, 0.25f, 1, 1, 1};
-    if (depth_feedback) {
+    if (depth_feedback || color_feedback) {
       vertices = {-1, -1, 0, 0, 0, 1, 3, -1, 2, 0, 0, 1, -1, 3, 0, 2, 0, 1};
     }
     std::vector<u32> vertex_words(vertices.size());
@@ -18176,25 +18197,45 @@ public:
       auto bindings = RenderExecutorTestAccess::PrepareGraphicsBindings(
           executor, vertex.stage, pixel.stage, true);
       Require(name, "sampled attachment identity",
-              !depth_feedback || bindings.pixel->images[0].image_id == depth.image_id,
-              "the fragment must sample the depth attachment's native image");
+              (!depth_feedback || bindings.pixel->images[0].image_id == depth.image_id) &&
+                  (!color_feedback || bindings.pixel->images[0].image_id == color.image_id),
+              "the fragment must sample the attachment's native image");
       auto &command = scheduler.Current();
       vk::ImageAspectFlags feedback_aspects;
       std::array<PreparedBindings *, 2> stages{
           &bindings.vertex[0], &*bindings.pixel};
+      if (color_feedback) {
+        // Host-only: with KYTY_COLOR_FEEDBACK=0 the old behaviour (no colour feedback) returns.
+        ::setenv("KYTY_COLOR_FEEDBACK", "0", 1);
+        vk::ImageAspectFlags old_aspects = vk::ImageAspectFlagBits::eColor;
+        (void)RenderExecutorTestAccess::AcquireRenderTargets(
+            executor, command, &color, 1, depth, stages, &old_aspects);
+        ::unsetenv("KYTY_COLOR_FEEDBACK");
+        Require(name, "KYTY_COLOR_FEEDBACK=0 restores old aspects", !old_aspects,
+                "the knob did not disable colour feedback aspects");
+      }
       auto rendering = RenderExecutorTestAccess::AcquireRenderTargets(
           executor, command, &color, 1, depth, stages, &feedback_aspects);
+      if (color_feedback) {
+        Require(name, "color feedback aspects",
+                feedback_aspects == vk::ImageAspectFlagBits::eColor &&
+                    rendering.color_attachments[0].image_layout == vk::ImageLayout::eGeneral,
+                "a colour attachment sampled by its own draw did not declare colour feedback");
+      }
       const bool feedback_enabled = rendering.depth_stencil_attachment.image_layout ==
                                     vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT;
       Require(name, "per-draw depth feedback",
               feedback_enabled == (depth_feedback && depth.depth_write_enable) &&
-                  feedback_aspects == (feedback_enabled
-                                          ? vk::ImageAspectFlagBits::eDepth
-                                          : vk::ImageAspectFlags{}),
+                  feedback_aspects == (color_feedback ? vk::ImageAspectFlags{vk::ImageAspectFlagBits::eColor}
+                                       : feedback_enabled ? vk::ImageAspectFlags{vk::ImageAspectFlagBits::eDepth}
+                                                          : vk::ImageAspectFlags{}),
               "feedback was not selected only for an overlapping fragment depth read/write");
       RenderExecutorTestAccess::CommitBindings(
           executor, command, selected, bindings.vertex[0], *bindings.pixel);
-      rendering.color_attachments[0].is_clear = true;
+      Require(name, "sampled colour descriptor layout",
+              !color_feedback || bindings.pixel->images[0].layout == vk::ImageLayout::eGeneral,
+              "the colour feedback read must use the general layout like the attachment");
+      rendering.color_attachments[0].is_clear = !color_feedback;
       rendering.color_attachments[0].clear_value = clear_value;
       command.BeginRendering(rendering);
       auto cmd = command.Handle();
@@ -18249,6 +18290,22 @@ public:
                 std::abs(std::bit_cast<float>(solid_pixels[center + component]) -
                          packed_expected[component]) < 0.0001f && solid_pixels[component] == 0,
                 "packed vertex color changed channels, clamped HDR, or filled outside the triangle");
+      }
+    } else if (color_feedback) {
+      draw(filled);
+      draw(filled);
+      const auto repeated_pixels = read_color();
+      for (uint32_t y = 0; y < extent; y++) {
+        for (uint32_t x = 0; x < extent; x++) {
+          for (uint32_t c = 0; c < 4; c++) {
+            const auto index = (y * extent + x) * 4 + c;
+            Require(name, "colour feedback read-modify-write",
+                    solid_pixels[index] == std::bit_cast<uint32_t>(initial_depth(x, y) + 0.125f) &&
+                        repeated_pixels[index] ==
+                            std::bit_cast<uint32_t>(initial_depth(x, y) + 0.375f),
+                    "a fragment did not read back its own earlier colour write");
+          }
+        }
       }
     } else if (depth_feedback) {
       // Consecutive draws in the same submission must see each earlier depth write.
@@ -19249,14 +19306,14 @@ public:
       vertex_shader = owned_vertex_shader;
       pixel_shader = owned_pixel_shader;
     }
-    if (m_gpu_indirect_supported && !depth_feedback && !packed_vertex_color) {
+    if (m_gpu_indirect_supported && !depth_feedback && !color_feedback && !packed_vertex_color) {
       // The GPU-copied argument pages are GPU-owned; unmapping publishes them to the CPU, which
       // needs the GPU command lane.
       context.InitializeGpu(nullptr);
     }
     resources.UnmapMemory(depth_address, allocation_size);
     scheduler.Finish();
-    if (m_gpu_indirect_supported && !depth_feedback && !packed_vertex_color) {
+    if (m_gpu_indirect_supported && !depth_feedback && !color_feedback && !packed_vertex_color) {
       context.ShutdownGpu();
     }
     DestroyBuffer(&buffer);
@@ -46744,6 +46801,7 @@ int main(int argc, char **argv) {
     CheckDepthTextureEncoding();
     vulkan.CheckComparisonDepthTexture();
     vulkan.CheckRasterization(true);
+    vulkan.CheckRasterization(false, Prospero::BufferFormat::k32_32_32_32Float, true);
     RunCase(nullptr, ImageSampleA16CompareBiasRdna2AddressOrder());
     return 0;
   }
@@ -46847,6 +46905,7 @@ int main(int argc, char **argv) {
   if (rasterization) {
     vulkan.CheckComparisonDepthTexture();
     vulkan.CheckRasterization(true);
+    vulkan.CheckRasterization(false, Prospero::BufferFormat::k32_32_32_32Float, true);
   } else {
     skipped_device_checks = true;
   }
