@@ -368,11 +368,15 @@ struct SampleOffset {
 	int32_t          fields[3] {};
 };
 
-// Resolves a VGPR value that holds a compile-time constant. `v_mov_b32 vN, K` is lowered as
-// SelectU32(exec, K, old) (Translator::WriteRawU32), which is not an immediate: for inactive lanes
-// the sample result is discarded, so the exec-gated true arm is the constant. The v_writelane
-// shape (Control.cpp: exec && m0 == lane) is lane-dependent and is not accepted.
-bool ResolveConstantU32(const IR::Value& input, uint32_t* out) {
+// Resolves a VGPR value that holds a compile-time constant that is the same for every lane that
+// executes the sample. Every VGPR write lowers to SelectU32(exec, value, old)
+// (Translator::WriteRawU32), and the gate only disappears when exec is the immediate true. A
+// SelectU32 is therefore accepted only when its condition is the very SSA value of the exec live
+// at the sample (`sample_exec`, ImageSampleRaw's U1 operand): a lane active at the sample was
+// active at the write and holds the constant, and inactive lanes' results are discarded. Any other
+// condition (v_cndmask compare, v_movreld's lane match, an exec that changed between the write and
+// the sample) is per-lane and is rejected.
+bool ResolveConstantU32(const IR::Value& input, const IR::Value& sample_exec, uint32_t* out) {
 	const auto value = input.Resolve();
 	if (value.IsImmediate()) {
 		if (value.GetType() != IR::Type::U32) return false;
@@ -381,18 +385,7 @@ bool ResolveConstantU32(const IR::Value& input, uint32_t* out) {
 	}
 	const auto* inst = value.ResolveInstruction();
 	if (inst == nullptr || inst->GetOpcode() != IR::ValueOpcode::SelectU32) return false;
-	const auto condition = inst->Arg(0).Resolve();
-	if (condition.IsImmediate()) return false;
-	const auto* condition_inst = condition.ResolveInstruction();
-	if (condition_inst->GetOpcode() == IR::ValueOpcode::LogicalAnd) {
-		for (uint32_t index = 0; index < condition_inst->NumArgs(); index++) {
-			const auto operand = condition_inst->Arg(index).Resolve();
-			if (!operand.IsImmediate() &&
-			    operand.ResolveInstruction()->GetOpcode() == IR::ValueOpcode::IEqual32) {
-				return false;
-			}
-		}
-	}
+	if (!(inst->Arg(0).Resolve() == sample_exec.Resolve())) return false;
 	const auto taken = inst->Arg(1).Resolve();
 	if (!taken.IsImmediate() || taken.GetType() != IR::Type::U32) return false;
 	*out = taken.U32();
@@ -403,7 +396,8 @@ bool ResolveConstantU32(const IR::Value& input, uint32_t* out) {
 // complement. Constant offsets in [-8, 7] (Vulkan minTexelOffset/maxTexelOffset guarantee) become
 // the ConstOffset image operand; anything else needs the runtime coordinate fold.
 SampleOffset ResolveSampleOffset(const IR::MemoryInfo& mem, const IR::Inst& address,
-                                 const ImageSampleLayout& layout, uint32_t spatial) {
+                                 const IR::Value& sample_exec, const ImageSampleLayout& layout,
+                                 uint32_t spatial) {
 	SampleOffset result;
 	if (layout.offset == NoImageComponent || mem.image_address_components <= layout.offset) {
 		return result;
@@ -414,7 +408,7 @@ SampleOffset ResolveSampleOffset(const IR::MemoryInfo& mem, const IR::Inst& addr
 	const auto value = address.Arg(packed).Resolve();
 	result.kind      = SampleOffsetKind::Runtime;
 	uint32_t bits = 0;
-	if (!ResolveConstantU32(value, &bits)) return result;
+	if (!ResolveConstantU32(value, sample_exec, &bits)) return result;
 	bool           in_range = true;
 	for (uint32_t index = 0; index < 3u; index++) {
 		result.fields[index] = static_cast<int32_t>(((bits >> (index * 8u)) & 0x3fu) ^ 0x20u) - 0x20;
@@ -1033,7 +1027,8 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		}
 		uint32_t fold_level = 0;
 		const auto sample_offset =
-		    ResolveSampleOffset(mem, *address, layout, dimension_info.spatial_components);
+		    ResolveSampleOffset(mem, *address, inst.Arg(3), layout,
+		                        dimension_info.spatial_components);
 		if (sample_offset.kind != SampleOffsetKind::None) {
 			if (image.cube) {
 				ctx.Fail(inst, "has a texel offset on a cube image");
@@ -1052,7 +1047,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 					const auto packed = lod_layout.bit_offset / 32u;
 					if (lod_layout.bit_width == 32u && packed < address->NumArgs()) {
 						uint32_t lod_bits = 0;
-						if (ResolveConstantU32(address->Arg(packed), &lod_bits)) {
+						if (ResolveConstantU32(address->Arg(packed), inst.Arg(3), &lod_bits)) {
 							const float value = std::bit_cast<float>(lod_bits);
 							if (value >= 0.0f && value < 16.0f && value == std::floor(value)) {
 								fold_ok    = true;

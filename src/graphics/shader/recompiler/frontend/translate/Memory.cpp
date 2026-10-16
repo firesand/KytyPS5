@@ -687,7 +687,7 @@ void Translator::IMAGE_SAMPLE(const Decoder::Instruction& inst) {
 	const auto resource = GetImageResource(memory);
 	const auto sampler  = GetSamplerResource(memory);
 	const auto address  = MakeImageAddress(inst, MemorySourceAt(inst, 0));
-	const auto result   = ir.Emit(IR::ValueOpcode::ImageSampleRaw, {resource, sampler, address},
+	const auto result   = ir.Emit(IR::ValueOpcode::ImageSampleRaw, {resource, sampler, address, ir.GetExec()},
 	                              AddMemoryInfo(memory, inst.pc));
 	const bool dref     = (memory.image_sample_flags & Decoder::ImageSampleFlagCompare) != 0u;
 	if (dref && memory.data_bits != 16u) {
