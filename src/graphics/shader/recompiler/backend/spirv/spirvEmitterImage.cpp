@@ -360,6 +360,116 @@ uint32_t PackedOffset(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR
 	return result;
 }
 
+enum class SampleOffsetKind { None, Constant, Runtime };
+
+struct SampleOffset {
+	SampleOffsetKind kind = SampleOffsetKind::None;
+	int32_t          fields[3] {};
+};
+
+// RDNA2 MIMG _o: the first address dword packs x[5:0], y[13:8], z[21:16] as 6-bit two's
+// complement. Constant offsets in [-8, 7] (Vulkan minTexelOffset/maxTexelOffset guarantee) become
+// the ConstOffset image operand; anything else needs the runtime coordinate fold.
+SampleOffset ResolveSampleOffset(const IR::MemoryInfo& mem, const IR::Inst& address,
+                                 const ImageSampleLayout& layout, uint32_t spatial) {
+	SampleOffset result;
+	if (layout.offset == NoImageComponent || mem.image_address_components <= layout.offset) {
+		return result;
+	}
+	const auto packed = Decoder::ImageAddressComponentLayout(mem.image_sample_flags, layout.offset)
+	                        .bit_offset / 32u;
+	if (packed >= address.NumArgs()) return result;
+	const auto value = address.Arg(packed).Resolve();
+	result.kind      = SampleOffsetKind::Runtime;
+	if (!value.IsImmediate() || value.GetType() != IR::Type::U32) return result;
+	const uint32_t bits = value.U32();
+	bool           in_range = true;
+	for (uint32_t index = 0; index < 3u; index++) {
+		result.fields[index] = static_cast<int32_t>(((bits >> (index * 8u)) & 0x3fu) ^ 0x20u) - 0x20;
+		if (index < spatial && (result.fields[index] < -8 || result.fields[index] > 7)) {
+			in_range = false;
+		}
+	}
+	if (in_range) result.kind = SampleOffsetKind::Constant;
+	return result;
+}
+
+uint32_t ConstOffsetOperand(EmitterState& state, const SampleOffset& offset, uint32_t spatial) {
+	if (spatial == 1u) return ConstantI32(state, offset.fields[0]);
+	uint32_t values[3] {};
+	for (uint32_t index = 0; index < spatial; index++) {
+		values[index] = ConstantI32(state, offset.fields[index]);
+	}
+	return spatial == 2u ? state.builder.Constant(spv::OpConstantComposite, TypeI32Vector(state, 2),
+	                                              values[0], values[1])
+	                     : state.builder.Constant(spv::OpConstantComposite, TypeI32Vector(state, 3),
+	                                              values[0], values[1], values[2]);
+}
+
+// Explicit-LOD fallback: coord += offset / size(level), per spatial component. Array layers
+// (coordinate components beyond the spatial ones) are left alone.
+uint32_t FoldOffsetIntoCoord(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
+                             const IR::Inst& address, const ImageSampleLayout& layout,
+                             uint32_t resource, uint32_t coord, uint32_t lod_f32) {
+	auto&       state      = ctx.state;
+	const auto& image      = state.program.info.images[resource];
+	const auto& info       = ImageDimensionInfoFor(image.dimension);
+	const auto  spatial    = info.spatial_components;
+	const auto  components = info.coordinate_components;
+	state.builder.RequireCapability(spv::CapabilityImageQuery);
+	uint32_t level = ConstantU32(state, 0);
+	if (lod_f32 != 0u && image.mip_count > 1u) {
+		const auto clamped = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state),
+		                          GLSLstd450FMax, lod_f32, ZeroF32(state));
+		const auto floored = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpExtInst, TypeF32(state), floored, GlslStd450(state),
+		                          GLSLstd450Floor, clamped);
+		const auto as_uint = Unary(state, spv::OpConvertFToU, TypeU32(state), floored);
+		level              = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpExtInst, TypeU32(state), level, GlslStd450(state),
+		                          GLSLstd450UMin, as_uint, ConstantU32(state, image.mip_count - 1u));
+	}
+	const auto descriptor = LoadImageDescriptor(state, resource);
+	const auto size       = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpImageQuerySizeLod, ImageViewSizeType(state, image.dimension),
+	                          size, descriptor, level);
+	const auto packed = Unary(state, spv::OpBitcast, TypeI32(state),
+	                          AddressU32(ctx, mem, address, layout.offset));
+	uint32_t   parts[3] {};
+	for (uint32_t index = 0; index < components; index++) {
+		parts[index] = coord;
+		if (components != 1u) {
+			parts[index] = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), parts[index], coord,
+			                          index);
+		}
+		if (index >= spatial) continue;
+		auto dim = size;
+		if (components != 1u) {
+			dim = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), dim, size, index);
+		}
+		const auto field = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpBitFieldSExtract, TypeI32(state), field, packed,
+		                          ConstantU32(state, index * 8u), ConstantU32(state, 6));
+		const auto delta = Binary(state, spv::OpFDiv, TypeF32(state),
+		                          Unary(state, spv::OpConvertSToF, TypeF32(state), field),
+		                          Unary(state, spv::OpConvertUToF, TypeF32(state), dim));
+		parts[index]     = Binary(state, spv::OpFAdd, TypeF32(state), parts[index], delta);
+	}
+	if (components == 1u) return parts[0];
+	const auto result = state.builder.AllocateId();
+	if (components == 3u) {
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 3), result,
+		                          parts[0], parts[1], parts[2]);
+	} else {
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), result,
+		                          parts[0], parts[1]);
+	}
+	return result;
+}
+
 uint32_t HorizontalOffsets(EmitterState& state, ImageDimension dimension) {
 	const auto components   = ImageDimensionInfoFor(dimension).spatial_components;
 	const auto count        = ConstantU32(state, 4);
@@ -878,8 +988,9 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				dref_value = AddressF32(ctx, mem, *address, layout.dref);
 			}
 		}
-		std::array<uint32_t, 3> operands {};
+		std::array<uint32_t, 4> operands {};
 		size_t operand_count = 0;
+		uint32_t lod_value = 0;
 		if (HasFlag(mem, Decoder::ImageSampleFlagDerivative)) {
 			operands[0] = spv::ImageOperandsGradMask;
 			operands[1] = CoordF32(ctx, mem, *address, layout.grad_x, dimension_info.spatial_components);
@@ -893,10 +1004,31 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			operands[0] = spv::ImageOperandsLodMask;
 			operands[1] = lod;
 			operand_count = 2;
+			lod_value = lod;
 		} else if (layout.bias != NoImageComponent) {
 			operands[0] = spv::ImageOperandsBiasMask;
 			operands[1] = AddressF32(ctx, mem, *address, layout.bias);
 			operand_count = 2;
+		}
+		const auto sample_offset =
+		    ResolveSampleOffset(mem, *address, layout, dimension_info.spatial_components);
+		if (sample_offset.kind != SampleOffsetKind::None) {
+			if (image.cube) {
+				ctx.Fail(inst, "has a texel offset on a cube image");
+				return;
+			}
+			if (sample_offset.kind == SampleOffsetKind::Runtime) {
+				if (!explicit_lod) {
+					ctx.Fail(inst, "has a non-constant or out-of-range texel offset on an "
+					               "implicit-LOD sample");
+					return;
+				}
+				if (HasFlag(mem, Decoder::ImageSampleFlagDerivative)) {
+					ctx.Fail(inst, "has a non-constant or out-of-range texel offset on a "
+					               "gradient sample");
+					return;
+				}
+			}
 		}
 		const auto& samplers = state.program.info.samplers.at(mem.sampler).indirect_resources;
 		uint32_t sampler_index = 0;
@@ -911,16 +1043,27 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler, sampler_index);
 		const auto EmitSample = [&](uint32_t resource, uint32_t array_index) {
 			const auto& candidate = state.program.info.images[resource];
-			const auto coord =
+			auto coord =
 			    CoordF32(ctx, mem, *address, layout.coord,
 			             ImageDimensionInfoFor(candidate.dimension).coordinate_components,
 			             candidate.cube);
+			auto local_operands      = operands;
+			auto local_operand_count = operand_count;
+			if (sample_offset.kind == SampleOffsetKind::Constant) {
+				// Image operand words follow mask-bit order: Bias, Lod, Grad, then ConstOffset.
+				if (local_operand_count == 0u) local_operand_count = 1u;
+				local_operands[0] |= spv::ImageOperandsConstOffsetMask;
+				local_operands[local_operand_count++] = ConstOffsetOperand(
+				    state, sample_offset, ImageDimensionInfoFor(candidate.dimension).spatial_components);
+			} else if (sample_offset.kind == SampleOffsetKind::Runtime) {
+				coord = FoldOffsetIntoCoord(ctx, mem, *address, layout, resource, coord, lod_value);
+			}
 			const auto sampled = MakeSampledImage(state, resource, sampler_id, 0u, array_index,
 			                                      sampler_index != 0u);
 			const auto sample = state.builder.AllocateId();
 			state.builder.AddFunction(opcode, result_type, sample, sampled, coord,
 			                          std::span(&dref_value, dref ? 1u : 0u),
-			                          std::span<const uint32_t>(operands).first(operand_count));
+			                          std::span<const uint32_t>(local_operands).first(local_operand_count));
 			return sample;
 		};
 		auto result = EmitImageAccess(ctx, inst, result_type, EmitSample);
