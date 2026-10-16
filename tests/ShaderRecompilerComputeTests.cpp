@@ -18,6 +18,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/hostMemory.h"
+#include "graphics/host_gpu/hostReadStats.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -45951,6 +45952,21 @@ void CheckMeshDrawIndexGate0() {
   instance.destroy(nullptr);
 }
 
+// Mesh fallback reasons: the name table is sized by deduction and static_asserted against the enum
+// (hostReadStats.h), so a reason without a site/name cannot compile; this checks the names are
+// present and distinct at run time.
+static void CheckGpuIndirectReasonNames() {
+  using Probe = Libs::Graphics::HostReadProbe;
+  for (uint32_t i = 0; i < Probe::GpuIndirectCount; ++i) {
+    EXIT_IF(Probe::kGpuIndirectNames[i] == nullptr || Probe::kGpuIndirectNames[i][0] == 0);
+    for (uint32_t j = 0; j < i; ++j) {
+      EXIT_IF(std::strcmp(Probe::kGpuIndirectNames[i], Probe::kGpuIndirectNames[j]) == 0);
+    }
+  }
+  EXIT_IF(Probe::MeshNonIndexed != Probe::StaleMeshState + 1);
+  printf("gpu-indirect reason names OK (%u)\n", static_cast<uint32_t>(Probe::GpuIndirectCount));
+}
+
 int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
@@ -46791,6 +46807,7 @@ int main(int argc, char **argv) {
     CheckEmbeddedFetchVertexOffset();
     CheckMeshRecordEmission();
     CheckComputeDrawParametersLoads();
+    CheckGpuIndirectReasonNames();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--depth-feedback-only") == 0) {

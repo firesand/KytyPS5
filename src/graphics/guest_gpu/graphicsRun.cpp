@@ -1165,9 +1165,9 @@ static void PatchIndirectDrawOffsets(CommandProcessor& cp, IndirectDrawRegisters
 }
 
 void CommandProcessor::DrawIndirect(uint32_t data_offset, IndirectDrawRegisters registers,
-                                    uint32_t draw_initiator, bool indexed) {
+                                    uint32_t draw_initiator, bool indexed, uint32_t cmd_id) {
 	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
-	DrawIndirectMulti(data_offset, 1, nullptr, args_size, registers, draw_initiator, indexed);
+	DrawIndirectMulti(data_offset, 1, nullptr, args_size, registers, draw_initiator, indexed, cmd_id);
 }
 
 // KYTY_CP_GPU_INDIRECT=1: indirect draws read their argument records on the GPU
@@ -1181,12 +1181,41 @@ static bool GpuIndirectEnabled() {
 	return enabled;
 }
 
+// Logs the first 32 distinct mesh-packet tuples (diagnostic, KYTY_CP_GPU_INDIRECT only).
+static void LogMeshTuple(const RenderExecutor::MeshPacketInfo& probe, bool indexed, uint32_t stride,
+                         uint32_t cmd_id, bool has_count_addr) {
+	using Tuple = std::array<uint64_t, 8>;
+	static std::mutex         mutex;
+	static std::vector<Tuple> seen;
+	const Tuple tuple {probe.hash, probe.known ? (probe.fast_launch ? 1u : 0u) : 2u,
+	                   probe.known ? probe.primitive : UINT32_MAX, probe.ppg_known ? probe.ppg : UINT32_MAX,
+	                   indexed ? 1u : 0u, stride, cmd_id, has_count_addr ? 1u : 0u};
+	std::lock_guard lock(mutex);
+	if (seen.size() >= 32 || std::find(seen.begin(), seen.end(), tuple) != seen.end()) {
+		return;
+	}
+	seen.push_back(tuple);
+	char fl[4]    = "?";
+	char prim[16] = "?";
+	char ppg[16]  = "?";
+	if (probe.known) {
+		snprintf(fl, sizeof(fl), "%u", probe.fast_launch ? 1u : 0u);
+		snprintf(prim, sizeof(prim), "%u", probe.primitive);
+	}
+	if (probe.ppg_known) {
+		snprintf(ppg, sizeof(ppg), "%u", probe.ppg);
+	}
+	LOGF("GpuIndirect(mesh-tuple): ms=0x%016" PRIx64 " fl=%s prim=%s ppg=%s indexed=%d stride=%u op=0x%x"
+	     " count_addr=%d\n",
+	     probe.hash, fl, prim, ppg, indexed ? 1 : 0, stride, cmd_id, has_count_addr ? 1 : 0);
+}
+
 // Returns true when the draw was recorded with GPU-resident arguments. False keeps the host path
 // (and has counted why).
 bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_count_or_count,
                                             const volatile uint32_t* count_addr,
                                             uint32_t stride_in_bytes, IndirectDrawRegisters registers,
-                                            bool indexed) {
+                                            bool indexed, uint32_t cmd_id) {
 	auto& executor = m_renderer.GetRenderExecutor();
 	// NGG / mesh vertex stages: the translation prepass serves every batch SGPR (including the
 	// first-index one) from the record, but only for indexed draws without a count buffer.
@@ -1200,9 +1229,23 @@ bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_c
 		HostReadProbe::CountGpuIndirect(kind);
 		return false;
 	};
-	if (mesh && (!indexed || count_addr != nullptr)) {
-		HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackMesh);
-		return fallback();
+	if (mesh) {
+		// Diagnostics: classify every mesh packet by the memoized program facts and log the first
+		// 32 distinct tuples. Runs before the early returns so non-indexed packets are covered.
+		const auto probe = executor.ProbeMeshPacket(CurrentBuffer());
+		LogMeshTuple(probe, indexed, stride_in_bytes, cmd_id, count_addr != nullptr);
+		if (!indexed || count_addr != nullptr) {
+			HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackMesh);
+			if (!indexed) {
+				HostReadProbe::CountGpuIndirect(HostReadProbe::MeshNonIndexed);
+				HostReadProbe::CountGpuIndirect(!probe.known ? HostReadProbe::MeshNonIndexedUnknownFl
+				                                : probe.fast_launch ? HostReadProbe::MeshNonIndexedFl
+				                                                    : HostReadProbe::MeshNonIndexedNoFl);
+			} else {
+				HostReadProbe::CountGpuIndirect(HostReadProbe::MeshCount);
+			}
+			return fallback();
+		}
 	}
 	ShaderDrawParameters parameters;
 	parameters.active      = true;
@@ -1243,8 +1286,14 @@ bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_c
 			                                     : HostReadProbe::FallbackSrt);
 			return false;
 		}
-		if (block == RenderExecutor::GpuIndirectBlock::Mesh) {
+		if (block == RenderExecutor::GpuIndirectBlock::MeshDisabled ||
+		    block == RenderExecutor::GpuIndirectBlock::MeshFastLaunch ||
+		    block == RenderExecutor::GpuIndirectBlock::MeshPpg0) {
 			HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackMesh);
+			HostReadProbe::CountGpuIndirect(
+			    block == RenderExecutor::GpuIndirectBlock::MeshDisabled     ? HostReadProbe::MeshDisabled
+			    : block == RenderExecutor::GpuIndirectBlock::MeshFastLaunch ? HostReadProbe::MeshFastLaunch
+			                                                                : HostReadProbe::MeshPpg0);
 		}
 		return fallback();
 	}
@@ -1279,6 +1328,7 @@ bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_c
 		if (args_span > MeshArgsRangeCap || range > MeshIndexRangeCap || !GuestRange {m_index_base_addr, range}.Valid() ||
 		    !m_renderer.IsMapped(m_index_base_addr, range)) {
 			HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackMesh);
+			HostReadProbe::CountGpuIndirect(HostReadProbe::MeshCaps);
 			return fallback();
 		}
 	}
@@ -1316,13 +1366,13 @@ bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_c
 void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
                                          const volatile uint32_t* count_addr,
                                          uint32_t stride_in_bytes, IndirectDrawRegisters registers,
-                                         uint32_t draw_initiator, bool indexed) {
+                                         uint32_t draw_initiator, bool indexed, uint32_t cmd_id) {
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != (indexed ? 0u : 2u));
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 
 	if (GpuIndirectEnabled() &&
 	    TryDrawIndirectOnGpu(data_offset, max_count_or_count, count_addr, stride_in_bytes,
-	                         registers, indexed)) {
+	                         registers, indexed, cmd_id)) {
 		return;
 	}
 

@@ -636,9 +636,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 			}
 		}
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines begin vs=0x%016" PRIx64 " ps=0x%016" PRIx64
-		     " topology=%u depth=%d samples=%u%s\n",
+		     " topology=%u depth=%d samples=%u dp=%d/%d%s\n",
 		     gfx_vs_hash, gfx_ps_hash, static_cast<uint32_t>(static_params.topology),
-		     with_depth ? 1 : 0, static_cast<uint32_t>(static_params.samples), targets.c_str());
+		     with_depth ? 1 : 0, static_cast<uint32_t>(static_params.samples),
+		     vs_input_info.draw_parameters.active ? 1 : 0,
+		     vs_input_info.draw_parameters.mesh_record ? 1 : 0, targets.c_str());
 	}
 	Log::Flush();
 	const auto gfx_compile_start = std::chrono::steady_clock::now();

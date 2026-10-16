@@ -1616,6 +1616,38 @@ bool RenderExecutor::DrawUsesMeshVertexStage(CommandBuffer& buffer) {
 	       VertexShaderIsMesh(sh_ctx.GetVs(), buffer.GetRegisters());
 }
 
+RenderExecutor::MeshPacketInfo RenderExecutor::ProbeMeshPacket(CommandBuffer& buffer) {
+	static std::mutex                                    mutex;
+	static std::unordered_map<uint64_t, MeshPacketInfo> memo;
+	constexpr size_t                                     kMaxHashes = 32;
+	auto&                                                sh_ctx     = buffer.GetShaders();
+	MeshPacketInfo                                       out;
+	if (!DrawHasValidVertexShader(sh_ctx) ||
+	    !VertexShaderIsMesh(sh_ctx.GetVs(), buffer.GetRegisters(), &out.hash)) {
+		return out;
+	}
+	// Same sources PrepareProgram uses (shader/shader.cpp: `fast_launch = (GetShaderStages() >> 19) & 3`,
+	// `input_primitive = GetPrimType()`); read per packet because they are register state.
+	out.known       = true;
+	out.fast_launch = ((buffer.GetRegisters().GetShaderStages() >> 19u) & 3u) != 0;
+	out.primitive   = static_cast<uint32_t>(buffer.GetUserConfig().GetPrimType());
+	std::lock_guard lock(mutex);
+	if (const auto it = memo.find(out.hash); it != memo.end()) {
+		out.ppg_known = true;
+		out.ppg       = it->second.ppg;
+		return out;
+	}
+	if (memo.size() >= kMaxHashes) {
+		return out;
+	}
+	ShaderVertexInputInfo info {};
+	PrepareProgram(sh_ctx.GetVs(), buffer.GetRegisters(), buffer.GetUserConfig(), info);
+	out.ppg_known = true;
+	out.ppg       = info.mesh.primitives_per_group;
+	memo.emplace(out.hash, out);
+	return out;
+}
+
 bool RenderExecutor::CanDrawIndirectOnGpu(CommandBuffer& buffer, bool indexed,
                                           uint32_t index_type_and_size, uint32_t draw_count,
                                           const ShaderDrawParameters& parameters,
@@ -1651,7 +1683,7 @@ bool RenderExecutor::CanDrawIndirectOnGpu(CommandBuffer& buffer, bool indexed,
 		if (!parameters.mesh_record || !indexed || !graphics.mesh_shader_enabled ||
 		    !MeshIndirectTranslator::Fits(draw_count)) {
 			if (block != nullptr) {
-				*block = GpuIndirectBlock::Mesh;
+				*block = GpuIndirectBlock::MeshDisabled;
 			}
 			return false;
 		}
@@ -1662,7 +1694,8 @@ bool RenderExecutor::CanDrawIndirectOnGpu(CommandBuffer& buffer, bool indexed,
 		shader_hash = params.hash;
 		if (info.mesh.fast_launch || info.mesh.primitives_per_group == 0) {
 			if (block != nullptr) {
-				*block = GpuIndirectBlock::Mesh;
+				*block = info.mesh.fast_launch ? GpuIndirectBlock::MeshFastLaunch
+				                               : GpuIndirectBlock::MeshPpg0;
 			}
 			return false;
 		}

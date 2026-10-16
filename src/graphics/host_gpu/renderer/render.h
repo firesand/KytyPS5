@@ -184,8 +184,22 @@ public:
 	// evaluates one of them on the host (or one not compiled yet) keeps the host path (Srt).
 	// Indexed mesh (NGG) draws are eligible too: parameters.mesh_record selects the translation
 	// prepass variant, and the draw must name no count buffer (the caller checks).
-	enum class GpuIndirectBlock { None, Mesh, Srt, Other };
+	enum class GpuIndirectBlock { None, MeshDisabled, MeshFastLaunch, MeshPpg0, Srt, Other };
 	[[nodiscard]] bool DrawUsesMeshVertexStage(CommandBuffer& buffer);
+	// Diagnostics for mesh indirect packets. fast_launch and primitive are read from the bound
+	// registers on every packet (exact, no PrepareProgram); ppg comes from PrepareProgram, memoized
+	// by shader hash for the first 32 distinct hashes (ppg_known == false for later hashes; it
+	// shares the memo's caveat if GE_CNTL varies per hash). Only meaningful when
+	// DrawUsesMeshVertexStage() is true.
+	struct MeshPacketInfo {
+		uint64_t hash        = 0;
+		bool     known       = false; // fast_launch / primitive are valid (always true for a mesh draw)
+		bool     fast_launch = false;
+		uint32_t primitive   = 0;
+		bool     ppg_known   = false;
+		uint32_t ppg         = 0;
+	};
+	[[nodiscard]] MeshPacketInfo ProbeMeshPacket(CommandBuffer& buffer);
 	[[nodiscard]] bool CanDrawIndirectOnGpu(CommandBuffer& buffer, bool indexed,
 	                                        uint32_t index_type_and_size, uint32_t draw_count,
 	                                        const ShaderDrawParameters& parameters,

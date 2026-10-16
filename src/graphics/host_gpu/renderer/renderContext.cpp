@@ -225,7 +225,9 @@ struct FaultSampler {
 		line += fmt::format(" | cpu-sync {} calls {} regions {} copy-batches {} copy-buffers"
 		                    " | cp reads: args {} ({} ms) count {} ({} ms) dispatch {} ({} ms) pred {} ({} ms)"
 		                    " | gpu-indirect {} draws {} fallback(index_offset) {} fallback(other) ({} of which mesh) {} fallback(srt)"
-		                    " {} ms waited | mesh-gpu {} draws {} fallback(mesh-srt) {} stale(mesh-state)",
+		                    " {} ms waited | mesh-gpu {} draws {} fallback(mesh-srt) {} stale(mesh-state)"
+		                    " | mesh-fallback-reasons: nonindexed {} (fl {} nofl {} unknown-fl {}) count {}"
+		                    " fits/disabled {} fastlaunch {} ppg0 {} caps {}",
 		                    syncs_all.calls, syncs_all.regions, sync_all.copy_batches, sync_all.copy_buffers,
 		                    rs[HostReadProbe::DrawArgs].first,
 		                    rs[HostReadProbe::DrawArgs].second / 1000000,
@@ -242,7 +244,16 @@ struct FaultSampler {
 		                    reads_all.gpu_indirect_wait_ns / 1000000,
 		                    reads_all.gpu_indirect[HostReadProbe::GpuMeshDraws],
 		                    reads_all.gpu_indirect[HostReadProbe::FallbackMeshSrt],
-		                    reads_all.gpu_indirect[HostReadProbe::StaleMeshState]);
+		                    reads_all.gpu_indirect[HostReadProbe::StaleMeshState],
+		                    reads_all.gpu_indirect[HostReadProbe::MeshNonIndexed],
+		                    reads_all.gpu_indirect[HostReadProbe::MeshNonIndexedFl],
+		                    reads_all.gpu_indirect[HostReadProbe::MeshNonIndexedNoFl],
+		                    reads_all.gpu_indirect[HostReadProbe::MeshNonIndexedUnknownFl],
+		                    reads_all.gpu_indirect[HostReadProbe::MeshCount],
+		                    reads_all.gpu_indirect[HostReadProbe::MeshDisabled],
+		                    reads_all.gpu_indirect[HostReadProbe::MeshFastLaunch],
+		                    reads_all.gpu_indirect[HostReadProbe::MeshPpg0],
+		                    reads_all.gpu_indirect[HostReadProbe::MeshCaps]);
 		line += fmt::format(" | host-resident binds {} bytes {} KiB fallbacks {}", resident_all.binds,
 		                    resident_all.bytes >> 10, resident_all.fallbacks);
 		const auto& bc = budget_all.categories;
