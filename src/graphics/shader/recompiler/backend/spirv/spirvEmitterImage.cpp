@@ -368,6 +368,37 @@ struct SampleOffset {
 	int32_t          fields[3] {};
 };
 
+// Resolves a VGPR value that holds a compile-time constant. `v_mov_b32 vN, K` is lowered as
+// SelectU32(exec, K, old) (Translator::WriteRawU32), which is not an immediate: for inactive lanes
+// the sample result is discarded, so the exec-gated true arm is the constant. The v_writelane
+// shape (Control.cpp: exec && m0 == lane) is lane-dependent and is not accepted.
+bool ResolveConstantU32(const IR::Value& input, uint32_t* out) {
+	const auto value = input.Resolve();
+	if (value.IsImmediate()) {
+		if (value.GetType() != IR::Type::U32) return false;
+		*out = value.U32();
+		return true;
+	}
+	const auto* inst = value.ResolveInstruction();
+	if (inst == nullptr || inst->GetOpcode() != IR::ValueOpcode::SelectU32) return false;
+	const auto condition = inst->Arg(0).Resolve();
+	if (condition.IsImmediate()) return false;
+	const auto* condition_inst = condition.ResolveInstruction();
+	if (condition_inst->GetOpcode() == IR::ValueOpcode::LogicalAnd) {
+		for (uint32_t index = 0; index < condition_inst->NumArgs(); index++) {
+			const auto operand = condition_inst->Arg(index).Resolve();
+			if (!operand.IsImmediate() &&
+			    operand.ResolveInstruction()->GetOpcode() == IR::ValueOpcode::IEqual32) {
+				return false;
+			}
+		}
+	}
+	const auto taken = inst->Arg(1).Resolve();
+	if (!taken.IsImmediate() || taken.GetType() != IR::Type::U32) return false;
+	*out = taken.U32();
+	return true;
+}
+
 // RDNA2 MIMG _o: the first address dword packs x[5:0], y[13:8], z[21:16] as 6-bit two's
 // complement. Constant offsets in [-8, 7] (Vulkan minTexelOffset/maxTexelOffset guarantee) become
 // the ConstOffset image operand; anything else needs the runtime coordinate fold.
@@ -382,8 +413,8 @@ SampleOffset ResolveSampleOffset(const IR::MemoryInfo& mem, const IR::Inst& addr
 	if (packed >= address.NumArgs()) return result;
 	const auto value = address.Arg(packed).Resolve();
 	result.kind      = SampleOffsetKind::Runtime;
-	if (!value.IsImmediate() || value.GetType() != IR::Type::U32) return result;
-	const uint32_t bits = value.U32();
+	uint32_t bits = 0;
+	if (!ResolveConstantU32(value, &bits)) return result;
 	bool           in_range = true;
 	for (uint32_t index = 0; index < 3u; index++) {
 		result.fields[index] = static_cast<int32_t>(((bits >> (index * 8u)) & 0x3fu) ^ 0x20u) - 0x20;
@@ -1020,9 +1051,9 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 					    Decoder::ImageAddressComponentLayout(mem.image_sample_flags, layout.lod);
 					const auto packed = lod_layout.bit_offset / 32u;
 					if (lod_layout.bit_width == 32u && packed < address->NumArgs()) {
-						const auto lod = address->Arg(packed).Resolve();
-						if (lod.IsImmediate() && lod.GetType() == IR::Type::U32) {
-							const float value = std::bit_cast<float>(lod.U32());
+						uint32_t lod_bits = 0;
+						if (ResolveConstantU32(address->Arg(packed), &lod_bits)) {
+							const float value = std::bit_cast<float>(lod_bits);
 							if (value >= 0.0f && value < 16.0f && value == std::floor(value)) {
 								fold_ok    = true;
 								fold_level = static_cast<uint32_t>(value);
