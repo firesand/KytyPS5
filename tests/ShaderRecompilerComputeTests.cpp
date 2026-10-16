@@ -35581,6 +35581,14 @@ TestCase DsBpermuteWave64UsesIndependentHalves() {
   return test;
 }
 
+// KYTY_LDS_WAVE_ORDER switch as seen by the emitter: default on, "0" off.
+bool LdsWaveOrderSwitchOn() {
+  const auto *value = std::getenv("KYTY_LDS_WAVE_ORDER");
+  return value == nullptr || std::strcmp(value, "0") != 0;
+}
+
+constexpr size_t kLdsOrderLoopBarriers = 4;
+
 TestCase Wave64LdsInstructionOrder(bool probe_target = true) {
   using O = ShaderOpcode;
   TestCase test;
@@ -35631,7 +35639,10 @@ TestCase Wave64LdsInstructionOrder(bool probe_target = true) {
   test.required_spirv = {"OpLoopMerge"};
   const auto *probe = std::getenv("KYTY_PROBE_LDS_WAVE_ORDER");
   const auto *probe_all = std::getenv("KYTY_PROBE_LDS_WAVE_ORDER_ALL");
-  if (probe_target && probe != nullptr && std::strcmp(probe, "1") == 0) {
+  if (LdsWaveOrderSwitchOn()) {
+    // Tracker active: the 64-thread workgroup is one wave, so Workgroup scope.
+    test.required_spirv.push_back("OpControlBarrier %uint_2 %uint_2 %uint_264");
+  } else if (probe_target && probe != nullptr && std::strcmp(probe, "1") == 0) {
     test.required_spirv.push_back("OpControlBarrier %uint_3 %uint_3 %uint_264");
   } else if (probe_all == nullptr || std::strcmp(probe_all, "1") != 0) {
     test.forbidden_spirv.push_back("OpControlBarrier");
@@ -46277,6 +46288,38 @@ int main(int argc, char **argv) {
     const auto *probe_all = std::getenv("KYTY_PROBE_LDS_WAVE_ORDER_ALL");
     const bool enabled = probe != nullptr && std::strcmp(probe, "1") == 0;
     const bool all_enabled = probe_all != nullptr && std::strcmp(probe_all, "1") == 0;
+    const bool order_on = LdsWaveOrderSwitchOn();
+    // T1/T2: single-wave neighbour ordering, wave32 (Workgroup) and wave64 halves.
+    for (const auto &test : {Wave32SingleWaveLdsOrdering(), Wave64LdsWarWithinHalf()}) {
+      const auto compiled = CompileCase(test, 32);
+      spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+      std::string assembly;
+      Require(test.name, "neighbour ordering disassembly",
+              tools.Disassemble(compiled.spirv, &assembly),
+              "failed to disassemble neighbour ordering regression");
+      const bool wave64 = test.compute_info.wave_size == 64u;
+      const size_t expected =
+          order_on ? 4u : (wave64 && all_enabled ? 2u : 0u);
+      Require(test.name, "barrier count",
+              CountText(assembly, "OpControlBarrier ") == expected,
+              "expected entry->write, write->read, read->write (WAR), write->read");
+      if (order_on) {
+        // One barrier per hazard, before both halves of a wave64, never per half.
+        std::string want;
+        for (const char event: std::string("BSBLBSBL")) {
+          want += event;
+          if (event != 'B' && wave64) {
+            want += event;
+          }
+        }
+        Require(test.name, "barrier precedes each LDS access",
+                LdsEventSequence(assembly) == want,
+                "expected barrier, write, barrier, read, barrier, write(WAR), barrier, read");
+        Require(test.name, "workgroup scope",
+                CountText(assembly, "OpControlBarrier %uint_2 %uint_2 %uint_264") == 4u,
+                "single-wave workgroup must use Workgroup execution and memory scope");
+      }
+    }
     for (bool targeted : {false, true}) {
       const auto test = Wave64LdsInstructionOrder(targeted);
       for (u32 subgroup_size : {32u, 64u}) {
@@ -46286,16 +46329,36 @@ int main(int argc, char **argv) {
         Require(test.name, "LDS ordering disassembly",
                 tools.Disassemble(compiled.spirv, &assembly),
                 "failed to disassemble LDS ordering regression");
-        Require(test.name, "one barrier per guest LDS read",
-                CountText(assembly, "OpControlBarrier ") ==
-                    ((enabled && targeted) || (all_enabled && subgroup_size == 32u) ? 2u : 0u),
-                "probe lost its hash/emulated-wave gate or emitted per-half barriers");
+        // Switch on: write->read, read->write (WAR) and write->read hazards, one
+        // Workgroup-scope barrier each (64 threads == wave size), never per half.
+        // Switch off: the old opt-in probe, one Subgroup barrier per guest read.
+        const size_t expected =
+            order_on ? kLdsOrderLoopBarriers
+                     : ((enabled && targeted) || (all_enabled && subgroup_size == 32u) ? 2u : 0u);
+        Require(test.name, "one barrier per LDS hazard",
+                CountText(assembly, "OpControlBarrier ") == expected,
+                "LDS wave-order emission changed (tracker, or probe gate)");
+        Require(test.name, "workgroup scope when the switch is on",
+                !order_on ||
+                    CountText(assembly, "OpControlBarrier %uint_2 %uint_2 %uint_264") ==
+                        expected,
+                "one-wave workgroup must use Workgroup execution and memory scope");
       }
     }
-    auto wave32 = Wave64LdsInstructionOrder(false);
-    wave32.compute_info.wave_size = 32;
-    wave32.forbidden_spirv.push_back("OpControlBarrier");
-    (void)CompileCase(wave32, 32);
+    {
+      // Wave32 with a 64-thread workgroup (two waves): one host subgroup holds
+      // one guest wave, so Subgroup scope when the switch is on, nothing when off.
+      auto wave32 = Wave64LdsInstructionOrder(false);
+      wave32.compute_info.wave_size = 32;
+      wave32.forbidden_spirv.clear();
+      wave32.required_spirv = {"OpLoopMerge"};
+      if (order_on) {
+        wave32.required_spirv.push_back("OpControlBarrier %uint_3 %uint_3 %uint_264");
+      } else {
+        wave32.forbidden_spirv.push_back("OpControlBarrier");
+      }
+      (void)CompileCase(wave32, 32);
+    }
     std::printf("[compute] LDS wave order compile checks ok (probe=%u all=%u)\n",
                 enabled ? 1u : 0u, all_enabled ? 1u : 0u);
     return 0;
