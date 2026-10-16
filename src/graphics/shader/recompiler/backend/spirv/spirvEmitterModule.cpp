@@ -509,9 +509,10 @@ void DefineInputs(EmitterState& state) {
 		add_builtin(IR::StageInputKind::NumWorkgroups, 3, "gl_NumWorkGroups");
 	}
 	// BaseVertex / BaseInstance exist only in the Vertex execution model; MeshEXT uses DrawIndex.
-	if (const auto* vertex = state.input_info.vertex;
-	    vertex != nullptr && vertex->draw_parameters.active &&
-	    state.program.stage == ShaderType::Vertex) {
+	// input_info is a union of per-stage pointers: check the stage before reading `.vertex`.
+	if (const auto* vertex =
+	        state.program.stage == ShaderType::Vertex ? state.input_info.vertex : nullptr;
+	    vertex != nullptr && vertex->draw_parameters.active) {
 		const auto& draw = vertex->draw_parameters;
 		if (draw.base_vertex_slot != ShaderDrawParameters::kNoSlot || draw.rebase_ids) {
 			add_builtin(IR::StageInputKind::BaseVertex, 1, "gl_BaseVertex");
