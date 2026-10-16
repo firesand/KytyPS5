@@ -35646,6 +35646,94 @@ TestCase Wave64LdsInstructionOrder(bool probe_target = true) {
   return test;
 }
 
+// One-wave workgroup. Lane i writes its own slot, reads neighbour i^1 (cross-lane
+// RAW, different host invocation), overwrites its own slot (WAR against lane i^1's
+// read) and reads the neighbour again. The guest compiler emits no S_BARRIER here.
+TestCase LdsNeighbourOrdering(const char *name, u32 wave_size) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = name;
+  auto &code = test.code;
+  code.push_back(EncodeVop2(0x1a, 1, InlineU32(2), 0));  // v1 = tid << 2
+  code.push_back(EncodeVop2(0x1d, 5, InlineU32(1), 0));  // v5 = tid ^ 1
+  code.push_back(EncodeVop2(0x1a, 5, InlineU32(2), 5));  // v5 <<= 2
+  AppendVMovU32(&code, 6, 0xC0DEu);
+  code.push_back(EncodeDs0(0x0d));                       // ds_write_b32 v1, v0
+  code.push_back(EncodeDs1(0, 0, 1));
+  code.push_back(EncodeSopp(0x0c, 0xc07f));              // s_waitcnt lgkmcnt(0)
+  code.push_back(EncodeDs0(0x36));                       // ds_read_b32 v3, v5
+  code.push_back(EncodeDs1(3, 0, 5));
+  code.push_back(EncodeSopp(0x0c, 0xc07f));
+  code.push_back(EncodeDs0(0x0d));                       // ds_write_b32 v1, v6
+  code.push_back(EncodeDs1(0, 6, 1));
+  code.push_back(EncodeSopp(0x0c, 0xc07f));
+  code.push_back(EncodeDs0(0x36));                       // ds_read_b32 v4, v5
+  code.push_back(EncodeDs1(4, 0, 5));
+  code.push_back(EncodeSopp(0x0c, 0xc07f));
+  AppendStoreVgprAtLaneDwordOffset(&code, 3, 0, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 4, 0, wave_size);
+  AppendEnd(&code);
+  test.initial.assign(2 * wave_size, 0);
+  for (u32 lane = 0; lane < wave_size; lane++) {
+    test.expected.push_back(lane ^ 1u);
+  }
+  test.expected.insert(test.expected.end(), wave_size, 0xC0DEu);
+  test.opcodes = {O::V_LSHLREV_B32, O::V_XOR_B32,  O::V_MOV_B32,
+                  O::DS_WRITE_B32,  O::DS_READ_B32, O::S_WAITCNT,
+                  O::V_ADD_NC_U32,  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = wave_size;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase Wave32SingleWaveLdsOrdering() {
+  return LdsNeighbourOrdering("Wave32SingleWaveLdsOrdering", 32);
+}
+
+TestCase Wave64LdsWarWithinHalf() {
+  return LdsNeighbourOrdering("Wave64LdsWarWithinHalf", 64);
+}
+
+// Events in emission order: 'B' = OpControlBarrier, 'S'/'L' = OpStore/OpLoad through a
+// Workgroup-storage LDS access chain.
+std::string LdsEventSequence(const std::string &assembly) {
+  std::set<std::string> lds_pointers;
+  std::string events;
+  std::istringstream lines(assembly);
+  std::string line;
+  while (std::getline(lines, line)) {
+    const auto first = line.find_first_not_of(' ');
+    if (first == std::string::npos) {
+      continue;
+    }
+    line.erase(0, first);
+    if (line.rfind("OpControlBarrier ", 0) == 0) {
+      events.push_back('B');
+    } else if (line.find("= OpAccessChain %_ptr_Workgroup_uint ") != std::string::npos) {
+      lds_pointers.insert(line.substr(0, line.find(' ')));
+    } else if (line.rfind("OpStore ", 0) == 0) {
+      std::istringstream words(line);
+      std::string op, pointer;
+      words >> op >> pointer;
+      if (lds_pointers.count(pointer) != 0) {
+        events.push_back('S');
+      }
+    } else if (line.find("= OpLoad ") != std::string::npos) {
+      std::istringstream words(line);
+      std::string result, eq, op, type, pointer;
+      words >> result >> eq >> op >> type >> pointer;
+      if (lds_pointers.count(pointer) != 0) {
+        events.push_back('L');
+      }
+    }
+  }
+  return events;
+}
+
 TestCase Wave64CrossHalfLaneAndLds() {
   using O = ShaderOpcode;
   std::vector<u32> code;
@@ -46215,6 +46303,8 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--lds-wave-order-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Wave64LdsInstructionOrder());
+    RunCase(&vulkan, Wave32SingleWaveLdsOrdering());
+    RunCase(&vulkan, Wave64LdsWarWithinHalf());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--wave64-only") == 0) {
@@ -46224,6 +46314,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, DsPermuteWave64UsesIndependentHalves());
     RunCase(&vulkan, DsBpermuteWave64UsesIndependentHalves());
     RunCase(&vulkan, Wave64CrossHalfLaneAndLds());
+    RunCase(&vulkan, Wave64LdsWarWithinHalf());
     RunCase(&vulkan, Wave64RawMasksAndScalarBranch());
     RunCase(&vulkan, Wave64PartialMultidimensionalWorkgroup());
     RunCase(&vulkan, Wave64AppendConsumeHighHalf());
