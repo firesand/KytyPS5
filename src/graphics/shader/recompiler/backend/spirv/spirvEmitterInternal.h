@@ -25,6 +25,12 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
+// KYTY_LDS_WAVE_ORDER: default on; "0" disables the compute LDS wave-order barriers (A/B switch).
+inline bool LdsWaveOrderEnabled() {
+	const auto* value = std::getenv("KYTY_LDS_WAVE_ORDER");
+	return value == nullptr || std::strcmp(value, "0") != 0;
+}
+
 struct InputBinding : IR::StageInput {
 	uint32_t variable_id = 0;
 };
@@ -107,6 +113,7 @@ struct EmitterState {
 	uint32_t                                         tess_patch_base     = 0;
 
 	uint32_t                                         lane_count              = 1;
+	uint32_t                                         wave_lds_scope          = 0;
 	uint32_t                                         lane_half               = 0;
 	std::array<BufferDefinition, 4>                  storage_buffers {};
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};

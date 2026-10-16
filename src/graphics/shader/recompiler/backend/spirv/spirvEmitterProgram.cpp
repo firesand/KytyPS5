@@ -289,7 +289,13 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 	ctx.state.current_block = block;
 	EmitLabel(ctx.state, block->Definition());
 	bool emitted_non_phi = false;
-	// Diagnostic only: test native wave-wide LDS instruction order when EXEC
+	// Wave LDS ordering (see WaveLdsScope): a barrier separates an LDS write from the next LDS access
+	// and a read from the next write. The block may be entered right after a write. Emitted once per
+	// instruction, before both wave64 halves and outside the per-lane EXEC guards (barriers must be
+	// uniform). Replaces the opt-in probe below, which only runs when KYTY_LDS_WAVE_ORDER=0.
+	bool lds_written = true;
+	bool lds_read    = false;
+	// Diagnostic only (KYTY_LDS_WAVE_ORDER=0): test native wave-wide LDS instruction order when EXEC
 	// changes between writer and reader. The family probe is restricted to compute
 	// wave64 emulated as two virtual halves of one host subgroup32.
 	const auto* lds_probe = std::getenv("KYTY_PROBE_LDS_WAVE_ORDER");
@@ -300,7 +306,7 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 	                          lds_probe_all != nullptr && lds_probe_all[0] == '1' &&
 	                          lds_probe_all[1] == '\0';
 	const bool probe_lds_order = ctx.state.program.stage == ShaderType::Compute &&
-	                            (targeted_probe || family_probe);
+	                            !LdsWaveOrderEnabled() && (targeted_probe || family_probe);
 	std::optional<uint32_t> last_lds_probe_pc;
 	for (const auto& inst: *block) {
 		if (inst.GetOpcode() == IR::ValueOpcode::Phi) {
@@ -311,6 +317,28 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 			emitted_non_phi = true;
 		}
 		const auto shared_access = IR::SharedAccessOf(inst.GetOpcode());
+		if (ctx.state.wave_lds_scope != 0) {
+			if (inst.GetOpcode() == IR::ValueOpcode::Barrier) {
+				lds_written = false;
+				lds_read    = false;
+			} else if (shared_access != IR::SharedAccess::None &&
+			           ctx.Memory(inst).kind == IR::ResourceKind::Lds) {
+				const bool writes = shared_access != IR::SharedAccess::Read;
+				if (lds_written || (writes && lds_read)) {
+					const auto memory = ctx.state.lds_storage_class == spv::StorageClassStorageBuffer
+					                        ? spv::MemorySemanticsUniformMemoryMask
+					                        : spv::MemorySemanticsWorkgroupMemoryMask;
+					ctx.state.builder.AddFunction(
+					    spv::OpControlBarrier, ConstantU32(ctx.state, ctx.state.wave_lds_scope),
+					    ConstantU32(ctx.state, ctx.state.wave_lds_scope),
+					    ConstantU32(ctx.state, spv::MemorySemanticsAcquireReleaseMask | memory));
+					lds_written = false;
+					lds_read    = false;
+				}
+				lds_written |= writes;
+				lds_read |= shared_access != IR::SharedAccess::Write;
+			}
+		}
 		if (probe_lds_order &&
 		    (shared_access == IR::SharedAccess::Read || shared_access == IR::SharedAccess::Atomic) &&
 		    ctx.Memory(inst).kind == IR::ResourceKind::Lds) {

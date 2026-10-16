@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
+#include <cstring>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
@@ -15,6 +17,40 @@ namespace {
 	EXIT("SPIR-V validation failed: hash=0x%016" PRIx64 " stage=%u reason=%s\n",
 	     program.shader_hash, static_cast<unsigned>(program.stage), reason);
 	std::abort();
+}
+
+// KYTY_LDS_WAVE_ORDER (default on, "0" = off): lanes of one guest wave run in lockstep, so a lane may read
+// LDS another lane of its wave wrote without a guest barrier. Host invocations need one; it is issued where
+// the wave's control flow is uniform across the barrier scope: the workgroup when it is a single wave, or
+// the host subgroup when it holds exactly one guest wave (or both virtual halves of a wave64). Compute only.
+// A workgroup-scope barrier is used for single-wave workgroups because a subgroup-scope one did not make
+// LDS writes visible on NVIDIA (AnyPS5 SpirvEmitter.cpp:41-67).
+uint32_t WaveLdsScope(const IR::Program& program, const ShaderWorkgroupInputInfo* workgroup,
+                      uint32_t lane_count) {
+	if (!Emitter::LdsWaveOrderEnabled() || program.stage != ShaderType::Compute || workgroup == nullptr) {
+		return 0;
+	}
+	bool writes = false;
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			const auto access = IR::SharedAccessOf(inst.GetOpcode());
+			writes |= access != IR::SharedAccess::None && access != IR::SharedAccess::Read;
+		}
+	}
+	if (!writes) {
+		return 0;
+	}
+	const uint32_t threads = std::max(workgroup->threads_num[0], 1u) *
+	                         std::max(workgroup->threads_num[1], 1u) *
+	                         std::max(workgroup->threads_num[2], 1u);
+	if (threads <= program.wave_size) {
+		return spv::ScopeWorkgroup;
+	}
+	if (lane_count == 2u ||
+	    (program.wave_size == workgroup->host_subgroup_size && workgroup->host_subgroup_size <= 32u)) {
+		return spv::ScopeSubgroup;
+	}
+	return 0;
 }
 
 void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
@@ -222,6 +258,7 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
 	        ? 2u
 	        : 1u;
+	state.wave_lds_scope = WaveLdsScope(program, workgroup, state.lane_count);
 	DefineModule(state);
 	ValidateNativeProgram(program, program.stage == ShaderType::Compute &&
 	                                   input_info.compute != nullptr && input_info.compute->lds_storage);
