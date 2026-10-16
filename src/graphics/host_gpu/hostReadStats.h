@@ -200,16 +200,36 @@ struct CpuTimes {
 };
 
 struct SyncProbe {
+	// wait_pass_*: KYTY_SYNC_ON_WAIT_PASS accounting. passes = WAIT_REG_MEM / conditional-IB checks
+	// that passed without suspending while the stream's sync epoch was already consumed;
+	// consumed = a BDA/unbounded consumer sync was requested later in that same epoch (with the
+	// switch off this is a sync the guest's acquire would have required, but that was skipped);
+	// extra = such syncs that actually ran (switch on) and uploaded > 0 bytes; bytes = their bytes.
 	struct Snapshot {
 		uint64_t calls = 0, regions = 0;
+		uint64_t wait_passes = 0, wait_consumed = 0, wait_extra = 0, wait_bytes = 0;
 	};
 	inline static std::atomic<uint64_t> s_calls {0};
 	inline static std::atomic<uint64_t> s_regions {0};
+	inline static std::atomic<uint64_t> s_wait_passes {0};
+	inline static std::atomic<uint64_t> s_wait_consumed {0};
+	inline static std::atomic<uint64_t> s_wait_extra {0};
+	inline static std::atomic<uint64_t> s_wait_bytes {0};
 	static void     NoteCall() noexcept { s_calls.fetch_add(1, std::memory_order_relaxed); }
 	static void     NoteRegion() noexcept { s_regions.fetch_add(1, std::memory_order_relaxed); }
+	static void     NoteWaitPass() noexcept { s_wait_passes.fetch_add(1, std::memory_order_relaxed); }
+	static void     NoteWaitConsumed() noexcept { s_wait_consumed.fetch_add(1, std::memory_order_relaxed); }
+	static void     NoteWaitExtra(uint64_t bytes) noexcept {
+        s_wait_extra.fetch_add(1, std::memory_order_relaxed);
+        s_wait_bytes.fetch_add(bytes, std::memory_order_relaxed);
+	}
 	static Snapshot Take() noexcept {
 		return {s_calls.exchange(0, std::memory_order_relaxed),
-		        s_regions.exchange(0, std::memory_order_relaxed)};
+		        s_regions.exchange(0, std::memory_order_relaxed),
+		        s_wait_passes.exchange(0, std::memory_order_relaxed),
+		        s_wait_consumed.exchange(0, std::memory_order_relaxed),
+		        s_wait_extra.exchange(0, std::memory_order_relaxed),
+		        s_wait_bytes.exchange(0, std::memory_order_relaxed)};
 	}
 };
 

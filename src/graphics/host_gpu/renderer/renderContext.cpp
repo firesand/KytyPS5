@@ -165,6 +165,10 @@ struct FaultSampler {
 		reads_sum.gpu_indirect_wait_ns += host_reads.gpu_indirect_wait_ns;
 		syncs_sum.calls += syncs.calls;
 		syncs_sum.regions += syncs.regions;
+		syncs_sum.wait_passes += syncs.wait_passes;
+		syncs_sum.wait_consumed += syncs.wait_consumed;
+		syncs_sum.wait_extra += syncs.wait_extra;
+		syncs_sum.wait_bytes += syncs.wait_bytes;
 		for (size_t i = 0; i < budget.categories.size(); ++i) {
 			budget_sum.categories[i].calls += budget.categories[i].calls;
 			budget_sum.categories[i].inclusive_ns += budget.categories[i].inclusive_ns;
@@ -243,6 +247,8 @@ struct FaultSampler {
 		                    reads_all.gpu_indirect[HostReadProbe::FallbackMesh],
 		                    reads_all.gpu_indirect[HostReadProbe::FallbackSrt],
 		                    reads_all.gpu_indirect_wait_ns / 1000000);
+		line += fmt::format(" | wait-pass {} (consumed {}, extra-syncs {}, bytes {})", syncs_all.wait_passes,
+		                    syncs_all.wait_consumed, syncs_all.wait_extra, syncs_all.wait_bytes);
 		line += fmt::format(" | host-resident binds {} bytes {} KiB fallbacks {}", resident_all.binds,
 		                    resident_all.bytes >> 10, resident_all.fallbacks);
 		// Lazy hazard-tracked barriers (KYTY_LAZY_BARRIERS). Mode 1: per site `emitted/elided`
@@ -374,6 +380,35 @@ void RenderContext::PrepareBda() {
 	m_fault_process_pending = true;
 }
 
+static std::atomic<int>& SyncOnWaitPassMode() {
+	static std::atomic<int> mode = [] {
+		const char* value = std::getenv("KYTY_SYNC_ON_WAIT_PASS");
+		return value == nullptr ? 0 : std::atoi(value);
+	}();
+	return mode;
+}
+
+void RenderContext::SetSyncOnWaitPassMode(int mode) {
+	SyncOnWaitPassMode().store(mode);
+}
+
+void RenderContext::NoteGuestAcquire(uint64_t label_addr) {
+	SyncProbe::NoteWaitPass();
+	const int mode = SyncOnWaitPassMode().load();
+	// Nothing to do when this epoch has not synced yet: the first consumer syncs anyway.
+	if (m_bda_synced_epoch != m_bda_sync_epoch) {
+		return;
+	}
+	// Mode 0 only measures: the consumer is counted, the sync is not made.
+	if (mode == 2 && label_addr != 0 && !m_buffer_cache.IsRegionCpuModified(label_addr, 4)) {
+		return;
+	}
+	m_wait_pass_pending = true;
+	if (mode != 0) {
+		++m_bda_sync_epoch;
+	}
+}
+
 void RenderContext::SyncCpuWrites() {
 	// Once per command stream (KYTY_BDA_SYNC_PER_DRAW=1 restores the per-draw sync): every sync
 	// re-protects the pages it uploads, so the game's next CPU write to them faults again.
@@ -383,9 +418,19 @@ void RenderContext::SyncCpuWrites() {
 	}();
 	if (!per_draw) {
 		if (m_bda_synced_epoch == m_bda_sync_epoch) {
+			if (m_wait_pass_pending) { // switch off: the sync the passing wait would have caused
+				m_wait_pass_pending = false;
+				SyncProbe::NoteWaitConsumed();
+			}
 			return;
 		}
 		m_bda_synced_epoch = m_bda_sync_epoch;
+	}
+	const bool     wait_pass   = m_wait_pass_pending;
+	const uint64_t bytes_begin = m_buffer_cache.RangeBytesTotal();
+	if (wait_pass) {
+		m_wait_pass_pending = false;
+		SyncProbe::NoteWaitConsumed();
 	}
 	SyncProbe::NoteCall();
 	BudgetScope budget(BudgetProbe::Sync, true);
@@ -412,6 +457,12 @@ void RenderContext::SyncCpuWrites() {
 		});
 	}
 	m_buffer_cache.EndUploadBatch();
+	if (wait_pass) {
+		const uint64_t bytes = m_buffer_cache.RangeBytesTotal() - bytes_begin;
+		if (bytes != 0) {
+			SyncProbe::NoteWaitExtra(bytes);
+		}
+	}
 }
 
 void RenderContext::RunGarbageCollector() {

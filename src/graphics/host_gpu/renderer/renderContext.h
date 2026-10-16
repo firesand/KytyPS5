@@ -61,7 +61,17 @@ public:
 	// pointer-using draws and before whole-heap descriptor reads.
 	void               SyncCpuWrites();
 	// Called when the command processor starts (or resumes) a guest command stream.
-	void               BeginCommandStream() { ++m_bda_sync_epoch; }
+	void               BeginCommandStream() {
+		++m_bda_sync_epoch;
+		m_wait_pass_pending = false;
+	}
+	// A WAIT_REG_MEM (or conditional-IB compare) passed without suspending: the guest acquired a
+	// label inside this stream, so CPU writes made before the label must be visible to later BDA /
+	// unbounded consumers. Starts a new sync epoch (KYTY_SYNC_ON_WAIT_PASS: 0 off (default), 1 on,
+	// 2 only when the label's page is CPU-dirty; label_addr 0 = unknown, treated as dirty).
+	void               NoteGuestAcquire(uint64_t label_addr = 0);
+	// Test hook: overrides the KYTY_SYNC_ON_WAIT_PASS mode read from the environment.
+	static void        SetSyncOnWaitPassMode(int mode);
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -86,6 +96,7 @@ private:
 	TextureCache              m_texture_cache;
 	uint64_t                  m_bda_sync_epoch    = 1;
 	uint64_t                  m_bda_synced_epoch  = 0;
+	bool                      m_wait_pass_pending = false; // a passing wait bumped a consumed epoch
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	std::unique_ptr<GuestGpu> m_gpu;

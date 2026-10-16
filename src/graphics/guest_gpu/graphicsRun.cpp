@@ -353,6 +353,9 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	(void)poll;
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
 		SuspendPm4("wait_reg_mem", reinterpret_cast<uint64_t>(addr), ref, mask, func, sizeof(T));
+	} else {
+		// The resume path of a suspended wait starts a new epoch; a wait that passes does not.
+		NoteGuestAcquire(reinterpret_cast<uint64_t>(addr));
 	}
 }
 
