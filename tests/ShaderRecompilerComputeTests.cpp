@@ -24,6 +24,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/skipShader.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
@@ -40911,6 +40912,49 @@ void CheckTessellationPrograms() {
 // `.compute` memory aliases an "active" ShaderDrawParameters must not take the vertex-only
 // draw-parameter paths (undeclared / invalid BaseVertex built-ins, OpLoad with pointer 0). Walk the
 // emitted words: no OpLoad may have a null pointer, and SPIR-V validation must pass.
+void CheckSkipShaderParsing() {
+  namespace SS = Libs::Graphics::SkipShader;
+  // 1..8 hashes, with and without 0x, mixed case and spaces.
+  std::string text;
+  std::vector<uint64_t> expected;
+  for (uint64_t n = 1; n <= 8; ++n) {
+    const uint64_t hash = 0x67e610ccc37800edull ^ (n * 0x0123456789abcdefull);
+    char token[40];
+    std::snprintf(token, sizeof(token), n % 3 == 0 ? "0X%016llX" : (n % 2 ? " 0x%llx " : "%llx"),
+                  static_cast<unsigned long long>(hash));
+    if (!text.empty()) text += ',';
+    text += token;
+    expected.push_back(hash);
+    const auto parsed = SS::ParseHashList(text);
+    if (parsed != expected) {
+      std::fprintf(stderr, "skip-shader: %llu hashes parsed wrong (%zu)\n",
+                   static_cast<unsigned long long>(n), parsed.size());
+      std::abort();
+    }
+    for (const auto h: expected) {
+      if (!SS::Contains(parsed, h)) std::abort();
+    }
+    if (SS::Contains(parsed, 0x1ull)) std::abort();
+  }
+  // Junk tokens are dropped, empty list is empty.
+  if (!SS::ParseHashList("").empty() || !SS::ParseHashList(",,zz,0x").empty()) std::abort();
+  if (SS::ParseHashList("ff,zz,10").size() != 2) std::abort();
+  if (SS::ParseHashList("12345678901234567").size() != 0) std::abort(); // 17 digits
+  uint64_t v = 0;
+  if (!SS::ParseHex("0xFF00", v) || v != 0xff00ull || SS::ParseHex("1,2", v) || SS::ParseHex(nullptr, v)) std::abort();
+  // Bits/value match.
+  const uint64_t hash = 0x67e610ccc37800edull;
+  if (!SS::BitsMatch(hash, 0xffull, 0xedull) || SS::BitsMatch(hash, 0xffull, 0xecull)) std::abort();
+  if (!SS::BitsMatch(hash, 0xf000000000000000ull, 0x6000000000000000ull)) std::abort();
+  if (SS::BitsMatch(hash, 0, 0)) std::abort(); // mask 0 is "off", not "match everything"
+  SS::Config cfg;
+  cfg.ps = {hash};
+  cfg.bits_mask = 0x3ull; cfg.bits_value = 0x1ull;
+  if (!cfg.MatchPs(hash) || !cfg.MatchPs(0x1ull) || !cfg.MatchPs(0x5ull) || cfg.MatchPs(0x2ull)) std::abort();
+  if (cfg.MatchCs(hash)) std::abort();
+  std::printf("skip-shader parsing and bits match ok\n");
+}
+
 void CheckComputeDrawParametersLoads() {
   using namespace Libs::Graphics;
   const char *name = "ComputeDrawParametersLoads";
@@ -46591,6 +46635,10 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     vulkan.CheckUnifiedTextureCacheFlow();
     vulkan.CheckBgra16Readback();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--skip-shader-only") == 0) {
+    CheckSkipShaderParsing();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--draw-offset-only") == 0) {

@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/skipShader.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -636,7 +637,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	{
 		GpuTimestampScope ts_scope(m_context.GetCommandScheduler(), vk_buffer,
 		                           GpuTimestamps::Kind::Dispatch, program.shader_hash);
-		if (ordered_rejection == nullptr) {
+		if (SkipShader::ShouldSkipCs(program.shader_hash)) {
+			// KYTY_SKIP_CS: bisection aid. Bindings and barriers stay; only the dispatch is omitted.
+		} else if (ordered_rejection == nullptr) {
 			static std::atomic<uint32_t> applied_count {0};
 			if (applied_count.fetch_add(1, std::memory_order_relaxed) < 16u)
 				LOGF("OrderedGds: serialized shader=0x%016" PRIx64 " groups=%ux1x1 guest_local=%ux%ux%u\n",

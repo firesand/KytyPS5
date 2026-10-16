@@ -23,6 +23,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/skipShader.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -1519,7 +1520,21 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		const uint64_t ts_ps_hash = state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0;
 		GpuTimestampScope ts_scope(m_context.GetCommandScheduler(), vk_buffer,
 		                           GpuTimestamps::Kind::Draw, ts_ps_hash, ts_vs_hash);
-		if (mesh_active) {
+		if (SkipShader::DrawRtEnabled()) {
+			std::string rt0 = "none";
+			for (uint32_t i = 0; i < state.color_count; i++) {
+				const auto& c = state.color_info[i];
+				if (c.target_slot == 0) {
+					rt0 = std::to_string(c.Extent().width) + "x" + std::to_string(c.Extent().height) + " " +
+					      vk::to_string(c.desc.view_info.format);
+					break;
+				}
+			}
+			SkipShader::NoteDrawRt(ts_ps_hash, rt0);
+		}
+		if (state.ps_active && SkipShader::ShouldSkipPs(ts_ps_hash)) {
+			// KYTY_SKIP_PS*: bisection aid. Targets, pipeline bind and barriers stay; only the draw is omitted.
+		} else if (mesh_active) {
 			vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 		} else if (gpu_indirect != nullptr) {
 			if (GpuDiagnostics::Enabled()) {
