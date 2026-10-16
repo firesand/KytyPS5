@@ -67,8 +67,12 @@ void main() {
     uint offset_hi, offset_lo;
     umulExtended(start_index, pc.element_size, offset_hi, offset_lo);
     uint carry;
-    const uint address_lo = uaddCarry(pc.index_base_lo, offset_lo, carry);
-    const uint address_hi = pc.index_base_hi + offset_hi + carry;
+    uint address_lo = uaddCarry(pc.index_base_lo, offset_lo, carry);
+    uint address_hi = pc.index_base_hi + offset_hi + carry;
+    if (non_indexed) {
+        address_lo = 0u; // no index buffer: the mesh shader reads vertex numbers (element size 0)
+        address_hi = 0u;
+    }
 
     const uint out_record = pc.record_dword + i * 8u;
     scratch[out_record + 0u] = clamped;
