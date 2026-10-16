@@ -37376,7 +37376,7 @@ TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu() {
 
   std::vector<u32> code;
   AppendVMovU32(&code, 20,
-                1); // Non-constant +1 X offset is not a SPIR-V ConstOffset.
+                1); // +1 X texel offset must reach the sample (ConstOffset).
   AppendVMovLiteral(&code, 21, 0x36003900u); // x=0.625, y=0.375 packed as f16.
   AppendVMovU32(&code, 22, 0);
   code.push_back(EncodeMimg0(0x30, 0xf));
@@ -37387,7 +37387,10 @@ TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu() {
   AppendEnd(&code);
 
   auto image = MakeRgbaImage(4, 4);
-  SetRgbaPixel(&image, 4, 2, 1, 0x3f800000u, 0x40000000u, 0x40400000u,
+  // Texel (2,1) is what a dropped +1 X offset would read; (3,1) is the marker.
+  SetRgbaPixel(&image, 4, 2, 1, 0x41000000u, 0x41100000u, 0x41200000u,
+               0x41300000u);
+  SetRgbaPixel(&image, 4, 3, 1, 0x3f800000u, 0x40000000u, 0x40400000u,
                0x40800000u);
 
   TestCase test;
@@ -37397,9 +37400,79 @@ TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu() {
   test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   test.sampled_image_rgba = image;
-  test.required_spirv = {"UnpackHalf2x16"};
+  test.required_spirv = {"UnpackHalf2x16", "ConstOffset"};
   test.forbidden_spirv = {"OpBitFieldSExtract"};
   return test;
+}
+
+// c2922-style checkerboard taps: image_sample_lz_o neighbours of texel (2,2) in a 4x4 image whose
+// red channel is 1 + x + 4y. Dropping the offset makes every tap read the centre (11.0).
+TestCase ImageSampleLzOffsetNeighbourTapsCase(bool runtime_offset) {
+  using O = ShaderOpcode;
+
+  const auto Bits = [](float value) {
+    u32 bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+  };
+  const u32 offsets[4] = {1u, 63u, 0x100u, 0x3f00u}; // (+1,0) (-1,0) (0,+1) (0,-1)
+
+  std::vector<u32> code;
+  for (u32 k = 0; k < (runtime_offset ? 1u : 4u); k++) {
+    if (runtime_offset) {
+      code.push_back(EncodeVop1(0x01, 20, 16)); // v_mov_b32 v20, s16 (user data, not foldable)
+    } else {
+      AppendVMovU32(&code, 20, offsets[k]);
+    }
+    AppendVMovLiteral(&code, 21, 0x3f200000u); // 0.625 = centre of texel 2 of 4.
+    AppendVMovLiteral(&code, 22, 0x3f200000u);
+    code.push_back(EncodeMimg0(0x37, 0x1)); // image_sample_lz_o
+    code.push_back(EncodeMimg1(k, 20));
+  }
+  const u32 centre_vgpr = runtime_offset ? 1u : 4u;
+  AppendVMovLiteral(&code, 21, 0x3f200000u);
+  AppendVMovLiteral(&code, 22, 0x3f200000u);
+  code.push_back(EncodeMimg0(0x27, 0x1)); // image_sample_lz
+  code.push_back(EncodeMimg1(centre_vgpr, 21));
+  for (u32 i = 0; i <= centre_vgpr; i++) {
+    AppendStoreVgpr(&code, i, i);
+  }
+  AppendEnd(&code);
+
+  auto image = MakeRgbaImage(4, 4);
+  for (u32 y = 0; y < 4u; y++) {
+    for (u32 x = 0; x < 4u; x++) {
+      SetRgbaPixel(&image, 4, x, y, Bits(static_cast<float>(1u + x + 4u * y)), 0, 0, 0);
+    }
+  }
+
+  TestCase test;
+  test.name = runtime_offset ? "ImageSampleLzOffsetRuntimeFoldsIntoCoordOnGpu"
+                             : "ImageSampleLzOffsetNeighbourTapsOnGpu";
+  test.code = code;
+  test.expected = runtime_offset
+                      ? std::vector<u32>{Bits(12.0f), Bits(11.0f)}
+                      : std::vector<u32>{Bits(12.0f), Bits(10.0f), Bits(15.0f), Bits(7.0f),
+                                         Bits(11.0f)};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.sampled_image_rgba = image;
+  if (runtime_offset) {
+    test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32_32_32_32Float);
+    test.user_data[16] = 1u;
+    test.has_user_data = true;
+    test.required_spirv = {"OpImageQuerySizeLod"};
+  } else {
+    test.required_spirv = {"ConstOffset"};
+  }
+  return test;
+}
+
+TestCase ImageSampleLzOffsetNeighbourTapsOnGpu() {
+  return ImageSampleLzOffsetNeighbourTapsCase(false);
+}
+
+TestCase ImageSampleLzOffsetRuntimeFoldsIntoCoordOnGpu() {
+  return ImageSampleLzOffsetNeighbourTapsCase(true);
 }
 
 TestCase ImageSampleA16CompareBiasRdna2AddressOrder() {
@@ -40259,6 +40332,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageSampleA16SamplerCoordsOnGpu);
   AddCase(ImageSampleOpcodeAliasUsesNormalCoords);
   AddCase(ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu);
+  AddCase(ImageSampleLzOffsetNeighbourTapsOnGpu);
+  AddCase(ImageSampleLzOffsetRuntimeFoldsIntoCoordOnGpu);
   AddCase(ImageSampleA16CompareBiasRdna2AddressOrder);
   AddCase(ImageGatherCompareOpcodes);
   AddCase(ImageStoreVariants);
@@ -46215,6 +46290,15 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--lds-wave-order-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Wave64LdsInstructionOrder());
+    return 0;
+  }
+  if ((argc == 2 || argc == 3) && std::strcmp(argv[1], "--sample-offset-only") == 0) {
+    // Optional case index (0=A16, 1=neighbour taps, 2=runtime fold): a failing case aborts.
+    const int only = argc == 3 ? std::atoi(argv[2]) : -1;
+    VulkanHarness vulkan;
+    if (only < 0 || only == 0) RunCase(&vulkan, ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu());
+    if (only < 0 || only == 1) RunCase(&vulkan, ImageSampleLzOffsetNeighbourTapsOnGpu());
+    if (only < 0 || only == 2) RunCase(&vulkan, ImageSampleLzOffsetRuntimeFoldsIntoCoordOnGpu());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--wave64-only") == 0) {
