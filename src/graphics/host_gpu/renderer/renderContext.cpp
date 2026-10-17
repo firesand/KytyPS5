@@ -383,7 +383,7 @@ void RenderContext::PrepareBda() {
 static std::atomic<int>& SyncOnWaitPassMode() {
 	static std::atomic<int> mode = [] {
 		const char* value = std::getenv("KYTY_SYNC_ON_WAIT_PASS");
-		const int   on    = value != nullptr && value[0] == '1' ? 1 : 0;
+		const int   on    = (value == nullptr || value[0] != '0') ? 1 : 0;
 		LOGF("RenderContext: sync on wait-pass %s\n", on != 0 ? "on" : "off (measure only)");
 		return on;
 	}();

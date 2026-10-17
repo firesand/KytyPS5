@@ -947,8 +947,10 @@ void RenderExecutor::PrepareBufferImageWrites(std::span<PreparedBindings* const>
 		EXIT_IF(prepared == nullptr || prepared->runtime == nullptr || !*prepared->runtime);
 		for (const auto& resource: prepared->runtime->program->info.buffers) {
 			if (!resource.written || resource.descriptor_index == UINT32_MAX) continue;
+			if (resource.unbounded) continue;
 			const auto& source = prepared->buffer_sources[resource.descriptor_index];
 			if (source.address == 0 || source.size == 0 || source.untracked_write) continue;
+			if (source.size >= (uint64_t{256} << 20u)) continue;
 			textures.InvalidateMemoryFromGPU(source.address, source.size, /*write_pending=*/true);
 		}
 	}
@@ -1196,6 +1198,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			    shader_stages, vk::DependencyFlags {}, 0, nullptr, 1, &barrier, 0, nullptr); }
 		}
 
+		std::vector<vk::ImageMemoryBarrier2> batched_image_barriers;
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
 			auto& image   = m_context.GetTextureCache().GetImage(descriptors.images[i].image_id);
 			auto& binding = descriptors.images[i];
@@ -1203,12 +1206,16 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,
 			                                   view.layer_count};
 			const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
+			vk::ImageLayout dest_layout {};
+			vk::AccessFlags2 dest_access {};
+			std::optional<ImageSubresourceRange> transition_range {};
+
 			if (image.info.data.Empty()) {
-				image.Transit(vk::ImageLayout::eGeneral,
-				              storage ? vk::AccessFlagBits2::eShaderRead |
+				dest_layout = vk::ImageLayout::eGeneral;
+				dest_access = storage ? vk::AccessFlagBits2::eShaderRead |
 				                            vk::AccessFlagBits2::eShaderWrite
-				                      : vk::AccessFlagBits2::eShaderRead,
-				              range, vk_buffer);
+				                      : vk::AccessFlagBits2::eShaderRead;
+				transition_range = range;
 			} else if (image.binding.is_target) {
 				const auto layout = image.binding.attachment_layout;
 				EXIT_IF(layout == vk::ImageLayout::eUndefined);
@@ -1221,27 +1228,58 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						EXIT("sampling a writable depth/stencil attachment aspect\n");
 					}
 				}
-				image.Transit(layout,
-				              image.binding.attachment_access | vk::AccessFlagBits2::eShaderRead |
-				                  (image.binding.shader_write ? vk::AccessFlagBits2::eShaderWrite
-				                                              : vk::AccessFlags2 {}),
-				              {}, vk_buffer);
+				dest_layout = layout;
+				dest_access = image.binding.attachment_access | vk::AccessFlagBits2::eShaderRead |
+				              (image.binding.shader_write ? vk::AccessFlagBits2::eShaderWrite
+				                                          : vk::AccessFlags2 {});
+				transition_range = std::nullopt;
 			} else if (image.binding.force_general && !image.info.IsDepth()) {
 				const vk::AccessFlags2 storage_access = image.binding.shader_write
 				                                            ? vk::AccessFlagBits2::eShaderWrite
 				                                            : vk::AccessFlags2 {};
-				image.Transit(vk::ImageLayout::eGeneral,
-				              vk::AccessFlagBits2::eShaderRead | storage_access, {}, vk_buffer);
+				dest_layout = vk::ImageLayout::eGeneral;
+				dest_access = vk::AccessFlagBits2::eShaderRead | storage_access;
+				transition_range = std::nullopt;
 			} else if (storage) {
-				image.Transit(vk::ImageLayout::eGeneral,
-				              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
-				              range, vk_buffer);
+				dest_layout = vk::ImageLayout::eGeneral;
+				dest_access = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+				transition_range = range;
 			} else {
-				image.Transit(image.info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-				                                   : vk::ImageLayout::eShaderReadOnlyOptimal,
-				              vk::AccessFlagBits2::eShaderRead, range, vk_buffer);
+				dest_layout = image.info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+				                                   : vk::ImageLayout::eShaderReadOnlyOptimal;
+				dest_access = vk::AccessFlagBits2::eShaderRead;
+				transition_range = range;
+			}
+
+			const auto transfer_access =
+			    vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
+			vk::PipelineStageFlags2 dest_stage {};
+			if (static_cast<bool>(dest_access & transfer_access)) {
+				dest_stage |= vk::PipelineStageFlagBits2::eTransfer;
+			}
+			if (!dest_access ||
+			    static_cast<bool>(dest_access & ~vk::AccessFlags2 {transfer_access})) {
+				dest_stage |=
+				    vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
+			}
+
+			auto image_barriers = image.GetBarriers(dest_layout, dest_access, dest_stage, transition_range);
+			if (!image_barriers.empty()) {
+				batched_image_barriers.insert(batched_image_barriers.end(),
+				                             image_barriers.begin(), image_barriers.end());
 			}
 			binding.layout = image.backing.state.layout;
+		}
+
+		if (!batched_image_barriers.empty()) {
+			m_context.GetCommandScheduler().EndRendering();
+			vk::DependencyInfo dependency {};
+			dependency.imageMemoryBarrierCount = static_cast<uint32_t>(batched_image_barriers.size());
+			dependency.pImageMemoryBarriers    = batched_image_barriers.data();
+			{
+				GpuTimestampScope ts_scope(vk_buffer, GpuTimestamps::Kind::BarrierImage);
+				vk_buffer.pipelineBarrier2(dependency);
+			}
 		}
 
 		std::array<size_t, ShaderRecompiler::IR::ImageBindingCount> image_starts {};

@@ -185,6 +185,7 @@ private:
 	GraphicContext&               m_graphics;
 	std::unique_ptr<ProgramCache> m_program_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
+	vk::ShaderModule                      m_task_shader_module = nullptr;
 	std::filesystem::path         m_driver_cache_path;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
@@ -195,6 +196,9 @@ private:
 	static inline std::atomic<PipelineCache*> s_live {nullptr};
 
 	void InitializeDriverCache();
+
+public:
+	[[nodiscard]] vk::ShaderModule GetTaskShaderModule() const { return m_task_shader_module; }
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
@@ -205,7 +209,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
                             const ShaderPixelInputInfo*            ps_input_info,
                             const PipelineCache::GraphicsPrograms& programs,
                             const PipelineStaticParameters&        static_params,
-                            vk::PipelineCache                      driver_cache);
+                            vk::PipelineCache                      driver_cache,
+                            vk::ShaderModule                       task_shader_module = nullptr);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache);

@@ -80,6 +80,7 @@ public:
 	void InvalidateMemoryFromGPU(uint64_t address, uint64_t size, bool write_pending = false,
 	                             std::span<const std::pair<uint64_t, uint64_t>> recorded = {},
 	                             GpuWriteCoverage coverage = GpuWriteCoverage::Conservative);
+	void InvalidateDccMetadata(uint64_t address, uint64_t size);
 	// True when a GPU-owned image overlaps the range (FillBuffer/CopyBuffer CPU paths must not bypass
 	// the merge by writing guest memory directly).
 	[[nodiscard]] bool HasGpuOwnedImageIn(uint64_t address, uint64_t size);
@@ -207,6 +208,7 @@ private:
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;
 
+	// Caller holds m_lock. Clears resolved DCC metadata and updates image page tracking.
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
 
@@ -224,6 +226,9 @@ private:
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	// Protected by m_lock. Maps metadata base address -> {size, epoch}.
+	std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> m_resolved_dcc_meta;
+	uint64_t                                          m_dcc_meta_epoch = 1;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;

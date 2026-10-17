@@ -691,6 +691,15 @@ uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (state.program.stage != ShaderType::Mesh || index >= IR::PushData::MeshDrawDwordCount) {
 		ctx.Fail(inst, "invalid mesh draw parameter");
 	}
+	if (state.task_payload_variable != 0 && index < 3) {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    spv::OpAccessChain,
+		    TypePointer(state, spv::StorageClassTaskPayloadWorkgroupEXT, TypeU32(state)), pointer,
+		    state.task_payload_variable, ConstantU32(state, index));
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), result, pointer);
+		return result;
+	}
 	const auto pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer,
 	                          state.push_constant_variable, ConstantU32(state, 0),

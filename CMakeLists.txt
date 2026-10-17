@@ -325,6 +325,21 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${color_clear_check_header}")
+
+set(pass_through_task_source "${gpu_tiler_shader_dir}/pass_through_task.task")
+set(pass_through_task_spv "${gpu_tiler_generated_dir}/pass_through_task.spv")
+set(pass_through_task_header "${gpu_tiler_generated_dir}/pass_through_task_spv.h")
+add_custom_command(
+	OUTPUT "${pass_through_task_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${pass_through_task_spv}" "${pass_through_task_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${pass_through_task_spv} -DOUTPUT=${pass_through_task_header}
+	        -DSYMBOL=PASS_THROUGH_TASK_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${pass_through_task_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${pass_through_task_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")

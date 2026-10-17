@@ -7,15 +7,16 @@
 
 namespace Libs::Graphics {
 
-// KYTY_LAZY_BARRIERS: 0 (unset/0) = unconditional barriers exactly as before; 1 = hazard-tracked
+// KYTY_LAZY_BARRIERS: 0 = unconditional barriers exactly as before; 1 (default/unset) = hazard-tracked
 // lazy barriers; 2 = tracked lazily AND the old unconditional barriers are still emitted (the
 // tracker's decisions are counted but the result cannot depend on them).
 // Read on first use (not at static init) so a test may setenv() before building its harness.
 inline uint32_t LazyBarrierMode() noexcept {
 	static const uint32_t mode = [] {
 		const char* value = std::getenv("KYTY_LAZY_BARRIERS");
-		if (value == nullptr || value[0] == '\0' || value[0] == '0') return 0u;
-		return value[0] == '2' ? 2u : 1u;
+		if (value != nullptr && value[0] == '0') return 0u;
+		if (value != nullptr && value[0] == '2') return 2u;
+		return 1u;
 	}();
 	return mode;
 }

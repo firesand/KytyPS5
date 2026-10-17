@@ -1609,6 +1609,87 @@ void TestFusedCpuNotGpuQuery() {
   Release(memory);
 }
 
+void TestMaybeWrittenGPUClaim() {
+  constexpr auto page = Libs::Graphics::TRACKER_PAGE_SIZE;
+  constexpr auto region_pages = Libs::Graphics::TRACKER_REGION_PAGES;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  auto *memory = Allocate(page_manager, region_pages);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  // Drain initial whole-region CPU dirty state
+  tracker.ForEachUploadRange(
+      address, region_pages * page, false,
+      [](uint64_t, uint64_t, const void *) noexcept {}, []() noexcept {});
+
+  // Fault at page 0 (isolated) then sequential fault at page 1 to activate ahead window
+  tracker.InvalidateWriteFault(address, page, [] {});
+  tracker.InvalidateWriteFault(address + page, page, [] {});
+
+  // Pages 0 and 1 are CPU-dirty
+  Check(tracker.IsRegionCpuModified(address, page), "page 0 must be CPU-dirty");
+  Check(tracker.IsRegionCpuModified(address + page, page), "page 1 must be CPU-dirty");
+
+  // Page 2 is speculative ahead: NOT in m_cpu_dirty, but writable on CPU!
+  Check(!tracker.IsRegionCpuModified(address + 2 * page, page), "page 2 must not be CPU-dirty (it is in m_maybe)");
+  Check(Protection(reinterpret_cast<void *>(address + 2 * page)) == PAGE_READWRITE, "page 2 must be writable (m_maybe)");
+
+  // GPU claims page 2 without CPU conflict
+  const bool success = tracker.TryMarkRegionAsGpuModified(address + 2 * page, page);
+  Check(success, "GPU claim of maybe page must succeed without conflict");
+  Check(tracker.IsRegionGpuModified(address + 2 * page, page), "page 2 must be GPU modified");
+  // Page 2 must have lost write protection on CPU
+  Check(Protection(reinterpret_cast<void *>(address + 2 * page)) == PAGE_NOACCESS, "page 2 must be read/write protected");
+
+  tracker.UnmarkRegionAsGpuModified(address + 2 * page, page);
+  tracker.UntrackMemory(address, region_pages * page);
+  Release(memory);
+}
+
+void TestSequentialAdaptiveDoubling() {
+  constexpr auto page = Libs::Graphics::TRACKER_PAGE_SIZE;
+  constexpr auto region_pages = Libs::Graphics::TRACKER_REGION_PAGES;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  auto *memory = Allocate(page_manager, region_pages);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  // Drain initial whole-region CPU dirty state
+  tracker.ForEachUploadRange(
+      address, region_pages * page, false,
+      [](uint64_t, uint64_t, const void *) noexcept {}, []() noexcept {});
+
+  // 1. Initial fault at page 0 (isolated): unprotects only page 0
+  tracker.InvalidateWriteFault(address, page, [] {});
+  Check(Protection(reinterpret_cast<void *>(address)) == PAGE_READWRITE, "page 0 must be writable");
+  Check(Protection(reinterpret_cast<void *>(address + page)) == PAGE_READONLY, "page 1 must be protected");
+
+  // 2. Sequential fault at page 1: detects sequential fill -> ahead becomes 4 -> unprotects page 1 + pages 2..5 (end=6)
+  tracker.InvalidateWriteFault(address + page, page, [] {});
+  Check(Protection(reinterpret_cast<void *>(address + 5 * page)) == PAGE_READWRITE, "page 5 must be writable");
+  Check(Protection(reinterpret_cast<void *>(address + 6 * page)) == PAGE_READONLY, "page 6 must be protected");
+
+  // 3. Sequential fault at page 6: doubles ahead to 8 -> unprotects page 6 + pages 7..14 (end=15)
+  tracker.InvalidateWriteFault(address + 6 * page, page, [] {});
+  Check(Protection(reinterpret_cast<void *>(address + 14 * page)) == PAGE_READWRITE, "page 14 must be writable");
+  Check(Protection(reinterpret_cast<void *>(address + 15 * page)) == PAGE_READONLY, "page 15 must be protected");
+
+  // 4. Sequential fault at page 15: doubles ahead to 16 -> unprotects page 15 + pages 16..31 (end=32)
+  tracker.InvalidateWriteFault(address + 15 * page, page, [] {});
+  Check(Protection(reinterpret_cast<void *>(address + 31 * page)) == PAGE_READWRITE, "page 31 must be writable");
+  Check(Protection(reinterpret_cast<void *>(address + 32 * page)) == PAGE_READONLY, "page 32 must be protected");
+
+  // 5. Non-sequential fault at page 50: resets ahead to 0 -> unprotects only page 50 (end=51)
+  tracker.InvalidateWriteFault(address + 50 * page, page, [] {});
+  Check(Protection(reinterpret_cast<void *>(address + 50 * page)) == PAGE_READWRITE, "page 50 must be writable");
+  Check(Protection(reinterpret_cast<void *>(address + 51 * page)) == PAGE_READONLY, "page 51 must be protected");
+
+  tracker.UntrackMemory(address, region_pages * page);
+  Release(memory);
+}
+
 int main(int argc, char **argv) {
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
@@ -1621,6 +1702,8 @@ int main(int argc, char **argv) {
   TestGpuWriteTicksMatchesMap();
   TestSlotVectorPaged();
   TestFusedCpuNotGpuQuery();
+  TestMaybeWrittenGPUClaim();
+  TestSequentialAdaptiveDoubling();
   TestGuestRange();
   TestRangeSet();
   TestHotPageSnapshotHash();

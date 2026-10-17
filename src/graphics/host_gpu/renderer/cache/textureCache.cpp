@@ -1290,7 +1290,7 @@ void TextureCache::InitializeImage(ImageId id) {
 	if (image.info.samples > 1) {
 		return;
 	}
-	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
+	const bool upload = (image.IsBufferModified() && !image.IsGpuModified()) || image.IsCpuDirty();
 	if (upload) {
 		ZeroCompanyImageLifecycle::Record(m_scheduler, "initialize-needs-upload", id, image);
 		// Rendering-defect forensics (2026-10-13): the dossier portrait and the briefing panel show
@@ -1325,6 +1325,8 @@ void TextureCache::InitializeImage(ImageId id) {
 			EXIT("TextureCache: failed to obtain image upload source\n");
 		}
 		UploadImage(image, *source, source_offset);
+		image.ClearBufferModified();
+	} else if (image.IsBufferModified()) {
 		image.ClearBufferModified();
 	}
 	if (image.IsCpuDirty()) {
@@ -1394,6 +1396,13 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		}
 		const auto meta_address = range.address + slice_size * first;
 		const auto meta_size    = slice_size * count;
+		{
+			std::scoped_lock lock {m_lock};
+			const auto it = m_resolved_dcc_meta.find(meta_address);
+			if (it != m_resolved_dcc_meta.end() && it->second.second == m_dcc_meta_epoch) {
+				return; // Already resolved and expanded on GPU; no intervening guest write
+			}
+		}
 		auto [meta_buffer, meta_offset] =
 		    m_buffer_cache.ObtainBuffer(meta_address, meta_size, /*is_written=*/true, false);
 		if (m_color_clear_resolver == nullptr) {
@@ -1425,6 +1434,9 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		request.extent      = ViewExtent(image, view.base_level, view.format);
 		m_color_clear_resolver->Resolve(command, request);
 		CommitGpuWrite(image);
+		// Protected by m_lock acquired at line 1411 (held across image lookup, resolve, and commit).
+		// Do NOT add an inner scoped_lock here: TrackingSpinLock is non-recursive and will abort.
+		m_resolved_dcc_meta[meta_address] = {meta_size, m_dcc_meta_epoch};
 		ZeroCompanyImageLifecycle::Record(m_scheduler, "materialize-color-clear-gpu", id, image,
 		    {.request = &desc.info, .address = meta_address, .size = meta_size});
 		if (clear_log) {
@@ -2514,6 +2526,23 @@ bool TextureCache::WriteOverlapPageQueryFits(uint64_t address, uint64_t size) {
 	       pages.last_exclusive - pages.first <= MaxPages;
 }
 
+// Caller holds m_lock (called from InvalidateMemoryFromGPU and InvalidateCpuAliases).
+void TextureCache::InvalidateDccMetadata(uint64_t address, uint64_t size) {
+	if (m_resolved_dcc_meta.empty()) {
+		return;
+	}
+	const uint64_t end = address + size;
+	for (auto it = m_resolved_dcc_meta.begin(); it != m_resolved_dcc_meta.end(); ) {
+		const uint64_t meta_start = it->first;
+		const uint64_t meta_end   = meta_start + it->second.first;
+		if (address < meta_end && end > meta_start) {
+			it = m_resolved_dcc_meta.erase(it);
+		} else {
+			++it;
+		}
+	}
+}
+
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, bool write_pending,
                                            std::span<const std::pair<uint64_t, uint64_t>> recorded,
                                            GpuWriteCoverage coverage) {
@@ -2521,6 +2550,7 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, bool
 		return;
 	}
 	std::scoped_lock lock {m_lock};
+	InvalidateDccMetadata(address, size);
 	// Both exact DMA and conservative shader writes can start inside an image at any size.
 	// The threshold chooses the lookup strategy, not whether an overlap is invalidated.
 	constexpr uint64_t SmallWrite = 64 * 1024;
@@ -2608,6 +2638,7 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, bool
 }
 
 void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
+	InvalidateDccMetadata(address, size);
 	const auto page_begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
 	const auto page_end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
 	for (const auto id: FindImagesInRegion(address, size, true)) {

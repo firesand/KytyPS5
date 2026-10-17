@@ -469,6 +469,7 @@ struct DrawCallInfo {
 	uint32_t             index_count    = 0;
 	uint32_t             instance_count = 0;
 	uint32_t             first_instance = 0;
+	DrawOffsetSource     offset_source  = DrawOffsetSource::DrawState;
 
 	[[nodiscard]] bool IsIndexed() const { return debug_op == CommandBufferDebugOp::DrawIndex; }
 	[[nodiscard]] const char* Name() const { return IsIndexed() ? "DrawIndex" : "DrawIndexAuto"; }
@@ -1218,24 +1219,23 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			EXIT("unsupported mesh draw: primitive=%u indexed=%u restart=%u\n",
 			     static_cast<uint32_t>(ucfg.GetPrimType()), draw.IsIndexed(), primitive_restart_enable);
 		}
-		const auto primitives = mesh.InputPrimitiveCount(draw.index_count);
-		if (primitives == 0 || draw.instance_count == 0) {
-			return;
-		}
-		mesh_groups        = (primitives - 1u) / mesh.primitives_per_group + 1u;
-		const auto& limits = m_context.GetGraphics().mesh_shader_properties;
-		if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
-		    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
-		    static_cast<uint64_t>(mesh_groups) * draw.instance_count >
-		        limits.maxMeshWorkGroupTotalCount) {
-			EXIT("mesh draw exceeds host workgroup limits: %ux%u\n", mesh_groups,
-			     draw.instance_count);
+		if (gpu_indirect == nullptr) {
+			const auto primitives = mesh.InputPrimitiveCount(draw.index_count);
+			if (primitives == 0 || draw.instance_count == 0) {
+				return;
+			}
+			mesh_groups        = (primitives - 1u) / mesh.primitives_per_group + 1u;
+			const auto& limits = m_context.GetGraphics().mesh_shader_properties;
+			if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
+			    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
+			    static_cast<uint64_t>(mesh_groups) * draw.instance_count >
+			        limits.maxMeshWorkGroupTotalCount) {
+				EXIT("mesh draw exceeds host workgroup limits: %ux%u\n", mesh_groups,
+				     draw.instance_count);
+			}
 		}
 	}
 
-	if (gpu_indirect != nullptr) {
-		EXIT_IF(mesh_active);
-	}
 	// GPU-resident indirect arguments: publish pending write-fault records (without touching the
 	// memory), then decide whether the argument read needs a shaderWrite -> indirectCommandRead
 	// barrier. Marks are made at record time for bound shader writes; unbounded (fault-tracked)
@@ -1251,13 +1251,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		indirect_args_bytes =
 		    static_cast<uint64_t>(gpu_indirect->draw_count - 1u) * gpu_indirect->stride + record_size;
 		const auto wait_begin = std::chrono::steady_clock::now();
-		cache.PrepareHostRead(gpu_indirect->args_addr, indirect_args_bytes);
 		// Lazy mode replaces the sticky HasPendingUnboundedWrites() (true until a host wait) with
 		// the tracker's per-command-buffer indirect_write_stages, evaluated at the barrier site.
 		indirect_barrier = cache.HasGpuDirtyBytes(gpu_indirect->args_addr, indirect_args_bytes) ||
 		                   (LazyBarriersKeepOld() && cache.HasPendingUnboundedWrites());
 		if (gpu_indirect->count_addr != 0) {
-			cache.PrepareHostRead(gpu_indirect->count_addr, sizeof(uint32_t));
 			indirect_barrier |= cache.HasGpuDirtyBytes(gpu_indirect->count_addr, sizeof(uint32_t));
 		}
 		if (LazyBarriersActive()) {
@@ -1350,9 +1348,23 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// memory.
 	// Resolves tracked shader writes (dispatches, earlier draws) before this draw consumes them:
 	// closes the pass when something is pending. No-op unless KYTY_LAZY_BARRIERS is on. An earlier
-	// draw's writes cannot be ordered against a later draw inside one pass, so any pending write
-	// makes this draw start a new pass (the old code ended the pass after the writing draw).
-	buffer.PrepareForDraw();
+	bool has_storage_reads = false;
+	for (const auto& stage: vertex_stages) {
+		if (HasShaderBufferReads(stage.stage) || stage.stage.program->info.uses_dma) {
+			has_storage_reads = true;
+			break;
+		}
+	}
+	if (!has_storage_reads && state.ps_active) {
+		if (HasShaderBufferReads(state.ps_input_info.stage) ||
+		    state.ps_input_info.stage.program->info.uses_dma) {
+			has_storage_reads = true;
+		}
+	}
+	const bool indirect = (gpu_indirect != nullptr) || (draw.offset_source == DrawOffsetSource::IndirectArgs);
+	if (has_storage_reads || indirect) {
+		buffer.PrepareForDraw();
+	}
 	auto vk_buffer = buffer.RawHandle();
 	if (LazyBarriersActive() && gpu_indirect != nullptr) {
 		// After PrepareForDraw the tracked part is resolved whenever a hazard was pending.
@@ -1368,11 +1380,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		vk::MemoryBarrier barrier {};
 		barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
 		barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
+		if (mesh_active) {
+			barrier.dstAccessMask |= vk::AccessFlagBits::eShaderRead;
+		}
 		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
 		                              vk::PipelineStageFlagBits::eComputeShader |
 		                              vk::PipelineStageFlagBits::eTransfer,
-		                          vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0,
-		                          nullptr, 0, nullptr);
+		                          vk::PipelineStageFlagBits::eDrawIndirect |
+		                              (mesh_active ? vk::PipelineStageFlagBits::eTaskShaderEXT : vk::PipelineStageFlags{}),
+		                          {}, 1, &barrier, 0, nullptr, 0, nullptr);
 		if (LazyBarriersActive()) {
 			BarrierProbe::NoteEmitted(BarrierProbe::DrawIndirectArgs);
 			auto& hazards = buffer.Hazards();
@@ -1389,10 +1405,34 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
 	if (mesh_active) {
-		vk_buffer.pushConstants(pipeline.pipeline_layout,
-		                        vk::ShaderStageFlagBits::eMeshEXT |
-		                            vk::ShaderStageFlagBits::eFragment,
-		                        0, sizeof(draw_data), draw_data);
+		if (gpu_indirect != nullptr) {
+			const auto& limits = m_context.GetGraphics().mesh_shader_properties;
+			struct alignas(8) TaskPushConsts {
+				uint64_t args_bda;
+				uint32_t stride;
+				uint32_t primitives_per_group;
+				uint32_t max_groups_x;
+				uint32_t max_groups_y;
+				uint32_t is_indexed;
+			} task_pc {};
+			const auto bda = indirect_args.first->BufferDeviceAddress() + indirect_args.second;
+			task_pc.args_bda              = bda;
+			task_pc.stride                = gpu_indirect->stride;
+			task_pc.primitives_per_group  = state.vertex_info[0].mesh.primitives_per_group;
+			task_pc.max_groups_x          = limits.maxMeshWorkGroupCount[0];
+			task_pc.max_groups_y          = limits.maxMeshWorkGroupCount[1];
+			task_pc.is_indexed            = draw.IsIndexed() ? 1u : 0u;
+			vk_buffer.pushConstants(pipeline.pipeline_layout,
+			                        vk::ShaderStageFlagBits::eTaskEXT |
+			                            vk::ShaderStageFlagBits::eMeshEXT |
+			                            vk::ShaderStageFlagBits::eFragment,
+			                        0, sizeof(task_pc), &task_pc);
+		} else {
+			vk_buffer.pushConstants(pipeline.pipeline_layout,
+			                        vk::ShaderStageFlagBits::eMeshEXT |
+			                            vk::ShaderStageFlagBits::eFragment,
+			                        0, sizeof(draw_data), draw_data);
+		}
 		ZeroCompanyMeshResources::Capture(buffer, submit_id,
 		    GpuDiagnostics::HandleValue(pipeline.pipeline),
 		    m_context.GetTextureCache().m_slot_images, stages, draw_data);
@@ -1520,7 +1560,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		GpuTimestampScope ts_scope(m_context.GetCommandScheduler(), vk_buffer,
 		                           GpuTimestamps::Kind::Draw, ts_ps_hash, ts_vs_hash);
 		if (mesh_active) {
-			vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+			if (gpu_indirect != nullptr) {
+				vk_buffer.drawMeshTasksEXT(gpu_indirect->draw_count, 1, 1);
+			} else {
+				vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+			}
 		} else if (gpu_indirect != nullptr) {
 			if (GpuDiagnostics::Enabled()) {
 				diagnostic.kind = draw.IsIndexed() ? "draw-indexed-indirect-gpu" : "draw-indirect-gpu";
@@ -1638,6 +1682,12 @@ bool RenderExecutor::CanDrawIndirectOnGpu(CommandBuffer& buffer, bool indexed,
 	}
 	uint64_t shader_hash = 0;
 	if (VertexShaderIsMesh(sh_ctx.GetVs(), buffer.GetRegisters(), &shader_hash)) {
+		if (graphics.task_shader_enabled && (!indexed || graphics.maintenance5_enabled)) {
+			if (block != nullptr) {
+				*block = GpuIndirectBlock::None;
+			}
+			return true;
+		}
 		if (block != nullptr) {
 			*block = GpuIndirectBlock::Mesh;
 		}
@@ -1796,7 +1846,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
-	                        args.instance_count, args.first_instance};
+	                        args.instance_count, args.first_instance, args.offset_source};
 	DrawRenderState state {};
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state,
 	                            args.gpu_indirect != nullptr ? &args.gpu_indirect->parameters
@@ -1872,7 +1922,8 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	hw_check(buffer);
 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndexAuto,
-	                         args.vertex_count, args.instance_count, args.first_instance};
+	                         args.vertex_count, args.instance_count, args.first_instance,
+	                         args.offset_source};
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, topology)) {

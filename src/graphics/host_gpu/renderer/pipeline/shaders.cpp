@@ -287,7 +287,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
                             const ShaderPixelInputInfo*            ps_input_info,
                             const PipelineCache::GraphicsPrograms& programs,
                             const PipelineStaticParameters&        static_params,
-                            vk::PipelineCache                      driver_cache) {
+                            vk::PipelineCache                      driver_cache,
+                            vk::ShaderModule                       task_shader_module) {
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
@@ -324,8 +325,15 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	EXIT_NOT_IMPLEMENTED(
 	    rect_list && (tess_control_shader_module == nullptr || tess_eval_shader_module == nullptr));
 
-	vk::PipelineShaderStageCreateInfo shader_stages[4] {};
+	vk::PipelineShaderStageCreateInfo shader_stages[5] {};
 	uint32_t                          shader_stage_count = 0;
+	if (mesh && vs_input_info.mesh_task_indirect) {
+		EXIT_NOT_IMPLEMENTED(task_shader_module == nullptr);
+		shader_stages[shader_stage_count++] = {.stage =
+		                                           vk::ShaderStageFlagBits::eTaskEXT,
+		                                       .module = task_shader_module,
+		                                       .pName  = "main"};
+	}
 	for (uint32_t i = 0; i < vertex_info.size(); i++) {
 		shader_stages[shader_stage_count++] = {.stage =
 		                                           NativeShaderStage(vertex_info[i].logical_stage),
@@ -511,6 +519,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		const auto native_stage = NativeShaderStage(stage.logical_stage);
 		AddLayoutBindings(descriptor_bindings, *stage.stage.program, native_stage);
 		graphics_stages |= native_stage;
+	}
+	if (mesh && vs_input_info.mesh_task_indirect) {
+		graphics_stages |= vk::ShaderStageFlagBits::eTaskEXT;
 	}
 	if (ps_active) {
 		EXIT_IF(!ps_input_info->stage);

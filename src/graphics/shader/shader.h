@@ -159,6 +159,7 @@ struct ShaderVertexInputInfo {
 	bool                    fetch_external      = false;
 	bool                    fetch_embedded      = false;
 	ShaderDrawParameters    draw_parameters;
+	bool                    mesh_task_indirect  = false;
 };
 
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {

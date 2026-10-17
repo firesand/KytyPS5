@@ -33,6 +33,26 @@ namespace {
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
 
+std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
+                                        StreamBuffer& staging, uint64_t size, uint64_t alignment,
+                                        vk::BufferUsageFlags usage, bool allow_wait,
+                                        const auto& write) {
+	const auto [mapped, offset] = staging.Map(size, alignment, allow_wait);
+	if (mapped != nullptr) {
+		write(mapped, offset);
+		staging.Commit();
+		return {&staging, offset};
+	}
+
+	auto temporary = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Upload, 0,
+	                                         usage, size);
+	write(temporary->Mapped().data(), 0);
+	temporary->Flush(0, size);
+	auto* buffer = temporary.get();
+	scheduler.DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
+	return {buffer, 0};
+}
+
 } // namespace
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
@@ -79,9 +99,6 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* 
 
 void BufferCache::Register(BufferId id) {
 	ChangeRegister<true>(id);
-	// A new buffer may cover pages that were CPU-dirty before any buffer existed there.
-	const auto& buffer = m_slot_buffers[id];
-	m_memory_tracker.MarkBdaSyncPending(buffer.CpuAddress(), buffer.Size());
 }
 
 void BufferCache::Unregister(BufferId id) {
@@ -544,14 +561,30 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", overlap.begin,
 	                     overlap.end - overlap.begin);
 	bool gpu_copy = false;
+	const bool has_overlap = overlap.first != overlap.last;
+	uint64_t old_begin = overlap.end;
+	uint64_t old_end   = overlap.begin;
 	for (auto it = overlap.first; it != overlap.last;) {
 		const auto old_id = (it++)->second;
+		const auto& old_buffer = m_slot_buffers[old_id];
+		old_begin = std::min(old_begin, old_buffer.CpuAddress());
+		old_end   = std::max(old_end, old_buffer.CpuAddress() + old_buffer.Size());
 		gpu_copy |= JoinOverlap(id, old_id, !overlap.has_stream_leap);
 	}
 	if (gpu_copy) {
 		m_slot_buffers[id].ready_tick = m_scheduler.CurrentTick(); // the recorded join copies
 	}
 	Register(id);
+	if (!has_overlap) {
+		m_memory_tracker.MarkBdaSyncPending(overlap.begin, overlap.end - overlap.begin);
+	} else {
+		if (overlap.begin < old_begin) {
+			m_memory_tracker.MarkBdaSyncPending(overlap.begin, old_begin - overlap.begin);
+		}
+		if (old_end < overlap.end) {
+			m_memory_tracker.MarkBdaSyncPending(old_end, overlap.end - old_end);
+		}
+	}
 	return id;
 }
 
@@ -618,38 +651,24 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	if (copies.empty()) {
 		return nullptr;
 	}
-	// sources[i] (when given and non-null) is the tracker's immutable snapshot of copy i; the
-	// remembered page hash describes that snapshot, so it, not live guest memory, is uploaded.
-	const auto source_of = [&](size_t i, const vk::BufferCopy& copy) {
-		if (i < sources.size() && sources[i] != nullptr) {
-			return sources[i];
-		}
-		return reinterpret_cast<const void*>(buffer.CpuAddress() + copy.dstOffset);
-	};
 
-	// Inside an upload batch the staging ring must not wait (a wait can flush the tick and would
-	// split the batch's copies from their staging data); a full ring falls back to a temporary.
-	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4, /*allow_wait=*/!m_upload_batch_open);
-	if (mapped != nullptr) {
+	const auto source = UploadMemory(m_graphics, m_scheduler, m_staging_buffer, total_size, 4,
+	    vk::BufferUsageFlagBits::eTransferSrc, /*allow_wait=*/!m_upload_batch_open,
+	    [&](uint8_t* mapped, uint64_t base_offset) {
 		for (size_t i = 0; i < copies.size(); i++) {
 			auto& copy = copies[i];
-			std::memcpy(mapped + copy.srcOffset, source_of(i, copy), copy.size);
+			if (i < sources.size() && sources[i] != nullptr) {
+				std::memcpy(mapped + copy.srcOffset, sources[i], copy.size);
+			} else {
+				const auto address = buffer.CpuAddress() + copy.dstOffset;
+				if (!LibKernel::Memory::CopySparseMemory(address, mapped + copy.srcOffset, copy.size)) {
+					EXIT("BufferCache: failed to read sparse guest buffer memory\n");
+				}
+			}
 			copy.srcOffset += base_offset;
 		}
-		m_staging_buffer.Commit();
-		return m_staging_buffer.Handle();
-	}
-
-	auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0,
-	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size);
-	for (size_t i = 0; i < copies.size(); i++) {
-		const auto& copy = copies[i];
-		std::memcpy(temporary->Mapped().data() + copy.srcOffset, source_of(i, copy), copy.size);
-	}
-	temporary->Flush(0, total_size);
-	const auto handle = temporary->Handle();
-	m_scheduler.DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
-	return handle;
+	});
+	return source.first->Handle();
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
@@ -666,7 +685,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
 		if (mapped != nullptr) {
-			std::memcpy(mapped, reinterpret_cast<const void*>(vaddr), size);
+			if (!LibKernel::Memory::CopySparseMemory(vaddr, mapped, size)) {
+				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
+			}
 			m_stream_buffer.Commit();
 			return {&m_stream_buffer, offset};
 		}
@@ -706,12 +727,14 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		return ObtainBuffer(vaddr, size, false, false);
 	}
 
-	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
-	if (staging == nullptr || !Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size)) {
-		EXIT("BufferCache: failed to read mapped guest image backing\n");
-	}
-	m_staging_buffer.Commit();
-	return {&m_staging_buffer, stage_offset};
+	return UploadMemory(m_graphics, m_scheduler, m_staging_buffer, size, 16,
+	    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eStorageBuffer,
+	    /*allow_wait=*/true,
+	    [&](uint8_t* mapped, uint64_t) {
+		if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, mapped, size)) {
+			EXIT("BufferCache: failed to read mapped guest image backing\n");
+		}
+	});
 }
 
 void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds) {

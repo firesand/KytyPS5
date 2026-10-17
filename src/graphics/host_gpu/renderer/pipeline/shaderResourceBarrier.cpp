@@ -109,6 +109,25 @@ bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 	return has_writes;
 }
 
+bool HasShaderBufferReads(const ShaderStageRuntime& runtime) {
+	if (!runtime) return false;
+	const auto& program   = *runtime.program;
+	const auto& resources = *runtime.resources;
+	if (resources.buffers.size() != program.info.buffers.size()) return false;
+	bool has_reads = false;
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		if (!program.info.buffers[i].read && !program.info.buffers[i].atomic) {
+			continue;
+		}
+		const auto& value = resources.buffers[i];
+		if (value.dword_count < 4) continue;
+		ShaderBufferResource descriptor;
+		std::memcpy(descriptor.fields, value.dwords.data(), sizeof(descriptor.fields));
+		has_reads |= descriptor.Base48() != 0 && descriptor.NumRecords() != 0;
+	}
+	return has_reads;
+}
+
 void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {
 	EXIT_IF(vk_buffer == nullptr || !source_stages);
 	const auto barrier = MakeShaderAccessDependency();

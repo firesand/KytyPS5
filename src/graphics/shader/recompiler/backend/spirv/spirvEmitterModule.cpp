@@ -619,6 +619,15 @@ void DefineInputs(EmitterState& state) {
 			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationFlat);
 		}
 	}
+	if (state.program.stage == ShaderType::Mesh && state.input_info.vertex != nullptr &&
+	    state.input_info.vertex->mesh_task_indirect) {
+		const auto u32_type = TypeU32(state);
+		const auto payload_struct_type = state.builder.Type(
+		    spv::OpTypeStruct, u32_type, u32_type, u32_type, u32_type);
+		state.builder.AddName(payload_struct_type, "TaskPayload");
+		state.task_payload_variable = DefineInterfaceVariable(
+		    state, payload_struct_type, spv::StorageClassTaskPayloadWorkgroupEXT, "taskPayload");
+	}
 }
 
 void DefineOutputs(EmitterState& state) {

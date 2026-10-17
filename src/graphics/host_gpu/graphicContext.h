@@ -38,7 +38,8 @@ struct GraphicContext {
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               supports_block_texel_view              = false;
-	bool                                      mesh_shader_enabled                   = false;
+	bool                               mesh_shader_enabled                   = false;
+	bool                               task_shader_enabled                   = false;
 	// VK_EXT_external_memory_host enabled (only requested under KYTY_HOST_RESIDENT=1).
 	bool                               external_memory_host_enabled          = false;
 	uint64_t                           min_imported_host_pointer_alignment   = 0;

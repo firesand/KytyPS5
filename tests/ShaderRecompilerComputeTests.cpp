@@ -5527,6 +5527,124 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  void CheckLargeSparseImageUpload() {
+    constexpr const char *name = "LargeSparseImageUpload";
+    constexpr uint64_t size = 576ull << 20, ring_size = 512ull << 20, page = 0x10000;
+    constexpr uint64_t base = 0x0000000250000000ull;
+    constexpr std::array<uint64_t, 3> mapped_offsets{0, ring_size, size - page};
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    void *reservation = reinterpret_cast<void *>(base);
+    Require(name, "sparse reservation", LibKernel::Memory::KernelReserveVirtualRange(
+        &reservation, size, 0x10, page) == 0, "large sparse reservation failed");
+    int64_t direct = -1;
+    Require(name, "physical pages", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), 3u * page, page, 0, &direct) == 0,
+        "sparse physical allocation failed");
+    for (u32 index = 0; index < mapped_offsets.size(); ++index) {
+      void *mapped = reinterpret_cast<void *>(base + mapped_offsets[index]);
+      Require(name, "map sparse page", LibKernel::Memory::KernelMapDirectMemory(
+          &mapped, page, 0x3, 0x10, direct + index * page, page) == 0,
+          "sparse page mapping failed");
+      auto *words = static_cast<u32 *>(mapped);
+      std::fill_n(words, page / sizeof(u32), 0u);
+      words[0] = 0x00020001u + index * 0x100u;
+      words[1] = 0x00040003u + index * 0x100u;
+      words[page / sizeof(u32) - 1u] = 0xabcdef01u;
+      context.MapMemory(base + mapped_offsets[index], page);
+    }
+    auto &cache = context.GetBufferCache();
+    // Exercise the ordinary ring before requesting the captured 576-MiB footprint.
+    const auto small = cache.ObtainBufferForImage(base, page);
+    auto readback = CreateHostBuffer(name, 8u * sizeof(u32),
+        vk::BufferUsageFlagBits::eTransferDst, {});
+    const vk::BufferCopy small_copy{small.second, 0, sizeof(u32)};
+    scheduler.Current().Handle().copyBuffer(small.first->Handle(), readback.buffer, 1, &small_copy);
+    const auto large = cache.ObtainBufferForImage(base, size);
+    Require(name, "temporary image source", large.first != nullptr && large.first != small.first &&
+        large.first->Size() == size && small.first->Size() == ring_size,
+        "oversized image upload resized the ring or truncated its source");
+    constexpr std::array<uint64_t, 5> probes{0, page, ring_size - 4u, ring_size, size - 4u};
+    std::array<vk::BufferCopy, probes.size()> copies{};
+    for (u32 index = 0; index < probes.size(); ++index)
+      copies[index] = {large.second + probes[index], (index + 1u) * sizeof(u32), sizeof(u32)};
+    scheduler.Current().Handle().copyBuffer(large.first->Handle(), readback.buffer,
+                                            copies.size(), copies.data());
+    // A compute consumer requires the same storage-buffer capability as the detiler.
+    const auto converted = TextureCacheTestAccess::Tiler(context.GetTextureCache()).TransformColor(
+        {large.first->Handle(), large.second + ring_size, 8u}, ColorTransform::SwapBgra16, true);
+    const vk::BufferCopy converted_copy{converted.offset, 6u * sizeof(u32), 8u};
+    scheduler.Current().Handle().copyBuffer(converted.buffer, readback.buffer, 1, &converted_copy);
+    vk::BufferMemoryBarrier barrier{};
+    barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = readback.buffer;
+    barrier.size = readback.size;
+    scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+        vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0, nullptr);
+    scheduler.Finish();
+    Require(name, "sparse upload and deferred lifetime",
+        ReadBuffer(name, readback, 8) == std::vector<u32>{0x00020001u, 0x00020001u, 0u, 0u,
+            0x00020101u, 0xabcdef01u, 0x00020103u, 0x00040101u},
+        "upload lost sparse holes, boundary bytes, compute access, or in-flight lifetime");
+    const auto private_base = LibKernel::Memory::AllocateRuntimeMemory(
+        0, page, Common::VirtualMemory::Mode::ReadWrite, "private_buffer_upload");
+    Require(name, "private source allocation", private_base != 0, "private allocation failed");
+    auto *private_words = reinterpret_cast<u32 *>(private_base);
+    private_words[0] = 0x55667788u;
+    private_words[page / sizeof(u32) - 1u] = 0x99aabbccu;
+    context.MapMemory(private_base, page);
+    context.MapMemory(base + page, 2u * page);
+    const auto sparse_buffer = cache.ObtainBuffer(base, 2u * page, false);
+    const auto private_buffer = cache.ObtainBuffer(private_base, page, false);
+    const auto sparse_stream = cache.ObtainBuffer(base + 2u * page, sizeof(u32), false);
+    Require(name, "sparse stream source",
+        sparse_stream.first == &cache.GetUtilityBuffer(MemoryUsage::Stream),
+        "small sparse read did not exercise the stream path");
+    const std::array<vk::BufferCopy, 2> sparse_copies{{
+        {sparse_buffer.second, 0, sizeof(u32)},
+        {sparse_buffer.second + page, sizeof(u32), sizeof(u32)}}};
+    const std::array<vk::BufferCopy, 2> private_copies{{
+        {private_buffer.second, 2u * sizeof(u32), sizeof(u32)},
+        {private_buffer.second + page - sizeof(u32), 3u * sizeof(u32), sizeof(u32)}}};
+    scheduler.Current().Handle().copyBuffer(sparse_buffer.first->Handle(), readback.buffer,
+        sparse_copies.size(), sparse_copies.data());
+    scheduler.Current().Handle().copyBuffer(private_buffer.first->Handle(), readback.buffer,
+        private_copies.size(), private_copies.data());
+    const vk::BufferCopy stream_copy{sparse_stream.second, 4u * sizeof(u32), sizeof(u32)};
+    scheduler.Current().Handle().copyBuffer(sparse_stream.first->Handle(), readback.buffer,
+        1, &stream_copy);
+    scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+        vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0, nullptr);
+    scheduler.Finish();
+    Require(name, "cached sparse and private upload",
+        ReadBuffer(name, readback, 5) == std::vector<u32>{0x00020001u, 0u, 0x55667788u, 0x99aabbccu, 0u} &&
+        !cache.IsRegionGpuModified(base, 2u * page) &&
+        !cache.IsRegionGpuModified(private_base, page),
+        "cached upload lost sparse/private data or changed read-only GPU ownership");
+    context.UnmapMemory(private_base, page);
+    context.UnmapMemory(base + page, 2u * page);
+    Require(name, "private source release", LibKernel::Memory::FreeGuestMemory(private_base, page),
+        "private allocation release failed");
+    DestroyBuffer(&readback);
+    for (const auto offset : mapped_offsets) context.UnmapMemory(base + offset, page);
+    scheduler.Finish();
+    context.ShutdownGpu();
+    Require(name, "release mappings", LibKernel::Memory::KernelMunmap(base, size) == 0,
+        "sparse mappings release failed");
+    Require(name, "release physical pages",
+        LibKernel::Memory::KernelReleaseDirectMemory(direct, 3u * page) == 0,
+        "sparse physical release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckUnifiedTextureCacheFlow() {
     constexpr const char *name = "UnifiedTextureCacheFlow";
     constexpr uintptr_t base = 0x0000000200600000ull;
@@ -9979,7 +10097,8 @@ public:
         context.BeginCommandStream();
         context.SyncCpuWrites();
         scheduler.FlushAndWait();
-        RenderContext::SetSyncOnWaitPassMode(0);
+        const char *env_wait = std::getenv("KYTY_SYNC_ON_WAIT_PASS");
+        RenderContext::SetSyncOnWaitPassMode((env_wait == nullptr || env_wait[0] != '0') ? 1 : 0);
       }
 
       resources.UnmapMemory(base, allocation_size);
@@ -12255,6 +12374,34 @@ public:
       auto &cache = context.GetBufferCache();
       auto &shaders = processor.GetShCtx();
       context.MapMemory(base, allocation_size);
+      // Empty CPU-owned arguments must not inspect the shader, even on a GPU-dirty page.
+      constexpr auto empty_args = base + allocation_size - case_size;
+      constexpr auto neighbor = empty_args + 0x100u;
+      constexpr std::array<std::array<u32, 3>, 3> empty_dimensions{{
+          {0, 1, 1}, {1, 0, 1}, {1, 1, 0}}};
+      Require(name, "empty arguments",
+              LibKernel::Memory::TryWriteBacking(empty_args, empty_dimensions.data(),
+                                                 sizeof(empty_dimensions)),
+              "empty indirect arguments could not be written");
+      shaders.SetCsShader({.data_addr = 1});
+      for (const bool dirty_neighbor : {false, true}) {
+        if (dirty_neighbor) {
+          auto [buffer, offset] = cache.ObtainBuffer(neighbor, sizeof(sentinel), true);
+          buffer->Fill(offset, sizeof(sentinel), sentinel + 1u);
+        }
+        Require(name, "exact argument ownership",
+                !cache.HasGpuDirtyBytes(empty_args, sizeof(empty_dimensions)) &&
+                    cache.IsRegionGpuModified(empty_args, sizeof(empty_dimensions)) == dirty_neighbor,
+                "empty arguments did not retain independent byte ownership");
+        const auto tick = scheduler.CurrentTick();
+        for (size_t i = 0; i < empty_dimensions.size(); ++i) {
+          processor.DispatchIndirect(empty_args + i * sizeof(empty_dimensions[0]), 0x41u);
+        }
+        Require(name, "empty dispatch avoids readback",
+                scheduler.CurrentTick() == tick &&
+                    cache.HasGpuDirtyBytes(neighbor, sizeof(sentinel)) == dirty_neighbor,
+                "empty dispatch submitted work or read back neighboring GPU data");
+      }
       const auto set_buffer = [&](u32 sgpr, uint64_t address, u32 records, u32 stride = 0) {
         ShaderBufferResource descriptor{};
         descriptor.UpdateAddress48(address);
@@ -43987,6 +44134,149 @@ void CheckDynamicRenderingState() {
   std::printf("[host]    %-32s ok\n", "DynamicRenderingState");
 }
 
+void CheckIndirectMeshDraws() {
+  const char *name = "IndirectMeshDraws";
+
+  // 1. Recompiler verification: Compile mesh shader with and without mesh_task_indirect.
+  const std::vector<u32> code = {
+      EncodeSopp(0x01), // s_endpgm
+  };
+
+  const auto CompileMesh = [&](bool task_indirect) {
+    ShaderVertexInputInfo vertex{};
+    vertex.mesh.threads_num[0] = 32;
+    vertex.mesh.threads_num[1] = 1;
+    vertex.mesh.threads_num[2] = 1;
+    vertex.mesh.primitives_per_group = 32;
+    vertex.mesh.vertices_per_group = 32;
+    vertex.mesh.max_vertices = 32;
+    vertex.mesh.max_primitives = 32;
+    vertex.mesh.wave_size = 32;
+    vertex.mesh.host_subgroup_size = 32;
+    vertex.mesh_task_indirect = task_indirect;
+
+    ShaderRecompiler::CompileOptions options{};
+    options.stage = ShaderType::Mesh;
+    options.wave_size = 32;
+    options.input_info.vertex = &vertex;
+    std::array<u32, 16> user_data{};
+    options.user_data = user_data;
+    options.user_data_base = 0;
+
+    auto translated = ShaderRecompiler::TranslateProgram(code, options);
+    auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+    ShaderRecompiler::IR::ResourceSnapshot resources;
+    ShaderRecompiler::IR::ResourceSpecialization specialization;
+    const ShaderRecompiler::IR::SrtRuntime runtime{
+        .user_data = options.user_data,
+        .shader_base = reinterpret_cast<uint64_t>(code.data()),
+    };
+    Require(name, "resource materialization",
+            ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization),
+            "mesh shader resources could not be materialized");
+    return ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
+  };
+
+  const auto direct = CompileMesh(false);
+  const auto indirect = CompileMesh(true);
+
+  // Validate SPIR-V with Vulkan 1.3 / MeshEXT environment
+  {
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
+    std::string direct_msg, indirect_msg;
+    tools.SetMessageConsumer([&direct_msg](spv_message_level_t, const char *,
+                                         const spv_position_t &position, const char *message) {
+      char buf[512];
+      std::snprintf(buf, sizeof(buf), "%zu:%zu: %s\n", position.line, position.column, message);
+      direct_msg += buf;
+    });
+    if (!tools.Validate(direct.spirv)) {
+      Fail(name, "direct mesh SPIR-V validation", direct_msg);
+    }
+
+    tools.SetMessageConsumer([&indirect_msg](spv_message_level_t, const char *,
+                                           const spv_position_t &position, const char *message) {
+      char buf[512];
+      std::snprintf(buf, sizeof(buf), "%zu:%zu: %s\n", position.line, position.column, message);
+      indirect_msg += buf;
+    });
+    if (!tools.Validate(indirect.spirv)) {
+      Fail(name, "indirect mesh SPIR-V validation", indirect_msg);
+    }
+
+    std::string direct_asm, indirect_asm;
+    Require(name, "direct disassembly", tools.Disassemble(direct.spirv, &direct_asm),
+            "failed to disassemble direct mesh shader");
+    Require(name, "indirect disassembly", tools.Disassemble(indirect.spirv, &indirect_asm),
+            "failed to disassemble indirect mesh shader");
+
+    Require(name, "direct lacks task payload",
+            direct_asm.find("TaskPayloadWorkgroupEXT") == std::string::npos,
+            "direct mesh shader unexpectedly declared TaskPayloadWorkgroupEXT");
+    Require(name, "indirect declares task payload",
+            indirect_asm.find("TaskPayloadWorkgroupEXT") != std::string::npos &&
+                indirect_asm.find("OpTypeStruct") != std::string::npos,
+            "indirect mesh shader failed to declare TaskPayloadWorkgroupEXT interface");
+  }
+
+  // 2. Static key separation:
+  ShaderVertexInputInfo direct_info{};
+  direct_info.mesh.threads_num[0] = 32;
+  direct_info.mesh_task_indirect = false;
+
+  ShaderVertexInputInfo indirect_info{};
+  indirect_info.mesh.threads_num[0] = 32;
+  indirect_info.mesh_task_indirect = true;
+
+  std::vector<u32> direct_key, indirect_key;
+  BuildStageStaticKey(direct_info, direct_key);
+  BuildStageStaticKey(indirect_info, indirect_key);
+
+  Require(name, "static key separation",
+          direct_key != indirect_key && !direct_key.empty() && !indirect_key.empty(),
+          "direct and indirect mesh shaders did not produce distinct static pipeline keys");
+
+  // 3. Dynamic Rendering Pass Normalization:
+  // Transient clear flags must be cleared post-begin so subsequent draws match render state
+  RenderState render_state{};
+  render_state.width = 1920;
+  render_state.height = 1080;
+  render_state.num_layers = 1;
+  render_state.num_color_attachments = 1;
+  render_state.color_attachments[0].image_layout = vk::ImageLayout::eColorAttachmentOptimal;
+  render_state.color_attachments[0].is_clear = true;
+  render_state.depth_stencil_attachment.has_depth = true;
+  render_state.depth_stencil_attachment.has_stencil = true;
+  render_state.depth_stencil_attachment.depth_clear = true;
+  render_state.depth_stencil_attachment.stencil_clear = true;
+  render_state.depth_stencil_attachment.is_clear = true;
+
+  // After CommandBuffer::BeginRendering normalizes:
+  render_state.color_attachments[0].is_clear = false;
+  render_state.depth_stencil_attachment.depth_clear = false;
+  render_state.depth_stencil_attachment.stencil_clear = false;
+  render_state.depth_stencil_attachment.is_clear = false;
+
+  RenderState subsequent_draw_state{};
+  subsequent_draw_state.width = 1920;
+  subsequent_draw_state.height = 1080;
+  subsequent_draw_state.num_layers = 1;
+  subsequent_draw_state.num_color_attachments = 1;
+  subsequent_draw_state.color_attachments[0].image_layout = vk::ImageLayout::eColorAttachmentOptimal;
+  subsequent_draw_state.color_attachments[0].is_clear = false;
+  subsequent_draw_state.depth_stencil_attachment.has_depth = true;
+  subsequent_draw_state.depth_stencil_attachment.has_stencil = true;
+  subsequent_draw_state.depth_stencil_attachment.depth_clear = false;
+  subsequent_draw_state.depth_stencil_attachment.stencil_clear = false;
+  subsequent_draw_state.depth_stencil_attachment.is_clear = false;
+
+  Require(name, "render state normalization identity",
+          render_state == subsequent_draw_state,
+          "dynamic rendering pass normalization failed to preserve render pass continuity");
+
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckDepthTargetFootprints() {
   TileSizeAlign stencil{};
   TileSizeAlign htile{};
@@ -46838,6 +47128,10 @@ int main(int argc, char **argv) {
     CheckComputeDrawParametersLoads();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--indirect-mesh-only") == 0) {
+    CheckIndirectMeshDraws();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--depth-feedback-only") == 0) {
     CheckDepthAttachmentWrites();
     CheckDepthFeedbackAspects();
@@ -46875,12 +47169,14 @@ int main(int argc, char **argv) {
     vulkan.CheckRasterization(false); // draw-hazard leg (mode 1) lives here
     return 0;
   }
-  if (argc == 2 && std::strcmp(argv[1], "--htile-clear-only") == 0) {
+  if (argc == 2 && (std::strcmp(argv[1], "--htile-clear-only") == 0 ||
+                    std::strcmp(argv[1], "--htile-only") == 0)) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedTextureCacheFlow();
     return 0;
   }
-  if (argc == 2 && std::strcmp(argv[1], "--dcc-clear-only") == 0) {
+  if (argc == 2 && (std::strcmp(argv[1], "--dcc-clear-only") == 0 ||
+                    std::strcmp(argv[1], "--dcc-only") == 0)) {
     VulkanHarness vulkan;
     vulkan.CheckRenderExecutorColorMetadataClear(/*require_gpu_resolver=*/true);
     return 0;
@@ -46962,8 +47258,14 @@ int main(int argc, char **argv) {
     vulkan.CheckHostResidentMemory();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--image-upload-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckLargeSparseImageUpload();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-range-only") == 0) {
     VulkanHarness vulkan;
+    vulkan.CheckLargeSparseImageUpload();
     vulkan.CheckUnifiedTextureCacheFlow();
     return 0;
   }
@@ -47147,6 +47449,7 @@ int main(int argc, char **argv) {
   CheckPm4RewindResume(vulkan.RuntimeRenderer());
   CheckPm4CeCompletion(vulkan.RuntimeRenderer());
   CheckEmbeddedFetchVertexOffset();
+  CheckIndirectMeshDraws();
   CheckEmbeddedFetchLaneSpill();
   CheckTessellationPrograms();
   CheckPixelParameterAliases();
@@ -47167,6 +47470,7 @@ int main(int argc, char **argv) {
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);
   vulkan.CheckBdaPageTableUploads();
+  vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();

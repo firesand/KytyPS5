@@ -120,6 +120,7 @@ bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t
 bool                   QueryBackingOffset(uint64_t vaddr, uint64_t size, uint64_t* backing_offset);
 [[nodiscard]] uint8_t* GetBackingHostView(uint64_t* size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
+bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);

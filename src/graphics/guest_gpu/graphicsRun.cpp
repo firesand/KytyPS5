@@ -1086,6 +1086,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 						           0, 16u * 2u * sizeof(uint64_t));
 					} else {
 						m_predicate_skip = false;
+						NoteGuestAcquire();
 					}
 					return;
 				}
@@ -1176,7 +1177,10 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, IndirectDrawRegisters 
 static bool GpuIndirectEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_CP_GPU_INDIRECT");
-		return value != nullptr && value[0] == '1';
+		if (value == nullptr) {
+			return true;
+		}
+		return value[0] != '0';
 	}();
 	return enabled;
 }

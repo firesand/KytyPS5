@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/gpuDiagnostics.h"
+#include "gpu_tiler_shaders/pass_through_task_spv.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -740,6 +741,9 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	InitializeDriverCache();
 	m_last_save = std::chrono::steady_clock::now();
 	s_live.store(this, std::memory_order_release);
+	if (m_graphics.task_shader_enabled) {
+		m_task_shader_module = CompileSPV(PASS_THROUGH_TASK_SPV, m_graphics.device);
+	}
 }
 
 PipelineCache::~PipelineCache() {
@@ -755,6 +759,9 @@ PipelineCache::~PipelineCache() {
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	if (m_task_shader_module != nullptr) {
+		m_graphics.device.destroyShaderModule(m_task_shader_module, nullptr);
+	}
 	if (m_driver_cache != nullptr) {
 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	}
@@ -958,12 +965,14 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (draw_parameters != nullptr && draw_parameters->active) {
-		// The command processor only requests this for plain vertex shaders (see
-		// RenderExecutor::CanDrawIndirectOnGpu); anything else has no draw-parameter variant.
-		EXIT_NOT_IMPLEMENTED(tess_active || mesh_active);
-		vertex_info[0].draw_parameters = *draw_parameters;
-		// Native fetch consumes the SGPRs the host path patched and expects ids without the base.
-		vertex_info[0].draw_parameters.rebase_ids = !vertex_info[0].fetch_embedded;
+		EXIT_NOT_IMPLEMENTED(tess_active);
+		if (mesh_active) {
+			vertex_info[0].mesh_task_indirect = true;
+		} else {
+			vertex_info[0].draw_parameters = *draw_parameters;
+			// Native fetch consumes the SGPRs the host path patched and expects ids without the base.
+			vertex_info[0].draw_parameters.rebase_ids = !vertex_info[0].fetch_embedded;
+		}
 	}
 	if (mesh_active) {
 		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
@@ -1259,7 +1268,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
-	                       ps_input_info, programs, static_params, m_driver_cache);
+	                       ps_input_info, programs, static_params, m_driver_cache,
+	                       m_task_shader_module);
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);

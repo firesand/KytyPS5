@@ -1,0 +1,82 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : enable
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, scalar) readonly buffer DrawIndirectArgsBuffer {
+	uint vertex_count;
+	uint instance_count;
+	uint first_vertex;
+	uint first_instance;
+};
+
+layout(buffer_reference, scalar) readonly buffer DrawIndexedIndirectArgsBuffer {
+	uint index_count;
+	uint instance_count;
+	uint first_index;
+	int  vertex_offset;
+	uint first_instance;
+};
+
+struct TaskPayload {
+	uint vertex_count;
+	uint first_vertex;
+	uint first_instance;
+	uint draw_id;
+};
+
+taskPayloadSharedEXT TaskPayload payload;
+
+layout(push_constant) uniform PushConstants {
+	uint64_t args_bda;
+	uint stride;
+	uint primitives_per_group;
+	uint max_groups_x;
+	uint max_groups_y;
+	uint is_indexed;
+} pc;
+
+void main() {
+	uint draw_id = gl_WorkGroupID.x;
+	uint64_t record_addr = pc.args_bda + uint64_t(draw_id) * uint64_t(pc.stride);
+
+	uint vertex_count = 0;
+	uint instance_count = 0;
+	uint first_vertex = 0;
+	uint first_instance = 0;
+
+	if (pc.is_indexed != 0u) {
+		DrawIndexedIndirectArgsBuffer args = DrawIndexedIndirectArgsBuffer(record_addr);
+		vertex_count = args.index_count;
+		instance_count = args.instance_count;
+		first_vertex = uint(args.vertex_offset);
+		first_instance = args.first_instance;
+	} else {
+		DrawIndirectArgsBuffer args = DrawIndirectArgsBuffer(record_addr);
+		vertex_count = args.vertex_count;
+		instance_count = args.instance_count;
+		first_vertex = args.first_vertex;
+		first_instance = args.first_instance;
+	}
+
+	if (vertex_count == 0u || instance_count == 0u) {
+		EmitMeshTasksEXT(0u, 0u, 0u);
+		return;
+	}
+
+	uint ppg = max(pc.primitives_per_group, 1u);
+	uint groups_x = (vertex_count + ppg - 1u) / ppg;
+	groups_x = min(groups_x, pc.max_groups_x);
+	uint groups_y = min(instance_count, pc.max_groups_y);
+
+	payload.vertex_count = vertex_count;
+	payload.first_vertex = first_vertex;
+	payload.first_instance = first_instance;
+	payload.draw_id = draw_id;
+
+	EmitMeshTasksEXT(groups_x, groups_y, 1u);
+}

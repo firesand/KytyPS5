@@ -140,6 +140,12 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
 	{ GpuTimestampScope ts_scope(RawHandle(), GpuTimestamps::Kind::RenderPass); RawHandle().beginRendering(rendering); }
 	m_render_state = state;
+	for (uint32_t i = 0; i < m_render_state.num_color_attachments; i++) {
+		m_render_state.color_attachments[i].is_clear = false;
+	}
+	m_render_state.depth_stencil_attachment.is_clear      = false;
+	m_render_state.depth_stencil_attachment.depth_clear   = false;
+	m_render_state.depth_stencil_attachment.stencil_clear = false;
 	m_rendering    = true;
 }
 

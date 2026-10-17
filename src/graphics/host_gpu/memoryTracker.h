@@ -78,11 +78,6 @@ public:
 	template <typename Flush>
 	void InvalidateWriteFault(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
 		static_assert(std::is_invocable_v<Flush&>);
-		const auto ahead = FaultAheadPages();
-		if (ahead <= 1) {
-			InvalidateRegion(vaddr, size, std::forward<Flush>(on_flush));
-			return;
-		}
 		CheckNotInUploadCallback();
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			const bool should_flush = [&] {
@@ -90,9 +85,8 @@ public:
 				if (manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
 					return true;
 				}
-				const auto address  = manager->GetCpuAddr() + offset;
-				const auto extended = manager->ExtendWriteFault(address, bytes, ahead);
-				manager->ChangeState<DirtySource::Cpu, true>(address, extended);
+				const auto address = manager->GetCpuAddr() + offset;
+				manager->ApplyWriteFault(address, bytes);
 				return false;
 			}();
 			if (should_flush) {
