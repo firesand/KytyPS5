@@ -5,7 +5,15 @@
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
+// GPU-side indirect mesh draws (KYTY_CP_GPU_INDIRECT): one task workgroup per non-indexed
+// DrawIndirectArgs record; launches the record's mesh groups and forwards the record in the payload
+// (the recompiled mesh program reads it, EmitMeshDrawParameter / EmitGetUserData).
+
 layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+// Device mesh workgroup limits (meshTaskIndirect.h kTaskSpec*).
+layout(constant_id = 0) const uint MAX_GROUPS_X = 65535u;
+layout(constant_id = 1) const uint MAX_GROUPS_Y = 65535u;
 
 layout(buffer_reference, scalar) readonly buffer DrawIndirectArgsBuffer {
 	uint vertex_count;
@@ -14,14 +22,7 @@ layout(buffer_reference, scalar) readonly buffer DrawIndirectArgsBuffer {
 	uint first_instance;
 };
 
-layout(buffer_reference, scalar) readonly buffer DrawIndexedIndirectArgsBuffer {
-	uint index_count;
-	uint instance_count;
-	uint first_index;
-	int  vertex_offset;
-	uint first_instance;
-};
-
+// Field order is fixed by the mesh side (spirvEmitterModule.cpp DefineInputs).
 struct TaskPayload {
 	uint vertex_count;
 	uint first_vertex;
@@ -31,47 +32,33 @@ struct TaskPayload {
 
 taskPayloadSharedEXT TaskPayload payload;
 
+// meshTaskIndirect.h MeshTaskPushConstants: at most 24 bytes, the mesh program's shader-data window
+// starts at push dword 6.
 layout(push_constant) uniform PushConstants {
 	uint64_t args_bda;
 	uint stride;
-	uint primitives_per_group;
-	uint max_groups_x;
-	uint max_groups_y;
-	uint is_indexed;
+	uint primitive_info; // primitives_per_group | size << 16 | step << 24
 } pc;
 
 void main() {
 	uint draw_id = gl_WorkGroupID.x;
 	uint64_t record_addr = pc.args_bda + uint64_t(draw_id) * uint64_t(pc.stride);
 
-	uint vertex_count = 0;
-	uint instance_count = 0;
-	uint first_vertex = 0;
-	uint first_instance = 0;
-
-	if (pc.is_indexed != 0u) {
-		DrawIndexedIndirectArgsBuffer args = DrawIndexedIndirectArgsBuffer(record_addr);
-		vertex_count = args.index_count;
-		instance_count = args.instance_count;
-		first_vertex = uint(args.vertex_offset);
-		first_instance = args.first_instance;
-	} else {
-		DrawIndirectArgsBuffer args = DrawIndirectArgsBuffer(record_addr);
-		vertex_count = args.vertex_count;
-		instance_count = args.instance_count;
-		first_vertex = args.first_vertex;
-		first_instance = args.first_instance;
-	}
+	DrawIndirectArgsBuffer args = DrawIndirectArgsBuffer(record_addr);
+	uint vertex_count = args.vertex_count;
+	uint instance_count = args.instance_count;
+	uint first_vertex = args.first_vertex;
+	uint first_instance = args.first_instance;
 
 	if (vertex_count == 0u || instance_count == 0u) {
 		EmitMeshTasksEXT(0u, 0u, 0u);
 		return;
 	}
 
-	uint ppg = max(pc.primitives_per_group, 1u);
+	uint ppg = max(pc.primitive_info & 0xffffu, 1u);
 	uint groups_x = (vertex_count + ppg - 1u) / ppg;
-	groups_x = min(groups_x, pc.max_groups_x);
-	uint groups_y = min(instance_count, pc.max_groups_y);
+	groups_x = min(groups_x, MAX_GROUPS_X);
+	uint groups_y = min(instance_count, MAX_GROUPS_Y);
 
 	payload.vertex_count = vertex_count;
 	payload.first_vertex = first_vertex;

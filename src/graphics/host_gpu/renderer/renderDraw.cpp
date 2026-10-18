@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/gpuIndirectFilter.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/meshTaskIndirect.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -1412,27 +1413,21 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
 	if (mesh_active) {
 		if (gpu_indirect != nullptr) {
-			const auto& limits = m_context.GetGraphics().mesh_shader_properties;
-			struct alignas(8) TaskPushConsts {
-				uint64_t args_bda;
-				uint32_t stride;
-				uint32_t primitives_per_group;
-				uint32_t max_groups_x;
-				uint32_t max_groups_y;
-				uint32_t is_indexed;
-			} task_pc {};
-			const auto bda = indirect_args.first->BufferDeviceAddress() + indirect_args.second;
-			task_pc.args_bda              = bda;
-			task_pc.stride                = gpu_indirect->stride;
-			task_pc.primitives_per_group  = state.vertex_info[0].mesh.primitives_per_group;
-			task_pc.max_groups_x          = limits.maxMeshWorkGroupCount[0];
-			task_pc.max_groups_y          = limits.maxMeshWorkGroupCount[1];
-			task_pc.is_indexed            = draw.IsIndexed() ? 1u : 0u;
+			// After CommitBindings' full push: the task block overwrites only dwords 0-5, which the
+			// task-path mesh program does not read; its shader data starts at dword 6.
+			static_assert(kTaskPushBytes <= ShaderRecompiler::IR::PushData::MeshDrawDwordCount * 4u);
+			EXIT_IF(draw.IsIndexed() || !pipeline.task_stage);
+			const auto& mesh = state.vertex_info[0].mesh;
+			MeshTaskPushConstants task_pc {};
+			task_pc.args_bda       = indirect_args.first->BufferDeviceAddress() + indirect_args.second;
+			task_pc.stride         = gpu_indirect->stride;
+			task_pc.primitive_info = PackMeshTaskPrimitiveInfo(
+			    mesh.primitives_per_group, mesh.InputPrimitiveSize(), mesh.InputPrimitiveStep());
 			vk_buffer.pushConstants(pipeline.pipeline_layout,
 			                        vk::ShaderStageFlagBits::eTaskEXT |
 			                            vk::ShaderStageFlagBits::eMeshEXT |
 			                            vk::ShaderStageFlagBits::eFragment,
-			                        0, sizeof(task_pc), &task_pc);
+			                        0, kTaskPushBytes, &task_pc);
 		} else {
 			vk_buffer.pushConstants(pipeline.pipeline_layout,
 			                        vk::ShaderStageFlagBits::eMeshEXT |
