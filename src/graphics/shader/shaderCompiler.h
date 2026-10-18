@@ -19,6 +19,10 @@ struct ShaderParams {
 	std::array<uint32_t, 40>  user_data {}; // 32 user SGPRs plus the merged-stage s0:s7 prefix.
 	uint32_t                  user_data_count = 0;
 	uint64_t                  hash = 0;
+	// Vertex-stage programs: the hash VertexShaderIsMesh reports for the bound shader (the front
+	// half for a GsFront pair, whose `hash` combines both halves). Keys the GPU-indirect gate's
+	// user-data mask. 0: use `hash`.
+	uint64_t                  gate_hash = 0;
 	std::span<const uint32_t> back_code;
 
 	[[nodiscard]] uint64_t Base() const {

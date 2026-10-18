@@ -678,8 +678,11 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
-			if (stage == ShaderType::Vertex) {
-				vertex_user_data_masks[params.hash] |= entry->second.resource_plan.user_data_mask;
+			// Mesh too (Stage 2): keyed by the hash CanDrawIndirectOnGpu looks up. Mesh programs
+			// compile with user_data_base 0, so GS slot k is bit kMeshUserSgprBase + k there.
+			if (stage == ShaderType::Vertex || stage == ShaderType::Mesh) {
+				vertex_user_data_masks[params.gate_hash != 0 ? params.gate_hash : params.hash] |=
+				    entry->second.resource_plan.user_data_mask;
 			}
 		}
 		entry->second.permutations.push_back(CompilePermutation(
@@ -722,7 +725,8 @@ struct PipelineCache::ProgramCache {
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
-	// Vertex-stage shader hash -> user-data registers its resource plan evaluates on the host.
+	// Vertex / mesh shader hash (ShaderParams::gate_hash) -> user-data registers its resource plan
+	// evaluates on the host.
 	std::unordered_map<uint64_t, uint64_t>                      vertex_user_data_masks;
 };
 
