@@ -2667,6 +2667,16 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size, bool wh
 			const auto last  = std::min(address + size, Common::AlignDown(owner->info.data.End(), TRACKER_PAGE_SIZE));
 			write_address = first;
 			write_size    = first < last ? last - first : 0;
+			// An image sharing written pages only partly (smaller than a page, or a head/tail page):
+			// the write may or may not have hit it, and a maybe-dirty hash taken now already
+			// includes it. Guest memory is the truth for a CPU-sourced, uncompressed image, so it
+			// re-uploads; GPU-modified or compressed images keep the fault-outside-its-bytes path.
+			if (write_size == 0 && !owner->IsGpuModified() &&
+			    owner->info.metadata.compression == VideoOutCompression::Uncompressed) {
+				write_address = std::max(address, owner->info.data.address);
+				const auto overlap_end = std::min(address + size, owner->info.data.End());
+				write_size = write_address < overlap_end ? overlap_end - write_address : 0;
+			}
 		}
 		if (write_size != 0 && owner->Overlaps(write_address, write_size)) {
 			if (owner->IsGpuModified() && KeepGpuImagesProbe() == 1) {

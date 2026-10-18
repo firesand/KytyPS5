@@ -15,6 +15,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/writeWatch.h"
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/pageManager.h"
@@ -9741,6 +9742,10 @@ public:
                   !texture_cache.GetImage(final_word_image).IsCpuDirty(),
               "the final mapped word's image was not clean before its CPU store");
       *final_word = 45;
+      // Kernel write-watch: the store does not fault; the next collection applies it.
+      if (Libs::Graphics::WriteWatch::Get() != nullptr) {
+        (void)resources.CollectCpuWrites(final_word_address, sizeof(uint32_t));
+      }
       Require(name, "fault boundary CPU store",
               *final_word == 45 &&
                   texture_cache.GetImage(final_word_image).IsDefinitelyCpuDirty(),
@@ -9847,6 +9852,9 @@ public:
         // A CPU store after publication dirties the image and is kept.
         auto *readback_store = reinterpret_cast<volatile uint32_t *>(readback_address + 64);
         *readback_store = 0x11223344u;
+        if (Libs::Graphics::WriteWatch::Get() != nullptr) {
+          (void)resources.CollectCpuWrites(readback_address + 64, sizeof(uint32_t));
+        }
         Require(name, "CPU store after readback dirties the image",
                 *readback_store == 0x11223344u &&
                     texture_cache.GetImage(readback_image).IsDefinitelyCpuDirty(),

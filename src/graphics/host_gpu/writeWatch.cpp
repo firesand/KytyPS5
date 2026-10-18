@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <cstdlib>
+#include <string>
 #include <utility>
 
 #if defined(__linux__)
@@ -42,6 +43,29 @@ std::atomic<uint64_t> g_errors {0};
 std::atomic<uint64_t> g_ns {0};
 std::atomic<uint64_t> g_label_checks {0};
 std::atomic<uint64_t> g_label_written {0};
+
+// KYTY_WRITE_WATCH_LOG=1: one line per collection that reported pages (first 4000).
+bool LogEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_WRITE_WATCH_LOG");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+void LogRuns(const char* what, uint64_t vaddr, uint64_t size,
+             const std::vector<std::pair<uint64_t, uint64_t>>& runs) {
+	static std::atomic<uint32_t> lines {0};
+	if (!LogEnabled() || runs.empty() || lines.fetch_add(1, std::memory_order_relaxed) >= 4000) {
+		return;
+	}
+	std::string text;
+	for (size_t i = 0; i < runs.size() && i < 8; i++) {
+		text += fmt::format(" 0x{:x}+0x{:x}", runs[i].first, runs[i].second - runs[i].first);
+	}
+	LOGF("WriteWatch: %s 0x%016" PRIx64 "+0x%" PRIx64 " reported %zu run(s):%s%s\n", what, vaddr,
+	     size, runs.size(), text.c_str(), runs.size() > 8 ? " ..." : "");
+}
 
 void AppendRun(std::vector<std::pair<uint64_t, uint64_t>>* runs, uint64_t start, uint64_t end) {
 	if (!runs->empty() && runs->back().second == start) {
@@ -295,6 +319,7 @@ void WriteWatch::Collect(uint64_t vaddr, uint64_t size, const RunFunc& func) noe
 		});
 	}
 	NoteLabelRuns(runs);
+	LogRuns("collect", vaddr, size, runs);
 	if (labels) {
 		m_label_scan_seq.fetch_add(1, std::memory_order_seq_cst);
 		m_label_scans_active.fetch_sub(1, std::memory_order_seq_cst);
