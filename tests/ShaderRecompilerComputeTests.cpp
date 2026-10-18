@@ -6,6 +6,7 @@
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "gpu_test_shaders/gpu_test_ms_depth_spv.h"
+#include "gpu_tiler_shaders/pass_through_task_spv.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -23,6 +24,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/gpuIndirectFilter.h"
+#include "graphics/host_gpu/renderer/meshTaskIndirect.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -76,6 +78,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -44524,10 +44527,106 @@ static void CheckMeshTaskPathEmission() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// T2: the pass-through task shader's push block fits in the push dwords the task-path mesh
+// program leaves free (0-5; its shader data starts at MeshDrawDwordCount), and the compiled GLSL
+// block (pass_through_task_spv.h) has the C++ layout (meshTaskIndirect.h) and spec constant ids.
+// Fails on bc40a55 (a 32-byte block).
+static void CheckMeshTaskPushLayout() {
+  const char *name = "MeshTaskPushLayout";
+  constexpr u32 budget = ShaderRecompiler::IR::PushData::MeshDrawDwordCount * 4u;
+  Require(name, "push budget", kTaskPushBytes <= budget,
+          "the task push block (" + std::to_string(kTaskPushBytes) + " bytes) overlaps the mesh "
+          "program's shader-data window at byte " + std::to_string(budget));
+  Require(name, "C++ layout",
+          offsetof(MeshTaskPushConstants, args_bda) == 0 &&
+              offsetof(MeshTaskPushConstants, stride) == 8 &&
+              offsetof(MeshTaskPushConstants, primitive_info) == 12 &&
+              offsetof(MeshTaskPushConstants, counters_bda) == 16,
+          "MeshTaskPushConstants changed; update pass_through_task.task and this test");
+  Require(name, "primitive info packing",
+          PackMeshTaskPrimitiveInfo(62, 3, 1) == (62u | (3u << 16u) | (1u << 24u)),
+          "PackMeshTaskPrimitiveInfo does not match the task shader's unpacking");
+
+  constexpr u32 kOpTypeInt = 21, kOpTypeStruct = 30, kOpTypePointer = 32, kOpVariable = 59,
+                kOpDecorate = 71, kOpMemberDecorate = 72;
+  constexpr u32 kDecorationSpecId = 1, kDecorationOffset = 35, kStorageClassPushConstant = 9;
+  const std::span<const u32> words(PASS_THROUGH_TASK_SPV);
+  Require(name, "SPIR-V header", words.size() > 5 && words[0] == 0x07230203u,
+          "pass_through_task_spv.h is not a SPIR-V module");
+  std::map<u32, u32> int_width;
+  std::map<u32, std::vector<u32>> struct_members;
+  std::map<u32, std::pair<u32, u32>> pointer_types; // id -> storage class, pointee
+  std::map<std::pair<u32, u32>, u32> member_offsets;
+  std::set<u32> spec_ids;
+  u32 push_pointer_type = 0;
+  for (size_t at = 5; at < words.size();) {
+    const u32 count = words[at] >> 16u;
+    const u32 opcode = words[at] & 0xffffu;
+    Require(name, "SPIR-V instruction stream", count != 0 && at + count <= words.size(),
+            "malformed instruction in the task shader module");
+    const auto operands = words.subspan(at + 1, count - 1);
+    switch (opcode) {
+      case kOpTypeInt:
+        int_width[operands[0]] = operands[1];
+        break;
+      case kOpTypeStruct:
+        struct_members[operands[0]].assign(operands.begin() + 1, operands.end());
+        break;
+      case kOpTypePointer:
+        pointer_types[operands[0]] = {operands[1], operands[2]};
+        break;
+      case kOpVariable:
+        if (operands.size() >= 3 && operands[2] == kStorageClassPushConstant) {
+          Require(name, "one push block", push_pointer_type == 0,
+                  "the task shader declares two push-constant variables");
+          push_pointer_type = operands[0];
+        }
+        break;
+      case kOpDecorate:
+        if (operands.size() >= 3 && operands[1] == kDecorationSpecId) {
+          spec_ids.insert(operands[2]);
+        }
+        break;
+      case kOpMemberDecorate:
+        if (operands.size() >= 4 && operands[2] == kDecorationOffset) {
+          member_offsets[{operands[0], operands[1]}] = operands[3];
+        }
+        break;
+      default: break;
+    }
+    at += count;
+  }
+  Require(name, "push block present", pointer_types.count(push_pointer_type) != 0,
+          "the task shader declares no push-constant block");
+  const u32 block = pointer_types[push_pointer_type].second;
+  Require(name, "push block struct", struct_members.count(block) != 0,
+          "the task shader's push constant is not a struct");
+  std::vector<u32> offsets;
+  u32 block_end = 0;
+  const auto &members = struct_members[block];
+  for (u32 member = 0; member < members.size(); ++member) {
+    const auto offset = member_offsets.find({block, member});
+    Require(name, "member offsets", offset != member_offsets.end() && int_width.count(members[member]) != 0,
+            "a push block member has no Offset or is not an integer");
+    offsets.push_back(offset->second);
+    block_end = std::max(block_end, offset->second + int_width[members[member]] / 8u);
+  }
+  Require(name, "GLSL layout matches C++",
+          offsets == std::vector<u32>{0, 8, 12, 16} && block_end == kTaskPushBytes,
+          "pass_through_task.task's push block (" + std::to_string(block_end) +
+              " bytes) does not match MeshTaskPushConstants (" + std::to_string(kTaskPushBytes) +
+              " bytes)");
+  Require(name, "spec constant ids",
+          spec_ids == std::set<u32>{kTaskSpecMaxGroupsX, kTaskSpecMaxGroupsY, kTaskSpecMaxGroupsTotal},
+          "the task shader's specialization constants do not match meshTaskIndirect.h");
+  std::printf("[host]    %-32s ok (%u bytes)\n", name, kTaskPushBytes);
+}
+
 void CheckMeshTaskIndirect() {
   CheckGpuIndirectReasonNames();
   CheckGpuIndirectHashFilter();
   CheckMeshTaskPathEmission();
+  CheckMeshTaskPushLayout();
 }
 
 void CheckDepthTargetFootprints() {
