@@ -1134,6 +1134,15 @@ void BufferCache::PrepareHostRead(uint64_t vaddr, uint64_t size) {
 	DrainPendingGpuModified();
 }
 
+bool BufferCache::PublishGpuWritesNoWait(uint64_t vaddr, uint64_t size) {
+	const bool pending = HasPendingUnboundedWrites() && m_write_fault_ranges.Intersects(vaddr, size);
+	if (pending) {
+		FlushWriteFaults(false);
+	}
+	DrainPendingGpuModified();
+	return pending;
+}
+
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }

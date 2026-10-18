@@ -53,22 +53,27 @@ struct HostReadProbe {
 	// - FallbackDenied: a vertex-stage hash in KYTY_CP_GPU_INDIRECT_DENY_HASH (counted in "other" too);
 	// - MeshClampedRecords / MeshEmptyRecords: argument records the task shader clamped to the
 	//   device's mesh workgroup limits / found empty (GPU atomics, read back with a delay);
+	// - ArgsWaitSkipped / ArgsWaitKept (lazy mode 1): GPU packets whose argument range intersected
+	//   pending unbounded writes and skipped the waiting publish, or kept it because the range also
+	//   has CPU-modified pages that ObtainBuffer would upload over the unpublished GPU writes;
 	// - StaleSgpr: a later draw whose shader can read a GS user-data register that a GPU packet left
 	//   at its pre-packet value (the host path would have patched it with the last record's offset).
 	enum GpuIndirect : uint32_t { GpuDraws = 0, FallbackIndexOffset, FallbackOther, FallbackMesh, FallbackSrt,
 	                              MeshGpuDraws, FallbackMeshDenied, FallbackMeshCountAddr, FallbackMeshPrim,
-	                              FallbackDenied, MeshClampedRecords, MeshEmptyRecords, StaleSgpr,
-	                              GpuIndirectCount };
+	                              FallbackDenied, MeshClampedRecords, MeshEmptyRecords, ArgsWaitSkipped,
+	                              ArgsWaitKept, StaleSgpr, GpuIndirectCount };
 	// Short names, one per enumerator in order; the size is deduced, so adding an enumerator without
 	// a name (or the reverse) fails to compile.
 	static constexpr auto kGpuIndirectNames = std::to_array<const char*>(
 	    {"gpu", "index_offset", "other", "mesh", "srt", "mesh-gpu", "mesh-denied", "mesh-count-addr",
-	     "mesh-prim", "denied", "mesh-clamped", "mesh-empty", "stale-sgpr"});
+	     "mesh-prim", "denied", "mesh-clamped", "mesh-empty", "args-wait-skipped", "args-wait-kept",
+	     "stale-sgpr"});
 	static_assert(kGpuIndirectNames.size() == GpuIndirectCount, "GpuIndirect enum / name table mismatch");
 	struct Snapshot {
 		std::array<std::pair<uint64_t, uint64_t>, SiteCount> sites {}; // calls, nanoseconds
 		std::array<uint64_t, GpuIndirectCount>               gpu_indirect {};
 		uint64_t                                             gpu_indirect_wait_ns = 0;
+		uint64_t                                             gpu_indirect_args_wait_ns = 0;
 	};
 	inline static std::array<HostReadCounters, SiteCount> s_sites {};
 	inline static std::array<std::atomic<uint64_t>, GpuIndirectCount> s_gpu_indirect {};
@@ -78,6 +83,12 @@ struct HostReadProbe {
 	inline static std::atomic<uint64_t> s_gpu_indirect_wait_ns {0};
 	static void AddGpuIndirectWait(uint64_t ns) noexcept {
 		s_gpu_indirect_wait_ns.fetch_add(ns, std::memory_order_relaxed);
+	}
+	// The part of it spent at the argument-record check in ExecutePreparedDraw (also in the total).
+	inline static std::atomic<uint64_t> s_gpu_indirect_args_wait_ns {0};
+	static void AddGpuIndirectArgsWait(uint64_t ns) noexcept {
+		s_gpu_indirect_wait_ns.fetch_add(ns, std::memory_order_relaxed);
+		s_gpu_indirect_args_wait_ns.fetch_add(ns, std::memory_order_relaxed);
 	}
 
 	static void CountGpuIndirect(GpuIndirect kind, uint64_t count = 1) noexcept {
@@ -98,6 +109,8 @@ struct HostReadProbe {
 			snapshot.gpu_indirect[i] = s_gpu_indirect[i].exchange(0, std::memory_order_relaxed);
 		}
 		snapshot.gpu_indirect_wait_ns = s_gpu_indirect_wait_ns.exchange(0, std::memory_order_relaxed);
+		snapshot.gpu_indirect_args_wait_ns =
+		    s_gpu_indirect_args_wait_ns.exchange(0, std::memory_order_relaxed);
 		return snapshot;
 	}
 	// Reads one dword per 4 KiB page of [vaddr, vaddr + size): a GPU-written range is published (and

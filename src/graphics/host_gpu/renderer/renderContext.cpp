@@ -163,6 +163,7 @@ struct FaultSampler {
 			reads_sum.gpu_indirect[i] += host_reads.gpu_indirect[i];
 		}
 		reads_sum.gpu_indirect_wait_ns += host_reads.gpu_indirect_wait_ns;
+		reads_sum.gpu_indirect_args_wait_ns += host_reads.gpu_indirect_args_wait_ns;
 		syncs_sum.calls += syncs.calls;
 		syncs_sum.regions += syncs.regions;
 		syncs_sum.wait_passes += syncs.wait_passes;
@@ -252,6 +253,7 @@ struct FaultSampler {
 		for (uint32_t i = HostReadProbe::MeshGpuDraws; i < HostReadProbe::GpuIndirectCount; ++i) {
 			line += fmt::format(" {}={}", HostReadProbe::kGpuIndirectNames[i], reads_all.gpu_indirect[i]);
 		}
+		line += fmt::format(" args-wait-ms={}", reads_all.gpu_indirect_args_wait_ns / 1000000);
 		line += fmt::format(" | wait-pass {} (consumed {}, extra-syncs {}, bytes {})", syncs_all.wait_passes,
 		                    syncs_all.wait_consumed, syncs_all.wait_extra, syncs_all.wait_bytes);
 		line += fmt::format(" | host-resident binds {} bytes {} KiB fallbacks {}", resident_all.binds,

@@ -155,6 +155,11 @@ public:
 	void FlushWriteFaults(bool wait);
 	// Before the host reads guest memory that unbounded writes may have touched.
 	void PrepareHostRead(uint64_t vaddr, uint64_t size);
+	// Non-waiting counterpart for a GPU-side consumer (GPU-indirect argument records): when
+	// [vaddr, size) intersects pending unbounded writes, records the write-fault pass without
+	// waiting for it; publishes marks that already completed. Returns true when unpublished
+	// unbounded writes may still cover the range.
+	[[nodiscard]] bool PublishGpuWritesNoWait(uint64_t vaddr, uint64_t size);
 	void MarkPageWritten(uint64_t vaddr);      // any thread (fault-processing operation)
 	void MarkWriteFaultOverflow();             // any thread
 	// Safe point between PM4 packets / at garbage collection: records the pending write-fault

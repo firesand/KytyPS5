@@ -1256,12 +1256,39 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		indirect_args_bytes =
 		    static_cast<uint64_t>(gpu_indirect->draw_count - 1u) * gpu_indirect->stride + record_size;
 		const auto wait_begin = std::chrono::steady_clock::now();
-		// Lazy mode replaces the sticky HasPendingUnboundedWrites() (true until a host wait) with
-		// the tracker's per-command-buffer indirect_write_stages, evaluated at the barrier site.
-		indirect_barrier = cache.HasGpuDirtyBytes(gpu_indirect->args_addr, indirect_args_bytes) ||
-		                   (LazyBarriersKeepOld() && cache.HasPendingUnboundedWrites());
-		if (gpu_indirect->count_addr != 0) {
-			indirect_barrier |= cache.HasGpuDirtyBytes(gpu_indirect->count_addr, sizeof(uint32_t));
+		// Lazy mode 1 decides the barrier from the tracker's indirect_write_stages below and
+		// discards the HasGpuDirtyBytes result, whose PrepareHostRead waits for the write-fault
+		// pass when the range intersects pending unbounded writes. Only ObtainBuffer still needs
+		// the publish: it must not upload CPU-modified bytes over unpublished GPU writes, so the
+		// wait stays exactly when the range has both. KYTY_CP_GPU_INDIRECT_ARGS_WAIT=1 keeps it always.
+		static const bool force_wait = [] {
+			const char* value = std::getenv("KYTY_CP_GPU_INDIRECT_ARGS_WAIT");
+			return value != nullptr && value[0] == '1';
+		}();
+		bool keep_wait = LazyBarrierMode() != 1 || force_wait;
+		if (!keep_wait) {
+			bool pending = cache.PublishGpuWritesNoWait(gpu_indirect->args_addr, indirect_args_bytes);
+			bool cpu_dirty = pending && cache.IsRegionCpuModified(gpu_indirect->args_addr, indirect_args_bytes);
+			if (gpu_indirect->count_addr != 0 &&
+			    cache.PublishGpuWritesNoWait(gpu_indirect->count_addr, sizeof(uint32_t))) {
+				pending   = true;
+				cpu_dirty = cpu_dirty || cache.IsRegionCpuModified(gpu_indirect->count_addr, sizeof(uint32_t));
+			}
+			if (pending) {
+				HostReadProbe::CountGpuIndirect(cpu_dirty ? HostReadProbe::ArgsWaitKept
+				                                          : HostReadProbe::ArgsWaitSkipped);
+			}
+			keep_wait = cpu_dirty;
+		}
+		if (keep_wait) {
+			// Lazy mode replaces the sticky HasPendingUnboundedWrites() (true until a host wait)
+			// with the tracker's per-command-buffer indirect_write_stages, evaluated at the barrier
+			// site.
+			indirect_barrier = cache.HasGpuDirtyBytes(gpu_indirect->args_addr, indirect_args_bytes) ||
+			                   (LazyBarriersKeepOld() && cache.HasPendingUnboundedWrites());
+			if (gpu_indirect->count_addr != 0) {
+				indirect_barrier |= cache.HasGpuDirtyBytes(gpu_indirect->count_addr, sizeof(uint32_t));
+			}
 		}
 		if (LazyBarriersActive()) {
 			// What the pre-tracker code would have decided (sticky flag included), for the counters.
@@ -1269,7 +1296,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				BarrierProbe::NoteOld(BarrierProbe::DrawIndirectArgs);
 			}
 		}
-		HostReadProbe::AddGpuIndirectWait(static_cast<uint64_t>(
+		HostReadProbe::AddGpuIndirectArgsWait(static_cast<uint64_t>(
 		    std::chrono::duration_cast<std::chrono::nanoseconds>(
 		        std::chrono::steady_clock::now() - wait_begin).count()));
 	}
