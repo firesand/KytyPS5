@@ -296,6 +296,11 @@ void WriteWatch::Collect(uint64_t vaddr, uint64_t size, const RunFunc& func) noe
 	if (size == 0) {
 		return;
 	}
+	// PAGEMAP_SCAN rejects an unaligned start (EINVAL), which would report the range as written.
+	const auto first = Common::AlignDown(vaddr, PAGE_SIZE);
+	const auto last  = Common::AlignUp(vaddr + size, PAGE_SIZE);
+	vaddr            = first;
+	size             = last - first;
 	const auto begin = std::chrono::steady_clock::now();
 	g_collects.fetch_add(1, std::memory_order_relaxed);
 	// A label page found written is re-protected by the scan before NoteLabelRuns flags it; checks

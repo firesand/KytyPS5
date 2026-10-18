@@ -1841,6 +1841,28 @@ void TestWriteWatchFirstWatcherDropsOldWrites() {
   UnmapWriteWatchView(view);
 }
 
+// Bindings start anywhere: an unaligned collection range must scan its pages, not fail
+// (PAGEMAP_SCAN rejects an unaligned start, and a failed scan counts as fully written).
+void TestWriteWatchUnalignedCollection() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  constexpr uint64_t page = TRACKER_PAGE_SIZE;
+  auto view = MapWriteWatchView(4);
+  const auto address = view.Address();
+  UploadAll(tracker, address, view.size);
+  (void)WriteWatch::TakeStats();
+  Check(CollectAndApply(tracker, address + page - 4, 12) == 0,
+        "an unaligned collection over clean pages reported writes");
+  view.memory[2 * page + 100] = 1;
+  Check(CollectAndApply(tracker, address + page + 8, page) == 1 &&
+            tracker.IsRegionCpuModified(address + 2 * page, page) &&
+            !tracker.IsRegionCpuModified(address + page, page),
+        "an unaligned collection did not report exactly the written page");
+  Check(WriteWatch::TakeStats().errors == 0, "an unaligned collection made a scan fail");
+  tracker.UntrackMemory(address, view.size);
+  UnmapWriteWatchView(view);
+}
+
 void TestWriteWatchLabels() {
   auto *write_watch = WriteWatch::Get();
   constexpr uint64_t page = TRACKER_PAGE_SIZE;
@@ -1871,6 +1893,7 @@ void RunWriteWatchCases() {
   TestWriteWatchCpuWriteWinsOverGpuMark();
   TestWriteWatchUncoveredMemoryKeepsProtection();
   TestWriteWatchFirstWatcherDropsOldWrites();
+  TestWriteWatchUnalignedCollection();
   TestWriteWatchLabels();
   std::puts("MemoryTrackerTests: write-watch cases passed");
   std::exit(0);

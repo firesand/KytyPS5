@@ -61,9 +61,9 @@ public:
 	[[nodiscard]] bool IsCovered(uint64_t vaddr, uint64_t size) const noexcept;
 
 	// Reports, and re-protects in the kernel, the pages of [vaddr, vaddr + size) written since
-	// their last collection, restricted to registered views: func(run_vaddr, run_size) per run,
-	// called after every internal lock is released. A failed scan reports its whole chunk. Any
-	// thread.
+	// their last collection, restricted to registered views: func(run_vaddr, run_size) per run of
+	// whole pages (the range is widened to page bounds), called after every internal lock is
+	// released. A failed scan reports its whole chunk. Any thread.
 	void Collect(uint64_t vaddr, uint64_t size, const RunFunc& func) noexcept;
 	// Re-protects [vaddr, vaddr + size) and drops what it reports: for pages gaining their first
 	// write watcher, whose earlier writes nobody tracked (PageManager; the protect a fault-based
