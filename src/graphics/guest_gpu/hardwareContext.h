@@ -1055,7 +1055,11 @@ public:
 		m_vs.gs_user_sgpr.type[id]  = type;
 		m_vs.gs_user_sgpr.count =
 		    ((id + 1) > m_vs.gs_user_sgpr.count ? (id + 1) : m_vs.gs_user_sgpr.count);
+		m_gs_user_sgpr_writes[id]++;
 	}
+	// Writes per GS user SGPR so far (SET_SH_REG, indirect SH writes, the host path's indirect
+	// offset patch): GPU-indirect stale-SGPR tracking compares it with the value at the packet.
+	[[nodiscard]] uint32_t GsUserSgprWrites(uint32_t id) const { return m_gs_user_sgpr_writes[id]; }
 
 	[[nodiscard]] const PixelShaderInfo&   GetPs() const { return m_ps; }
 	[[nodiscard]] const VertexShaderInfo&  GetVs() const { return m_vs; }
@@ -1071,6 +1075,7 @@ private:
 	VertexShaderInfo  m_vs;
 	PixelShaderInfo   m_ps;
 	ComputeShaderInfo m_cs;
+	uint32_t          m_gs_user_sgpr_writes[UserSgprInfo::SGPRS_MAX] = {};
 };
 
 } // namespace Libs::Graphics::HW

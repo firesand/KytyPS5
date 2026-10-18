@@ -56,18 +56,21 @@ struct HostReadProbe {
 	// - ArgsWaitSkipped / ArgsWaitKept (lazy mode 1): GPU packets whose argument range intersected
 	//   pending unbounded writes and skipped the waiting publish, or kept it because the range also
 	//   has CPU-modified pages that ObtainBuffer would upload over the unpublished GPU writes;
+	// - StaleInstances: a later draw that took its instance count from m_num_instances while a GPU
+	//   packet had left it at the pre-packet value (the host path stores the last record's count);
 	// - StaleSgpr: a later draw whose shader can read a GS user-data register that a GPU packet left
 	//   at its pre-packet value (the host path would have patched it with the last record's offset).
+	//   "Can read" = the slot is below the bound shader's user SGPR count (an upper bound).
 	enum GpuIndirect : uint32_t { GpuDraws = 0, FallbackIndexOffset, FallbackOther, FallbackMesh, FallbackSrt,
 	                              MeshGpuDraws, FallbackMeshDenied, FallbackMeshCountAddr, FallbackMeshPrim,
 	                              FallbackDenied, MeshClampedRecords, MeshEmptyRecords, ArgsWaitSkipped,
-	                              ArgsWaitKept, StaleSgpr, GpuIndirectCount };
+	                              ArgsWaitKept, StaleInstances, StaleSgpr, GpuIndirectCount };
 	// Short names, one per enumerator in order; the size is deduced, so adding an enumerator without
 	// a name (or the reverse) fails to compile.
 	static constexpr auto kGpuIndirectNames = std::to_array<const char*>(
 	    {"gpu", "index_offset", "other", "mesh", "srt", "mesh-gpu", "mesh-denied", "mesh-count-addr",
 	     "mesh-prim", "denied", "mesh-clamped", "mesh-empty", "args-wait-skipped", "args-wait-kept",
-	     "stale-sgpr"});
+	     "stale-instances", "stale-sgpr"});
 	static_assert(kGpuIndirectNames.size() == GpuIndirectCount, "GpuIndirect enum / name table mismatch");
 	struct Snapshot {
 		std::array<std::pair<uint64_t, uint64_t>, SiteCount> sites {}; // calls, nanoseconds

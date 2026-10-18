@@ -242,6 +242,9 @@ void CommandProcessor::Reset() {
 	m_index_buffer_size                = 0;
 	m_index_base_addr                  = 0;
 	m_num_instances                    = 1;
+	m_sgpr_poison                      = {};
+	m_any_sgpr_poison                  = false;
+	m_num_instances_stale              = false;
 	m_predicate_skip                   = false;
 	m_user_data_marker                 = HW::UserSgprType::Unknown;
 	m_draw_indirect_args_base_addr     = 0;
@@ -1061,7 +1064,8 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 		num_instances = 1;
 	}
 
-	m_num_instances = num_instances;
+	m_num_instances       = num_instances;
+	m_num_instances_stale = false;
 }
 
 void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t wait_op,
@@ -1125,10 +1129,92 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 	}
 }
 
+// KYTY_CP_GPU_INDIRECT=1: indirect draws read their argument records on the GPU
+// (vkCmdDraw[Indexed]Indirect[Count]) instead of through host reads that wait for the producing
+// dispatch. Default off.
+static bool GpuIndirectEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_CP_GPU_INDIRECT");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+void CommandProcessor::PoisonGpuIndirectSlots(const ShaderDrawParameters& parameters,
+                                              uint64_t last_record_addr, bool indexed) {
+	const auto poison = [&](uint32_t slot, uint32_t field) {
+		if (slot == ShaderDrawParameters::kNoSlot || slot >= m_sgpr_poison.size()) {
+			return;
+		}
+		m_sgpr_poison[slot] = {.active      = true,
+		                       .writes      = m_sh_ctx.GsUserSgprWrites(slot),
+		                       .record_addr = last_record_addr,
+		                       .field       = field};
+		m_any_sgpr_poison   = true;
+	};
+	// DrawIndirectArgs: start vertex = dword 2, start instance = dword 3; DrawIndexedIndirectArgs:
+	// base vertex = dword 3, start instance = dword 4.
+	poison(parameters.base_vertex_slot, indexed ? 3u : 2u);
+	poison(parameters.base_instance_slot, indexed ? 4u : 3u);
+	m_num_instances_stale = true;
+}
+
+// Counts draws that read state a GPU packet left unpatched. `instances_from_state`: the draw took
+// its instance count from m_num_instances. Slots the current GPU packet names are served by it.
+void CommandProcessor::CountStaleDrawState(bool instances_from_state,
+                                           const GpuIndirectDraw* gpu_indirect) {
+	if (instances_from_state && m_num_instances_stale) {
+		HostReadProbe::CountGpuIndirect(HostReadProbe::StaleInstances);
+	}
+	if (!m_any_sgpr_poison) {
+		return;
+	}
+	const auto user_sgprs = static_cast<uint32_t>(m_sh_ctx.GetVs().gs_regs.rsrc2.user_sgpr);
+	bool       any        = false;
+	bool       stale      = false;
+	uint32_t   stale_slot = 0;
+	for (uint32_t slot = 0; slot < m_sgpr_poison.size(); ++slot) {
+		auto& poison = m_sgpr_poison[slot];
+		if (!poison.active) {
+			continue;
+		}
+		if (poison.writes != m_sh_ctx.GsUserSgprWrites(slot)) {
+			poison.active = false; // rewritten since the packet
+			continue;
+		}
+		any = true;
+		if (slot >= user_sgprs || (gpu_indirect != nullptr &&
+		                           (slot == gpu_indirect->parameters.base_vertex_slot ||
+		                            slot == gpu_indirect->parameters.base_instance_slot))) {
+			continue;
+		}
+		if (!stale) {
+			stale      = true;
+			stale_slot = slot;
+		}
+	}
+	m_any_sgpr_poison = any;
+	if (!stale) {
+		return;
+	}
+	HostReadProbe::CountGpuIndirect(HostReadProbe::StaleSgpr);
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+		const auto& poison = m_sgpr_poison[stale_slot];
+		LOGF("GpuIndirect(stale-sgpr): draw reads GS slot %u (user_sgprs=%u) left unpatched by a GPU"
+		     " packet; host path value = dword %u of record 0x%016" PRIx64 "\n",
+		     stale_slot, user_sgprs, poison.field, poison.record_addr);
+	}
+}
+
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	args.index_type_and_size = m_index_type_and_size;
+	const bool instances_from_state = args.instance_count == 0;
 	if (args.instance_count == 0) {
 		args.instance_count = m_num_instances;
+	}
+	if (GpuIndirectEnabled()) {
+		CountStaleDrawState(instances_from_state, args.gpu_indirect);
 	}
 	if (GraphicsRunDebugDumpEnabled() && (args.base_vertex != 0 || args.first_instance != 0)) {
 		LOGF("\t draw indexed offsets: base_vertex = %" PRId32 ", first_instance = %" PRIu32 "\n",
@@ -1172,17 +1258,6 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, IndirectDrawRegisters 
                                     uint32_t draw_initiator, bool indexed) {
 	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
 	DrawIndirectMulti(data_offset, 1, nullptr, args_size, registers, draw_initiator, indexed);
-}
-
-// KYTY_CP_GPU_INDIRECT=1: indirect draws read their argument records on the GPU
-// (vkCmdDraw[Indexed]Indirect[Count]) instead of through host reads that wait for the producing
-// dispatch. Default off.
-static bool GpuIndirectEnabled() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_CP_GPU_INDIRECT");
-		return value != nullptr && value[0] == '1';
-	}();
-	return enabled;
 }
 
 // Logs the first 32 distinct mesh-packet tuples with the decision (KYTY_CP_GPU_INDIRECT only).
@@ -1329,6 +1404,9 @@ bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_c
 	if (shader.mesh) {
 		HostReadProbe::CountGpuIndirect(HostReadProbe::MeshGpuDraws);
 	}
+	PoisonGpuIndirectSlots(parameters,
+	                       draw.args_addr + static_cast<uint64_t>(max_count_or_count - 1u) * stride_in_bytes,
+	                       indexed);
 	return true;
 }
 
@@ -1396,7 +1474,8 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 			if (args->vertex_count_per_instance == 0 || args->instance_count == 0) {
 				continue;
 			}
-			m_num_instances = args->instance_count;
+			m_num_instances       = args->instance_count;
+			m_num_instances_stale = false;
 			DrawIndexAuto({.vertex_count   = args->vertex_count_per_instance,
 			               .instance_count = args->instance_count,
 			               .first_vertex   = args->start_vertex_location,
@@ -1428,7 +1507,8 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		auto* index_addr = reinterpret_cast<const void*>(
 		    m_index_base_addr + static_cast<uint64_t>(args->start_index_location) * index_size);
 
-		m_num_instances = args->instance_count;
+		m_num_instances       = args->instance_count;
+		m_num_instances_stale = false;
 		DrawIndex({.index_count    = index_count,
 		           .index_addr     = index_addr,
 		           .instance_count = args->instance_count,
@@ -1491,8 +1571,12 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 }
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
+	const bool instances_from_state = args.instance_count == 0;
 	if (args.instance_count == 0) {
 		args.instance_count = m_num_instances;
+	}
+	if (GpuIndirectEnabled()) {
+		CountStaleDrawState(instances_from_state, args.gpu_indirect);
 	}
 	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
 }
