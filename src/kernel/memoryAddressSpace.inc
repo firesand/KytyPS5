@@ -247,17 +247,22 @@ public:
 			return false;
 		}
 
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+		if (g_test_backing_read == nullptr)
+#endif
+		{
+			if (const void* ptr = TryGetBackingPointer(vaddr, size)) {
+				std::memcpy(data, ptr, size);
+				return true;
+			}
+		}
+
 		std::shared_lock lock(m_mutex);
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 		if (g_test_backing_read != nullptr) {
 			g_test_backing_read(vaddr, size);
 		}
 #endif
-
-		if (const void* ptr = TryGetBackingPointer(vaddr, size)) {
-			std::memcpy(data, ptr, size);
-			return true;
-		}
 		const auto end   = vaddr + size;
 		auto       first = m_maps.upper_bound(vaddr);
 		if (first == m_maps.begin()) {
