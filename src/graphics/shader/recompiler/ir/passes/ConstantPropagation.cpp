@@ -18,6 +18,13 @@ bool IsImmediate(Value value, Type type) {
 	return value.IsImmediate() && value.GetType() == type;
 }
 
+bool HasOneUse(const Inst& inst) {
+	// Replacement aliases preserve external Values but emit no additional operation.
+	return std::ranges::count_if(inst.Uses(), [](const Use& use) {
+		return use.user->GetOpcode() != ValueOpcode::Identity;
+	}) == 1;
+}
+
 void Replace(Inst& inst, Value value) {
 	inst.ReplaceUsesWith(value.Resolve());
 }
@@ -510,8 +517,31 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			});
 			return;
 		case ValueOpcode::BitwiseAnd32:
-			if (!FoldU32(inst, [](uint32_t a, uint32_t b) { return a & b; })) {
-				ReplaceBinaryIdentity(inst, Type::U32, 0xffffffffu);
+			if (FoldU32(inst, [](uint32_t a, uint32_t b) { return a & b; }) ||
+			    ReplaceBinaryIdentity(inst, Type::U32, UINT32_MAX)) return;
+			for (uint32_t arm = 0; arm < 2u; ++arm) {
+				const auto mask = Arg(inst, arm);
+				if (!IsImmediate(mask, Type::U32)) continue;
+				if (mask.U32() == 0u) {
+					Replace(inst, Value(0u));
+					return;
+				}
+				const auto* shifted = Arg(inst, arm ^ 1u).TryInstruction();
+				if (shifted == nullptr || shifted->GetOpcode() != ValueOpcode::ShiftLeftLogical32) continue;
+				const auto shift = Arg(*shifted, 1);
+				if (!IsImmediate(shift, Type::U32)) continue;
+				const auto shifted_mask = mask.U32() >> (shift.U32() & 31u);
+				if (shifted_mask == 0u) {
+					Replace(inst, Value(0u));
+					return;
+				}
+				if (!HasOneUse(*shifted) || shift.U32() >= 32u) continue;
+				const auto masked = block.PrependNewInst(
+				    instruction, ValueOpcode::BitwiseAnd32, {Arg(*shifted, 0), Value(shifted_mask)});
+				const auto result = block.PrependNewInst(
+				    instruction, ValueOpcode::ShiftLeftLogical32, {Value(&*masked), shift});
+				Replace(inst, Value(&*result));
+				return;
 			}
 			return;
 		case ValueOpcode::BitwiseAnd64:

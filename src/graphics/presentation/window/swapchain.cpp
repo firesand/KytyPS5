@@ -1081,7 +1081,6 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	KYTY_PROFILER_FUNCTION();
 	auto              format = m_impl->frames.GetFormat();
 	auto*             frame  = m_impl->frames.Acquire({width, height}, format);
-	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
 	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format);
 	vk::ClearColorValue clear {};
 	clear.float32[3] = opaque ? 1.0f : 0.0f;
@@ -1089,6 +1088,7 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 		EXIT_IF(producer->IsInvalid());
 		frame->Clear(*producer, clear);
 	} else {
+		Common::LockGuard lock(m_impl->present_mutex);
 		auto& command = m_impl->present_scheduler.BeginCommand();
 		frame->Clear(command, clear);
 		frame->present_tick = m_impl->present_scheduler.Submit();
@@ -1164,18 +1164,17 @@ void Presenter::Impl::Present() {
 			RecoverSwapchain(status);
 			continue;
 		}
-		{
-			Common::LockGuard render_lock(renderer.GetMutex());
-			auto&             command = present_scheduler.BeginCommand();
-			const bool        draw_system_overlay =
-			    overlay_visual.active && swapchain.PrepareSystemOverlay();
-			swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
-			                                draw_system_overlay);
-			const auto tick = swapchain.Submit(present_scheduler);
-			for (const auto& layer: layers) {
-				if (layer.frame != nullptr) {
-					layer.frame->present_tick = tick;
-				}
+		// present_mutex owns the prepared frames and this scheduler. Only queue submission
+		// is shared with rendering, and it has its own queue_mutex.
+		auto&      command = present_scheduler.BeginCommand();
+		const bool draw_system_overlay =
+		    overlay_visual.active && swapchain.PrepareSystemOverlay();
+		swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
+		                                draw_system_overlay);
+		const auto tick = swapchain.Submit(present_scheduler);
+		for (const auto& layer: layers) {
+			if (layer.frame != nullptr) {
+				layer.frame->present_tick = tick;
 			}
 		}
 		status = swapchain.Present();

@@ -287,10 +287,11 @@ uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint3
 	});
 }
 
-uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
+uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
+                     uint32_t prefix = 0) {
 	if (mem.kind == IR::ResourceKind::Buffer) {
 		const auto resource = ctx.state.program.info.buffers.at(mem.resource).descriptor_index;
-		const auto prefix = ctx.state.memory_byte_offsets[resource];
+		if (prefix == 0u) prefix = ctx.state.memory_byte_offsets[resource];
 		const auto address = Binary(ctx.state, spv::OpIAdd, TypeU32(ctx.state),
 		                            BufferByteAddress(ctx, inst, mem), prefix);
 		// The host binding prefix must not wrap an out-of-range guest address into the buffer.
@@ -311,8 +312,9 @@ uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memo
 	return ScratchByteAddress(ctx, mem, ctx.Arg(inst, 1), ctx.Arg(inst, 2));
 }
 
-uint32_t DwordIndex(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
-	auto address = ByteAddress(ctx, inst, mem);
+uint32_t DwordIndex(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
+                    uint32_t prefix = 0) {
+	auto address = ByteAddress(ctx, inst, mem, prefix);
 	if (mem.kind == IR::ResourceKind::Lds || mem.kind == IR::ResourceKind::Gds) {
 		// RDNA2 DS region addresses retain bits [15:2] after adding the byte offset.
 		address = Binary(ctx.state, spv::OpBitwiseAnd, TypeU32(ctx.state), address,
@@ -330,7 +332,7 @@ uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& 
 
 uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource) {
-	const auto index = DwordIndex(ctx, inst, mem);
+	const auto index = DwordIndex(ctx, inst, mem, resource.byte_offset);
 	return EmitValueOrZeroIfCondition(
 	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index),
 	    [&]() { return LoadWordInBounds(ctx, resource, index); });
@@ -346,7 +348,7 @@ uint32_t LoadWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo me
 uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                              const MemoryResourceAccess& resource, uint32_t bits,
                              bool sign_extend) {
-	const auto address = ByteAddress(ctx, inst, mem);
+	const auto address = ByteAddress(ctx, inst, mem, resource.byte_offset);
 	const auto index = Binary(
 	    ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state), address,
 	    ConstantU32(ctx.state, std::countr_zero(resource.element_bits / 8u)));
@@ -508,7 +510,7 @@ void StoreSubwordInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
 
 void StoreSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource, uint32_t bits, uint32_t data) {
-	const auto address = ByteAddress(ctx, inst, mem);
+	const auto address = ByteAddress(ctx, inst, mem, resource.byte_offset);
 	const auto index = Binary(
 	    ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state), address,
 	    ConstantU32(ctx.state, std::countr_zero(resource.element_bits / 8u)));
@@ -579,7 +581,7 @@ void StoreLocalFlat(ValueEmitContext& ctx, const IR::Inst& inst) {
 
 void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                        const MemoryResourceAccess& resource, uint32_t data) {
-	const auto index = DwordIndex(ctx, inst, mem);
+	const auto index = DwordIndex(ctx, inst, mem, resource.byte_offset);
 	EmitIfCondition(ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
 		StoreWordInBounds(ctx, resource, index, data);
 	});
@@ -616,22 +618,8 @@ void StoreWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) 
 		const auto selected = EmitIndirectResourceIndex(
 		    state, ctx.Arg(*handle, 0), buffer.indirect_mapping_offset,
 		    buffer.indirect_search_iterations, UINT32_MAX);
-		const auto merge = state.builder.AllocateId();
-		std::vector<uint32_t> labels(buffer.indirect_resources.size());
-		std::vector<uint32_t> branches {spv::OpSwitch, selected, merge};
-		for (uint32_t i = 0; i < labels.size(); ++i) {
-			labels[i] = state.builder.AllocateId();
-			branches.push_back(i);
-			branches.push_back(labels[i]);
-		}
-		state.builder.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
-		state.builder.AddFunction(branches);
-		for (uint32_t i = 0; i < labels.size(); ++i) {
-			EmitLabel(state, labels[i]);
-			store(buffer.indirect_resources[i]);
-			state.builder.AddFunction(spv::OpBranch, merge);
-		}
-		EmitLabel(state, merge);
+		EmitIndexSwitch(state, selected, buffer.indirect_resources.size(), 0u,
+		                [&](uint32_t item) { store(buffer.indirect_resources[item]); });
 	});
 }
 
@@ -690,7 +678,7 @@ PreparedFormattedMemory PrepareFormattedMemory(ValueEmitContext& ctx, const IR::
 	PreparedFormattedMemory plan;
 	plan.info      = info;
 	plan.resource  = resource;
-	const auto start = ByteAddress(ctx, inst, mem);
+	const auto start = ByteAddress(ctx, inst, mem, resource.byte_offset);
 	// Check the whole, unaligned format span before aligning the actual memory address.
 	const auto end = Binary(ctx.state, spv::OpIAdd, TypeU32(ctx.state), start,
 	                        ConstantU32(ctx.state, info.byte_size - 1u));
