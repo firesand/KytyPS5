@@ -4032,8 +4032,17 @@ int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchAddress(uint32_t*             cmd,
 		cmd[2] = static_cast<uint32_t>(vaddr & 0xffffffffu);
 		cmd[3] = (cmd[3] & 0xffff0000u) | static_cast<uint32_t>((vaddr >> 32u) & 0xffffu);
 	} else {
-		EXIT("unsupported queueEndOfPipeAction packet for address patch: 0x%08" PRIx32 "\n",
-		     cmd[0]);
+		// Like AgcQueueEndOfPipeActionPatchData: an unrecognised packet is an error code, not an emulator exit.
+		// Zero Company hit this once in 13 runs at t=35 s with cmd[0] == 0 (ng-136): the header was not written
+		// (yet), so there is nothing to patch. Logged with the neighbouring dwords to find out which case it is.
+		static std::atomic_uint32_t logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("AgcQueueEndOfPipeActionPatchAddress: unsupported packet 0x%08" PRIx32 " at 0x%016" PRIx64
+			     " (next %08" PRIx32 " %08" PRIx32 " %08" PRIx32 " %08" PRIx32 "), address 0x%016" PRIx64
+			     ": INVALID_PACKET\n",
+			     cmd[0], reinterpret_cast<uint64_t>(cmd), cmd[1], cmd[2], cmd[3], cmd[4], vaddr);
+		}
+		return GRAPHICS5_ERROR_INVALID_PACKET;
 	}
 
 	return OK;
