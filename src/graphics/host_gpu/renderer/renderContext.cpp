@@ -247,6 +247,11 @@ struct FaultSampler {
 		                    reads_all.gpu_indirect[HostReadProbe::FallbackMesh],
 		                    reads_all.gpu_indirect[HostReadProbe::FallbackSrt],
 		                    reads_all.gpu_indirect_wait_ns / 1000000);
+		// Stage 2 reasons, appended so the fields above keep their positions.
+		line += " | gpu-indirect2";
+		for (uint32_t i = HostReadProbe::MeshGpuDraws; i < HostReadProbe::GpuIndirectCount; ++i) {
+			line += fmt::format(" {}={}", HostReadProbe::kGpuIndirectNames[i], reads_all.gpu_indirect[i]);
+		}
 		line += fmt::format(" | wait-pass {} (consumed {}, extra-syncs {}, bytes {})", syncs_all.wait_passes,
 		                    syncs_all.wait_consumed, syncs_all.wait_extra, syncs_all.wait_bytes);
 		line += fmt::format(" | host-resident binds {} bytes {} KiB fallbacks {}", resident_all.binds,

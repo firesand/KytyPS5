@@ -43,7 +43,25 @@ struct HostReadProbe {
 	// KYTY_CP_GPU_INDIRECT accounting: draws issued with GPU-side arguments, and the indirect draws
 	// that stayed on the host path (first-index SGPR named, or any other reason; "mesh" is the
 	// subset of "other" caused by NGG/mesh vertex shaders).
-	enum GpuIndirect : uint32_t { GpuDraws = 0, FallbackIndexOffset, FallbackOther, FallbackMesh, FallbackSrt, GpuIndirectCount };
+	// Stage 2 (mesh through the pass-through task shader). FallbackMesh stays the total of mesh
+	// packets kept on the host path for a mesh reason; one reason counter each:
+	// - MeshGpuDraws: the subset of GpuDraws recorded with drawMeshTasksEXT through the task shader;
+	// - FallbackMeshDenied: the mesh hash is not in KYTY_CP_GPU_INDIRECT_MESH_HASH (unset = none) or
+	//   is in KYTY_CP_GPU_INDIRECT_DENY_HASH;
+	// - FallbackMeshCountAddr: the packet names a count dword (the task shader ignores it);
+	// - FallbackMeshPrim: the input primitive type is not supported by the task shader;
+	// - FallbackDenied: a vertex-stage hash in KYTY_CP_GPU_INDIRECT_DENY_HASH (counted in "other" too);
+	// - StaleSgpr: a later draw whose shader can read a GS user-data register that a GPU packet left
+	//   at its pre-packet value (the host path would have patched it with the last record's offset).
+	enum GpuIndirect : uint32_t { GpuDraws = 0, FallbackIndexOffset, FallbackOther, FallbackMesh, FallbackSrt,
+	                              MeshGpuDraws, FallbackMeshDenied, FallbackMeshCountAddr, FallbackMeshPrim,
+	                              FallbackDenied, StaleSgpr, GpuIndirectCount };
+	// Short names, one per enumerator in order; the size is deduced, so adding an enumerator without
+	// a name (or the reverse) fails to compile.
+	static constexpr auto kGpuIndirectNames = std::to_array<const char*>(
+	    {"gpu", "index_offset", "other", "mesh", "srt", "mesh-gpu", "mesh-denied", "mesh-count-addr",
+	     "mesh-prim", "denied", "stale-sgpr"});
+	static_assert(kGpuIndirectNames.size() == GpuIndirectCount, "GpuIndirect enum / name table mismatch");
 	struct Snapshot {
 		std::array<std::pair<uint64_t, uint64_t>, SiteCount> sites {}; // calls, nanoseconds
 		std::array<uint64_t, GpuIndirectCount>               gpu_indirect {};

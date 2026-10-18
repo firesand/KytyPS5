@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/gpuIndirectFilter.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -44277,6 +44278,58 @@ void CheckIndirectMeshDraws() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// FPS Stage 2 (reviews/stage2-gpu-indirect-spec-2026-10-18.md): GPU-side indirect mesh draws
+// through the pass-through task shader. Selector --mesh-task-indirect-only.
+static void CheckGpuIndirectReasonNames() {
+  const char *name = "GpuIndirectReasons";
+  using Probe = Libs::Graphics::HostReadProbe;
+  for (uint32_t i = 0; i < Probe::GpuIndirectCount; ++i) {
+    Require(name, "name present",
+            Probe::kGpuIndirectNames[i] != nullptr && Probe::kGpuIndirectNames[i][0] != 0,
+            "a GpuIndirect reason has no name");
+    for (uint32_t j = 0; j < i; ++j) {
+      Require(name, "names distinct",
+              std::strcmp(Probe::kGpuIndirectNames[i], Probe::kGpuIndirectNames[j]) != 0,
+              "two GpuIndirect reasons share a name");
+    }
+  }
+  // The FaultHistogram line prints the Stage 2 reasons from MeshGpuDraws to the end.
+  Require(name, "stage 2 block order",
+          Probe::FallbackSrt + 1 == Probe::MeshGpuDraws &&
+              Probe::StaleSgpr + 1 == Probe::GpuIndirectCount,
+          "the Stage 2 reasons are no longer one block at the end of the enum");
+  std::printf("[host]    %-32s ok (%u)\n", name, static_cast<uint32_t>(Probe::GpuIndirectCount));
+}
+
+static void CheckGpuIndirectHashFilter() {
+  const char *name = "GpuIndirectHashFilter";
+  using Filter = Libs::Graphics::GpuIndirectHashFilter;
+  const auto none = Filter::Parse(nullptr);
+  Require(name, "unset admits none", !none.all && none.hashes.empty() && !none.Contains(0) &&
+                                         !none.Contains(0x67e610ccc37800edull),
+          "an unset list admitted a hash");
+  const auto empty = Filter::Parse("");
+  Require(name, "empty admits none", !empty.Contains(0x1234),
+          "an empty list admitted a hash");
+  const auto all = Filter::Parse("*");
+  Require(name, "star admits all", all.Contains(0) && all.Contains(~0ull),
+          "'*' did not admit every hash");
+  const auto list = Filter::Parse("0x67e610ccc37800ed, ABCDEF;12 zz,0x,123456789abcdef01");
+  Require(name, "list members",
+          list.Contains(0x67e610ccc37800edull) && list.Contains(0xabcdefull) && list.Contains(0x12) &&
+              !list.all,
+          "a listed hash was not admitted");
+  Require(name, "malformed entries ignored",
+          list.hashes.size() == 3 && !list.Contains(0) && !list.Contains(0x123456789abcdef0ull),
+          "a malformed entry was parsed");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+void CheckMeshTaskIndirect() {
+  CheckGpuIndirectReasonNames();
+  CheckGpuIndirectHashFilter();
+}
+
 void CheckDepthTargetFootprints() {
   TileSizeAlign stencil{};
   TileSizeAlign htile{};
@@ -47132,6 +47185,10 @@ int main(int argc, char **argv) {
     CheckIndirectMeshDraws();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--mesh-task-indirect-only") == 0) {
+    CheckMeshTaskIndirect();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--depth-feedback-only") == 0) {
     CheckDepthAttachmentWrites();
     CheckDepthFeedbackAspects();
@@ -47450,6 +47507,7 @@ int main(int argc, char **argv) {
   CheckPm4CeCompletion(vulkan.RuntimeRenderer());
   CheckEmbeddedFetchVertexOffset();
   CheckIndirectMeshDraws();
+  CheckMeshTaskIndirect();
   CheckEmbeddedFetchLaneSpill();
   CheckTessellationPrograms();
   CheckPixelParameterAliases();

@@ -193,11 +193,22 @@ public:
 	// tessellation shaders, quad lists, 8-bit indices, custom primitive-restart values).
 	// `parameters` names the user-data slots the packet patches; a vertex shader whose resource plan
 	// evaluates one of them on the host (or one not compiled yet) keeps the host path (Srt).
-	enum class GpuIndirectBlock { None, Mesh, Srt, Other };
+	// MeshDenied / Denied: the bisection hash lists (gpuIndirectFilter.h) keep the program on the
+	// host path. `shader` (optional) receives the bound vertex-stage facts for the caller's log.
+	enum class GpuIndirectBlock { None, Mesh, MeshDenied, Denied, Srt, Other };
+	struct GpuIndirectShaderInfo {
+		bool     known       = false; // a valid vertex-stage shader is bound
+		bool     mesh        = false;
+		uint64_t hash        = 0;     // VertexShaderIsMesh's hash (ES / front half)
+		uint32_t fast_launch = 0;
+		uint32_t primitive   = 0;
+		uint32_t ge_primitive_group_size = 0;
+	};
 	[[nodiscard]] bool CanDrawIndirectOnGpu(CommandBuffer& buffer, bool indexed,
 	                                        uint32_t index_type_and_size, uint32_t draw_count,
 	                                        const ShaderDrawParameters& parameters,
-	                                        GpuIndirectBlock* block = nullptr);
+	                                        GpuIndirectBlock* block = nullptr,
+	                                        GpuIndirectShaderInfo* shader = nullptr);
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	void                           FindBuffers(std::span<PreparedBindings* const> stages);

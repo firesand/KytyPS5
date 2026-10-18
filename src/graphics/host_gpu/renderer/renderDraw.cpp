@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/gpuIndirectFilter.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -1662,7 +1663,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 bool RenderExecutor::CanDrawIndirectOnGpu(CommandBuffer& buffer, bool indexed,
                                           uint32_t index_type_and_size, uint32_t draw_count,
                                           const ShaderDrawParameters& parameters,
-                                          GpuIndirectBlock* block) {
+                                          GpuIndirectBlock* block, GpuIndirectShaderInfo* shader) {
 	if (block != nullptr) {
 		*block = GpuIndirectBlock::Other;
 	}
@@ -1688,8 +1689,25 @@ bool RenderExecutor::CanDrawIndirectOnGpu(CommandBuffer& buffer, bool indexed,
 	}
 	uint64_t shader_hash = 0;
 	const bool is_mesh = VertexShaderIsMesh(sh_ctx.GetVs(), buffer.GetRegisters(), &shader_hash);
+	const auto fast_launch = (buffer.GetRegisters().GetShaderStages() >> 19u) & 3u;
+	if (shader != nullptr) {
+		shader->known                   = true;
+		shader->mesh                    = is_mesh;
+		shader->hash                    = shader_hash;
+		shader->fast_launch             = fast_launch;
+		shader->primitive               = static_cast<uint32_t>(primitive);
+		shader->ge_primitive_group_size = static_cast<uint32_t>(ucfg.GetGeControl().primitive_group_size);
+	}
+	// Bisection lists (KYTY_CP_GPU_INDIRECT_DENY_HASH / _MESH_HASH): mesh programs need an explicit
+	// allowlist entry, so the mesh path stays off unless the variable names them.
+	if (GpuIndirectHashFilter::Deny().Contains(shader_hash) ||
+	    (is_mesh && !GpuIndirectHashFilter::MeshAllow().Contains(shader_hash))) {
+		if (block != nullptr) {
+			*block = is_mesh ? GpuIndirectBlock::MeshDenied : GpuIndirectBlock::Denied;
+		}
+		return false;
+	}
 	if (is_mesh) {
-		const auto fast_launch = (buffer.GetRegisters().GetShaderStages() >> 19u) & 3u;
 		if (!graphics.task_shader_enabled || indexed || fast_launch == 0) {
 			if (block != nullptr) {
 				*block = GpuIndirectBlock::Mesh;

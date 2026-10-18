@@ -32,6 +32,7 @@
 #include <memory>
 #include <mutex>
 #include <semaphore>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -1184,6 +1185,38 @@ static bool GpuIndirectEnabled() {
 	return enabled;
 }
 
+// Logs the first 32 distinct mesh-packet tuples with the decision (KYTY_CP_GPU_INDIRECT only).
+// Registers are printed as GS user-data slots (-1: not named, r<n>: not a GS user-data register).
+static void LogMeshTuple(const RenderExecutor::GpuIndirectShaderInfo& shader, bool indexed,
+                         uint32_t stride, uint32_t max_count, bool has_count_addr,
+                         IndirectDrawRegisters registers, uint32_t decision_id, const char* decision) {
+	using Tuple = std::array<uint64_t, 9>;
+	static std::mutex         mutex;
+	static std::vector<Tuple> seen;
+	const Tuple tuple {shader.hash, shader.fast_launch, shader.primitive, shader.ge_primitive_group_size,
+	                   (indexed ? 1u : 0u) | (has_count_addr ? 2u : 0u), stride,
+	                   registers.vertex_offset, registers.instance_offset, decision_id};
+	std::lock_guard lock(mutex);
+	if (seen.size() >= 32 || std::find(seen.begin(), seen.end(), tuple) != seen.end()) {
+		return;
+	}
+	seen.push_back(tuple);
+	const auto slot = [](uint32_t location) {
+		if (location == Pm4::SH_NOP) {
+			return std::string("-1");
+		}
+		if (location >= Pm4::SPI_SHADER_USER_DATA_GS_0 && location <= Pm4::SPI_SHADER_USER_DATA_GS_31) {
+			return std::to_string(location - Pm4::SPI_SHADER_USER_DATA_GS_0);
+		}
+		return "r" + std::to_string(location);
+	};
+	LOGF("GpuIndirect(mesh-tuple): ms=0x%016" PRIx64 " fl=%u prim=%u ge_ppg=%u indexed=%d stride=%u"
+	     " max_count=%u count_addr=%d vertex_offset_slot=%s instance_offset_slot=%s -> %s\n",
+	     shader.hash, shader.fast_launch, shader.primitive, shader.ge_primitive_group_size,
+	     indexed ? 1 : 0, stride, max_count, has_count_addr ? 1 : 0,
+	     slot(registers.vertex_offset).c_str(), slot(registers.instance_offset).c_str(), decision);
+}
+
 // Returns true when the draw was recorded with GPU-resident arguments. False keeps the host path
 // (and has counted why).
 bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_count_or_count,
@@ -1228,16 +1261,37 @@ bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_c
 	}
 
 	auto& executor = m_renderer.GetRenderExecutor();
-	RenderExecutor::GpuIndirectBlock block = RenderExecutor::GpuIndirectBlock::Other;
-	if (!executor.CanDrawIndirectOnGpu(CurrentBuffer(), indexed, m_index_type_and_size,
-	                                   max_count_or_count, parameters, &block)) {
-		if (block == RenderExecutor::GpuIndirectBlock::Srt) {
-			// The vertex shader's resource plan reads an offset SGPR (or is not compiled yet).
-			HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackSrt);
-			return false;
+	using Block = RenderExecutor::GpuIndirectBlock;
+	Block                                   block = Block::Other;
+	RenderExecutor::GpuIndirectShaderInfo shader;
+	const bool eligible = executor.CanDrawIndirectOnGpu(CurrentBuffer(), indexed, m_index_type_and_size,
+	                                                    max_count_or_count, parameters, &block, &shader);
+	if (shader.known && shader.mesh) {
+		const char* decision = "gpu";
+		switch (block) {
+			case Block::None: break;
+			case Block::Mesh: decision = "fallback(mesh)"; break;
+			case Block::MeshDenied: decision = "fallback(mesh-denied)"; break;
+			case Block::Denied: decision = "fallback(denied)"; break;
+			case Block::Srt: decision = "fallback(srt)"; break;
+			case Block::Other: decision = "fallback(other)"; break;
 		}
-		if (block == RenderExecutor::GpuIndirectBlock::Mesh) {
-			HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackMesh);
+		LogMeshTuple(shader, indexed, stride_in_bytes, max_count_or_count, count_addr != nullptr,
+		             registers, static_cast<uint32_t>(block), decision);
+	}
+	if (!eligible) {
+		switch (block) {
+			case Block::Srt:
+				// The vertex shader's resource plan reads an offset SGPR (or is not compiled yet).
+				HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackSrt);
+				return false;
+			case Block::Mesh: HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackMesh); break;
+			case Block::MeshDenied:
+				HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackMesh);
+				HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackMeshDenied);
+				break;
+			case Block::Denied: HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackDenied); break;
+			default: break;
 		}
 		return fallback();
 	}
@@ -1265,6 +1319,9 @@ bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_c
 		               .gpu_indirect   = &draw});
 	}
 	HostReadProbe::CountGpuIndirect(HostReadProbe::GpuDraws);
+	if (shader.mesh) {
+		HostReadProbe::CountGpuIndirect(HostReadProbe::MeshGpuDraws);
+	}
 	return true;
 }
 
