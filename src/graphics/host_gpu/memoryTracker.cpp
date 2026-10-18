@@ -64,12 +64,14 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	                                               &m_bda_pending_count, &m_hot_region_count);
 	auto* ptr     = manager.get();
 	ptr->MarkBdaSyncPending(); // constructed fully CPU-dirty
+	NoteCpuWriteFault();
 	m_region_storage.push_back(std::move(manager));
 	m_regions[index].store(ptr, std::memory_order_release);
 	return ptr;
 }
 
 void MemoryTracker::MarkBdaSyncPending(uint64_t vaddr, uint64_t size) {
+	NoteCpuWriteFault();
 	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t, uint64_t) {
 		manager->MarkBdaSyncPending();
 	});
@@ -122,6 +124,7 @@ void MemoryTracker::InvalidatePageHashes(uint64_t vaddr, uint64_t size) {
 
 void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
+	NoteCpuWriteFault();
 	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
 		// New backing for this range (buffer creation): no hot-page hash describes it.
@@ -162,6 +165,7 @@ void MemoryTracker::UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 
 void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
+	NoteCpuWriteFault();
 	std::vector<RegionManager*> managers;
 	managers.reserve((vaddr % TRACKER_REGION_SIZE + size + TRACKER_REGION_SIZE - 1) /
 	                 TRACKER_REGION_SIZE);

@@ -1310,7 +1310,7 @@ void TextureCache::InitializeImage(ImageId id) {
 			static uint64_t over_gpu = 0;
 			const bool      gpu      = image.IsGpuModified();
 			if (gpu) ++over_gpu;
-			if (count == 1 || count == 30 || count == 300 || (gpu && count % 100 == 0)) {
+			if (::Log::TraceEnabled() && (count == 1 || count == 30 || count == 300 || (gpu && count % 100 == 0))) {
 				LOGF("ImageCpuRefresh: uploads=%u gpu_owned=%d buffer_modified=%d cpu_dirty=%d "
 				     "maybe_dirty=%d over_gpu_total=%" PRIu64 " %s pitch=%u guest_format=%u\n",
 				     count, gpu ? 1 : 0, image.IsBufferModified() ? 1 : 0,
@@ -2608,7 +2608,7 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, bool
 			                     (uint64_t {static_cast<uint8_t>(info.tile_mode)} << 8u) ^
 			                     (info.data.size << 4u);
 			const auto count = ++hits[key];
-			if (count == 1 || count == 30 || count == 300) {
+			if (::Log::TraceEnabled() && (count == 1 || count == 30 || count == 300)) {
 				LOGF("ImageGpuInvalidatedByBuffer: hits=%u write_size=0x%" PRIx64 " %s\n", count,
 				     size, DescribeImageInfo(info).c_str());
 			}
@@ -2619,12 +2619,12 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, bool
 				static uint64_t merged = 0;
 				static uint64_t failed = 0;
 				if (PreserveGpuPixels(id, image, excluded)) {
-					if (++merged == 1 || merged % 1000 == 0) {
+					if (::Log::TraceEnabled() && (++merged == 1 || merged % 1000 == 0)) {
 						LOGF("PartialWriteMerge: preserved GPU pixels around 0x%" PRIx64 " bytes in %s "
 						     "(merged=%" PRIu64 " unmergeable=%" PRIu64 ")\n",
 						     size, DescribeImageInfo(info).c_str(), merged, failed);
 					}
-				} else if (++failed == 1 || failed % 1000 == 0) {
+				} else if (::Log::TraceEnabled() && (++failed == 1 || failed % 1000 == 0)) {
 					LOGF("PartialWriteMerge: could not preserve %s (unmergeable=%" PRIu64 ")\n",
 					     DescribeImageInfo(info).c_str(), failed);
 				}

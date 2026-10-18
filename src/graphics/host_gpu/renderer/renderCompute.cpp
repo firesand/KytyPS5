@@ -281,8 +281,10 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 	if (indirect_args != 0) {
 		// GPU-built dispatch arguments: publish pending unbounded writes, then download tracked
 		// GPU data, before sizing the LDS buffer from them (host-read audit 2026-10-12).
-		cache.PrepareHostRead(indirect_args, sizeof(vk::DispatchIndirectCommand));
-		cache.ReadMemory(indirect_args, sizeof(vk::DispatchIndirectCommand));
+		if (cache.HasGpuDirtyBytes(indirect_args, sizeof(vk::DispatchIndirectCommand))) {
+			cache.PrepareHostRead(indirect_args, sizeof(vk::DispatchIndirectCommand));
+			cache.ReadMemory(indirect_args, sizeof(vk::DispatchIndirectCommand));
+		}
 		std::memcpy(input.workgroup_counts, reinterpret_cast<const void*>(indirect_args),
 		            sizeof(input.workgroup_counts));
 	}

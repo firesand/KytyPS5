@@ -79,7 +79,11 @@ public:
 	// Tick of the last recorded GPU-side write INTO this buffer (staging upload, written binding,
 	// fill/copy destination, join copy). A host-side read of its device bytes (BAR readback or a
 	// host join) is only meaningful once this tick is free.
-	uint64_t last_gpu_write_tick = 0;
+	uint64_t last_gpu_write_tick  = 0;
+	uint64_t last_sync_epoch       = 0;
+	uint64_t last_sync_fault_count = 0;
+	uint64_t synced_vaddr          = 0;
+	uint64_t synced_size           = 0;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }

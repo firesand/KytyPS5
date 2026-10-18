@@ -40,6 +40,12 @@ public:
 	// GPU copy. Called from the GPU thread.
 	void InvalidatePageHashes(uint64_t vaddr, uint64_t size);
 	static HotPageStats TakeHotStats() { return RegionManager::TakeHotStats(); }
+	[[nodiscard]] uint64_t CpuWriteFaultCount() const noexcept {
+		return m_cpu_write_fault_count.load(std::memory_order_relaxed);
+	}
+	void NoteCpuWriteFault() noexcept {
+		m_cpu_write_fault_count.fetch_add(1, std::memory_order_relaxed);
+	}
 	// Regions whose CPU-dirty state changed since the last call (or that were flagged through
 	// MarkBdaSyncPending): func(region_address, region_size). GPU thread.
 	template <typename Func>
@@ -79,6 +85,7 @@ public:
 	void InvalidateWriteFault(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
 		static_assert(std::is_invocable_v<Flush&>);
 		CheckNotInUploadCallback();
+		NoteCpuWriteFault();
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			const bool should_flush = [&] {
 				std::scoped_lock lock(manager->lock);
@@ -99,6 +106,7 @@ public:
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
 		static_assert(std::is_invocable_v<Flush&>);
 		CheckNotInUploadCallback();
+		NoteCpuWriteFault();
 
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			const bool should_flush = [&] {
@@ -227,6 +235,7 @@ private:
 	PageManager&                                   m_page_manager;
 	std::atomic<uint32_t>                          m_bda_pending_count {0};
 	std::atomic<uint32_t>                          m_hot_region_count {0};
+	std::atomic<uint64_t>                          m_cpu_write_fault_count {1};
 };
 
 } // namespace Libs::Graphics

@@ -840,6 +840,9 @@ template <typename Program>
 static void LogUnboundedBuffer(const Program& program, uint32_t resource,
                                const ShaderBufferResource& descriptor, uint64_t address,
                                uint64_t size) {
+	if (!::Log::TraceEnabled()) {
+		return;
+	}
 	static std::vector<uint64_t> seen; // GPU thread only
 	const auto key = program.shader_hash ^ (uint64_t {resource} << 56u);
 	if (seen.size() >= 512 || std::find(seen.begin(), seen.end(), key) != seen.end()) {

@@ -1,6 +1,7 @@
 
 #include "common/logging/log.h"
 #include <cstdlib>
+#include <cstring>
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -186,6 +187,21 @@ bool VerboseEnabled() {
 		return value != nullptr && value[0] == '1';
 	}();
 	return verbose;
+}
+
+bool TraceEnabled() {
+	static const bool trace = [] {
+		const char* trace_env = std::getenv("KYTY_TRACE_LOGS");
+		if (trace_env != nullptr && (trace_env[0] == '1' || std::strcmp(trace_env, "true") == 0)) {
+			return true;
+		}
+		const char* diag_env = std::getenv("KYTY_GPU_DIAGNOSTICS");
+		if (diag_env != nullptr && diag_env[0] != '0' && diag_env[0] != '\0') {
+			return true;
+		}
+		return false;
+	}();
+	return trace;
 }
 
 bool IsSilent() {

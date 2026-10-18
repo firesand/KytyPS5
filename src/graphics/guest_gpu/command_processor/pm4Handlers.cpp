@@ -1944,7 +1944,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 	    reinterpret_cast<const uint32_t*>(buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u));
 	uint32_t                     indirect_num_dw = control & 0xfffffu;
 	static std::atomic<uint32_t> indirect_log_count {0};
-	if (indirect_log_count.fetch_add(1) < 128) {
+	if (::Log::TraceEnabled() && indirect_log_count.fetch_add(1) < 128) {
 		LOGF("\t indirect buffer: addr=0x%016" PRIx64 ", num_dw=%" PRIu32 ", control=0x%08" PRIx32
 		     "\n",
 		     reinterpret_cast<uint64_t>(indirect_buffer), indirect_num_dw, control);
@@ -2293,7 +2293,7 @@ KYTY_CP_OP_PARSER(CpOpPopMarker) {
 	auto dw_num = (cmd_id >> 16u) & 0x3fffu;
 
 	static std::atomic<uint32_t> pop_marker_log_count {0};
-	if (pop_marker_log_count.fetch_add(1) < 64) {
+	if (::Log::TraceEnabled() && pop_marker_log_count.fetch_add(1) < 64) {
 		LOGF("Pop marker\n");
 	}
 
@@ -2308,7 +2308,7 @@ KYTY_CP_OP_PARSER(CpOpPushMarker) {
 	const char* str = reinterpret_cast<const char*>(buffer);
 
 	static std::atomic<uint32_t> push_marker_log_count {0};
-	if (push_marker_log_count.fetch_add(1) < 128) {
+	if (::Log::TraceEnabled() && push_marker_log_count.fetch_add(1) < 128) {
 		LOGF("Push marker: %s\n", str);
 	}
 

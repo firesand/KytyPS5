@@ -196,8 +196,8 @@ void AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<cons
 	info.ls_stride = ReflectTessellationStride(local_program, true, info.input_control_points, 0u);
 	info.hs_stride = ReflectTessellationStride(control_program, false, info.output_control_points,
 	                                           info.ls_stride);
-	LOGF("Tessellation interface: input_cp=%u output_cp=%u ls_stride=%u hs_stride=%u\n",
-	     info.input_control_points, info.output_control_points, info.ls_stride, info.hs_stride);
+	LOGF_TRACE("Tessellation interface: input_cp=%u output_cp=%u ls_stride=%u hs_stride=%u\n",
+	           info.input_control_points, info.output_control_points, info.ls_stride, info.hs_stride);
 }
 
 void LowerTessellationMemory(IR::Program& program, const CompileOptions& options) {
@@ -320,11 +320,11 @@ void LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 	ConstantPropagationPass(program.blocks, program.wave_size);
 	RemoveIdentities(program.blocks);
 	EliminateDeadCode(program.blocks);
-	LOGF("%s tessellation lowering: reads=%u writes=%u factors=%u\n",
-	     options.stage == ShaderType::Local                 ? "LS"
-	     : options.stage == ShaderType::TessellationControl ? "HS"
-	                                                       : "TES",
-	     reads, writes, factors);
+	LOGF_TRACE("%s tessellation lowering: reads=%u writes=%u factors=%u\n",
+	           options.stage == ShaderType::Local                 ? "LS"
+	           : options.stage == ShaderType::TessellationControl ? "HS"
+	                                                             : "TES",
+	           reads, writes, factors);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler

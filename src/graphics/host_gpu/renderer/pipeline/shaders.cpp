@@ -646,21 +646,25 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 				                       vk::to_string(blend.dstColorBlendFactor));
 			}
 		}
-		LOGF("PipelineTrace: vkCreateGraphicsPipelines begin vs=0x%016" PRIx64 " ps=0x%016" PRIx64
-		     " topology=%u depth=%d samples=%u%s\n",
-		     gfx_vs_hash, gfx_ps_hash, static_cast<uint32_t>(static_params.topology),
-		     with_depth ? 1 : 0, static_cast<uint32_t>(static_params.samples), targets.c_str());
+		if (graphics_debug_dump_enabled() || ::Log::TraceEnabled()) {
+			LOGF("PipelineTrace: vkCreateGraphicsPipelines begin vs=0x%016" PRIx64 " ps=0x%016" PRIx64
+			     " topology=%u depth=%d samples=%u%s\n",
+			     gfx_vs_hash, gfx_ps_hash, static_cast<uint32_t>(static_params.topology),
+			     with_depth ? 1 : 0, static_cast<uint32_t>(static_params.samples), targets.c_str());
+			Log::Flush();
+		}
 	}
-	Log::Flush();
 	const auto gfx_compile_start = std::chrono::steady_clock::now();
 	result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
 	                                                 &pipeline.pipeline);
-	LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s vs=0x%016" PRIx64 " ps=0x%016" PRIx64
-	     " ms=%lld\n",
-	     vk::to_string(result).c_str(), gfx_vs_hash, gfx_ps_hash,
-	     static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
-	                                std::chrono::steady_clock::now() - gfx_compile_start)
-	                                .count()));
+	if (graphics_debug_dump_enabled() || ::Log::TraceEnabled()) {
+		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s vs=0x%016" PRIx64 " ps=0x%016" PRIx64
+		     " ms=%lld\n",
+		     vk::to_string(result).c_str(), gfx_vs_hash, gfx_ps_hash,
+		     static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+		                                std::chrono::steady_clock::now() - gfx_compile_start)
+		                                .count()));
+	}
 	if (result == vk::Result::eSuccess && pipeline.pipeline != nullptr && PipelineStatsProbe()) {
 		LogPipelineStatistics(graphics, pipeline.pipeline, vs_input_info.stage.program->shader_hash,
 		                      ps_active && ps_input_info != nullptr && ps_input_info->stage
@@ -722,12 +726,16 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	EXIT_IF(pipeline.pipeline_layout != nullptr);
 
-	LOGF("PipelineTrace: vkCreatePipelineLayout CS begin set_layouts=1 push_constants=%u\n",
-	     1u);
+	if (graphics_debug_dump_enabled() || ::Log::TraceEnabled()) {
+		LOGF("PipelineTrace: vkCreatePipelineLayout CS begin set_layouts=1 push_constants=%u\n",
+		     1u);
+	}
 	auto result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
 	                                                  &pipeline.pipeline_layout);
-	LOGF("PipelineTrace: vkCreatePipelineLayout CS done result=%s layout=%p\n",
-	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
+	if (graphics_debug_dump_enabled() || ::Log::TraceEnabled()) {
+		LOGF("PipelineTrace: vkCreatePipelineLayout CS done result=%s layout=%p\n",
+		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
@@ -745,19 +753,23 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	EXIT_IF(pipeline.pipeline != nullptr);
 
-	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p cs=0x%016" PRIx64 "\n",
-	     static_cast<void*>(pipeline.pipeline_layout), input_info.stage.program->shader_hash);
-	Log::Flush(); // survive a kill during a long driver compile
+	if (graphics_debug_dump_enabled() || ::Log::TraceEnabled()) {
+		LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p cs=0x%016" PRIx64 "\n",
+		     static_cast<void*>(pipeline.pipeline_layout), input_info.stage.program->shader_hash);
+		Log::Flush(); // survive a kill during a long driver compile
+	}
 	const auto compile_start = std::chrono::steady_clock::now();
 	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
 	                                                &pipeline.pipeline);
-	const auto compile_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-	                            std::chrono::steady_clock::now() - compile_start)
-	                            .count();
-	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p cs=0x%016" PRIx64
-	     " ms=%lld\n",
-	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline),
-	     input_info.stage.program->shader_hash, static_cast<long long>(compile_ms));
+	if (graphics_debug_dump_enabled() || ::Log::TraceEnabled()) {
+		const auto compile_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+		                            std::chrono::steady_clock::now() - compile_start)
+		                            .count();
+		LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p cs=0x%016" PRIx64
+		     " ms=%lld\n",
+		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline),
+		     input_info.stage.program->shader_hash, static_cast<long long>(compile_ms));
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);

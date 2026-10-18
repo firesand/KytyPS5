@@ -480,6 +480,9 @@ struct DrawCallInfo {
 static void ReportRenderAreaClamp(const char* kind, uint64_t guest_address, vk::Extent2D wanted,
                                   vk::Extent2D actual, const Image& image, uint32_t level,
                                   vk::Format view_format) {
+	if (!::Log::TraceEnabled()) {
+		return;
+	}
 	static std::atomic<uint32_t> reports = 0;
 	const auto n = reports.fetch_add(1, std::memory_order_relaxed) + 1;
 	if (n > 20 && n % 1000 != 0) {
@@ -497,6 +500,9 @@ static void ReportRenderAreaClamp(const char* kind, uint64_t guest_address, vk::
 // slot 0 and the largest overall, with draw counts. The settings file alone cannot show what the
 // game rendered at (it rewrote bUseDynamicResolution during the 720p runs; review 2026-10-13).
 static void NoteRenderTargetExtent(uint32_t width, uint32_t height, uint32_t slot) {
+	if (!::Log::TraceEnabled()) {
+		return;
+	}
 	static uint32_t max_w = 0, max_h = 0, max0_w = 0, max0_h = 0, draws = 0;
 	static std::unordered_set<uint64_t> distinct;
 	static auto last = std::chrono::steady_clock::now();
@@ -699,7 +705,7 @@ bool RenderExecutor::ConsumeMetadataColorOperation(CommandBuffer& buffer,
 	{
 		static std::unordered_set<uint64_t> reported; // GPU thread only
 		const auto key = (static_cast<uint64_t>(rt0.base.addr) << 8u) | mode;
-		if (reported.size() < 256 && reported.insert(key).second) {
+		if (::Log::TraceEnabled() && reported.size() < 256 && reported.insert(key).second) {
 			LOGF("MetadataColorOp: mode=%u cb0 base=0x%08x dcc=%u cmask_fast_clear=%u clear_word0=0x%08x "
 			     "slice_offset=%u\n",
 			     static_cast<unsigned>(mode), static_cast<uint32_t>(rt0.base.addr),
@@ -1369,7 +1375,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (LazyBarriersActive() && gpu_indirect != nullptr) {
 		// After PrepareForDraw the tracked part is resolved whenever a hazard was pending.
 		auto& hazards = buffer.Hazards();
-		if (hazards.indirect_write_stages || hazards.transfer_wrote) {
+		if (LazyBarrierMode() == 1) {
+			indirect_barrier = static_cast<bool>(hazards.indirect_write_stages) || hazards.transfer_wrote;
+		} else if (hazards.indirect_write_stages || hazards.transfer_wrote) {
 			indirect_barrier = true;
 		}
 	}
@@ -1681,17 +1689,15 @@ bool RenderExecutor::CanDrawIndirectOnGpu(CommandBuffer& buffer, bool indexed,
 		return false;
 	}
 	uint64_t shader_hash = 0;
-	if (VertexShaderIsMesh(sh_ctx.GetVs(), buffer.GetRegisters(), &shader_hash)) {
-		if (graphics.task_shader_enabled && (!indexed || graphics.maintenance5_enabled)) {
+	const bool is_mesh = VertexShaderIsMesh(sh_ctx.GetVs(), buffer.GetRegisters(), &shader_hash);
+	if (is_mesh) {
+		const auto fast_launch = (buffer.GetRegisters().GetShaderStages() >> 19u) & 3u;
+		if (!graphics.task_shader_enabled || indexed || fast_launch == 0) {
 			if (block != nullptr) {
-				*block = GpuIndirectBlock::None;
+				*block = GpuIndirectBlock::Mesh;
 			}
-			return true;
+			return false;
 		}
-		if (block != nullptr) {
-			*block = GpuIndirectBlock::Mesh;
-		}
-		return false;
 	}
 	// The host evaluates the resource plan (descriptor addresses, SRT reads, uniform branches) from
 	// the user-data snapshot. The GPU variant never patches the offset SGPRs, so a plan that reads
@@ -1713,7 +1719,7 @@ bool RenderExecutor::CanDrawIndirectOnGpu(CommandBuffer& buffer, bool indexed,
 	if (block != nullptr) {
 		*block = GpuIndirectBlock::None;
 	}
-	if (!indexed) {
+	if (is_mesh || !indexed) {
 		return true;
 	}
 	uint32_t element_size = 0;

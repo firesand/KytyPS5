@@ -65,6 +65,7 @@ public:
 		++m_bda_sync_epoch;
 		m_wait_pass_pending = false;
 	}
+	[[nodiscard]] uint64_t BdaSyncEpoch() const noexcept { return m_bda_sync_epoch; }
 	// The command processor observed guest memory without suspending (a WAIT_REG_MEM that passed,
 	// a conditional-IB compare, COND_EXEC, SET_PREDICATION): CPU writes made before the value it
 	// saw must be visible to later BDA / unbounded consumers in this stream. Starts a new sync

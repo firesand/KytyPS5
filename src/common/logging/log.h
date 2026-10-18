@@ -26,6 +26,8 @@ bool      IsSilent();
 // KYTY_LOG_VERBOSE=1 enables per-packet / per-event trace lines (off by default: they cost
 // measurable CPU on the GPU thread and the game threads).
 bool      VerboseEnabled();
+// KYTY_TRACE_LOGS=1 or KYTY_GPU_DIAGNOSTICS=1 enables verbose recompiler/pipeline/cache traces.
+bool      TraceEnabled();
 void      Write(std::string_view text);
 void      Write(fmt::text_style style, std::string_view text);
 void      WriteToConsoleAndLog(std::string_view text);
@@ -64,6 +66,14 @@ inline constexpr auto BrightWhite   = fmt::fg(fmt::terminal_color::bright_white)
 	do {                                                                                           \
 		if (!::Log::IsSilent()) {                                                                  \
 			::Log::Write((style), ::fmt::sprintf(__VA_ARGS__));                                    \
+		}                                                                                          \
+	} while (false)
+
+// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
+#define LOGF_TRACE(...)                                                                            \
+	do {                                                                                           \
+		if (::Log::TraceEnabled()) {                                                               \
+			LOGF(__VA_ARGS__);                                                                     \
 		}                                                                                          \
 	} while (false)
 

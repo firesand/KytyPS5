@@ -2793,12 +2793,14 @@ int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t len, s
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
-	LOGF("\t search_start = 0x%016" PRIx64 "\n"
-	     "\t search_end   = 0x%016" PRIx64 "\n"
-	     "\t len          = 0x%016" PRIx64 "\n"
-	     "\t alignment    = 0x%016" PRIx64 "\n"
-	     "\t memory_type  = %d\n",
-	     search_start, search_end, len, alignment, memory_type);
+	if (PRINT_NAME_ENABLED) {
+		LOGF("\t search_start = 0x%016" PRIx64 "\n"
+		     "\t search_end   = 0x%016" PRIx64 "\n"
+		     "\t len          = 0x%016" PRIx64 "\n"
+		     "\t alignment    = 0x%016" PRIx64 "\n"
+		     "\t memory_type  = %d\n",
+		     search_start, search_end, len, alignment, memory_type);
+	}
 
 	constexpr uint64_t PAGE_SIZE = 0x4000;
 	if (search_start < 0 || search_end <= search_start || len == 0 ||
@@ -2818,7 +2820,9 @@ int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t len, s
 
 	*phys_addr_out = static_cast<int64_t>(addr);
 
-	LOGF_COLOR(Log::Color::Green, "\tphys_addr    = %016" PRIx64 "\n\t[Ok]\n", addr);
+	if (PRINT_NAME_ENABLED) {
+		LOGF_COLOR(Log::Color::Green, "\tphys_addr    = %016" PRIx64 "\n\t[Ok]\n", addr);
+	}
 
 	return OK;
 }
@@ -2837,10 +2841,12 @@ int KYTY_SYSV_ABI KernelAllocateMainDirectMemory(size_t len, size_t alignment, i
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
-	LOGF("\t len          = 0x%016" PRIx64 "\n"
-	     "\t alignment    = 0x%016" PRIx64 "\n"
-	     "\t memory_type  = %d\n",
-	     len, alignment, memory_type);
+	if (PRINT_NAME_ENABLED) {
+		LOGF("\t len          = 0x%016" PRIx64 "\n"
+		     "\t alignment    = 0x%016" PRIx64 "\n"
+		     "\t memory_type  = %d\n",
+		     len, alignment, memory_type);
+	}
 
 	return KernelAllocateDirectMemory(0, static_cast<int64_t>(PhysicalMemory::Size()), len,
 	                                  alignment, memory_type, phys_addr_out);
@@ -3202,7 +3208,9 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		g_alloc_callback(out_addr, len);
 	}
 
-	LOGF_COLOR(Log::Color::Green, "\t [Ok]\n");
+	if (PRINT_NAME_ENABLED) {
+		LOGF_COLOR(Log::Color::Green, "\t [Ok]\n");
+	}
 
 	return OK;
 }

@@ -590,6 +590,19 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
+	if (!is_written && !is_texel_buffer) {
+		const uint64_t current_epoch  = m_scheduler.Context().BdaSyncEpoch();
+		const uint64_t current_faults = m_memory_tracker.CpuWriteFaultCount();
+		if (buffer.last_sync_epoch == current_epoch &&
+		    buffer.last_sync_fault_count == current_faults &&
+		    buffer.synced_vaddr <= vaddr &&
+		    (vaddr + size) <= (buffer.synced_vaddr + buffer.synced_size)) {
+			m_last_upload_bytes = 0;
+			m_last_upload_pages = 0;
+			return false;
+		}
+	}
+
 	std::vector<vk::BufferCopy> copies;
 	std::vector<const void*>    sources; // per copy: hot-page snapshot, or null = guest memory
 	uint64_t                    total_size = 0;
@@ -604,6 +617,32 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	    [&]() noexcept { source = UploadCopies(buffer, copies, sources, total_size); });
 	m_last_upload_bytes = total_size;
 	m_last_upload_pages = copies.size();
+
+	if (!is_written && !is_texel_buffer) {
+		const uint64_t current_epoch  = m_scheduler.Context().BdaSyncEpoch();
+		const uint64_t current_faults = m_memory_tracker.CpuWriteFaultCount();
+		if (buffer.last_sync_epoch == current_epoch &&
+		    buffer.last_sync_fault_count == current_faults &&
+		    buffer.synced_size > 0 &&
+		    vaddr <= (buffer.synced_vaddr + buffer.synced_size) &&
+		    (vaddr + size) >= buffer.synced_vaddr) {
+			const uint64_t new_start = std::min(buffer.synced_vaddr, vaddr);
+			const uint64_t new_end   = std::max(buffer.synced_vaddr + buffer.synced_size, vaddr + size);
+			buffer.synced_vaddr      = new_start;
+			buffer.synced_size       = new_end - new_start;
+		} else {
+			buffer.last_sync_epoch       = current_epoch;
+			buffer.last_sync_fault_count = current_faults;
+			buffer.synced_vaddr          = vaddr;
+			buffer.synced_size           = size;
+		}
+	} else if (is_written) {
+		buffer.last_sync_epoch       = 0;
+		buffer.last_sync_fault_count = 0;
+		buffer.synced_vaddr          = 0;
+		buffer.synced_size           = 0;
+	}
+
 	if (source) {
 		m_sync_stats.copy_buffers++;
 		buffer.last_gpu_write_tick = m_scheduler.CurrentTick(); // the staging copy below
@@ -705,7 +744,11 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
 		NoteGpuWrite(vaddr, size, m_scheduler.CurrentTick());
-		buffer.last_gpu_write_tick = m_scheduler.CurrentTick();
+		buffer.last_gpu_write_tick  = m_scheduler.CurrentTick();
+		buffer.last_sync_epoch       = 0;
+		buffer.last_sync_fault_count = 0;
+		buffer.synced_vaddr          = 0;
+		buffer.synced_size           = 0;
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }

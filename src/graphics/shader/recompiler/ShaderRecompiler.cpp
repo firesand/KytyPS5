@@ -878,22 +878,22 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		}
 	}
 
-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph\n", GetDumpLabel(options),
-	     StageName(options.stage), options.shader_hash);
+	LOGF_TRACE("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph\n", GetDumpLabel(options),
+	           StageName(options.stage), options.shader_hash);
 	auto native_cfg = CFG::BuildGraph(decoded);
 	CFG::Graph structured_cfg;
 	auto* selected_cfg = &native_cfg;
-	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
-	     " loops=%" PRIu64 " back_edges=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
-	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
-	     static_cast<uint64_t>(native_cfg.blocks.size()),
-	     static_cast<uint64_t>(native_cfg.natural_loops.size()),
-	     static_cast<uint64_t>(native_cfg.back_edges.size()), phase_ms());
+	LOGF_TRACE("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
+	           " loops=%" PRIu64 " back_edges=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
+	           GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+	           static_cast<uint64_t>(native_cfg.blocks.size()),
+	           static_cast<uint64_t>(native_cfg.natural_loops.size()),
+	           static_cast<uint64_t>(native_cfg.back_edges.size()), phase_ms());
 	if (native_cfg.irreducible) {
 		LogDispatcherFallback(options, native_cfg, "build");
 	} else {
-		LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG Structurize\n",
-		     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
+		LOGF_TRACE("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG Structurize\n",
+		           GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 		structured_cfg = CFG::Structurize(native_cfg);
 		if (structured_cfg.unsupported) {
 			native_cfg.unsupported = true;
@@ -903,14 +903,14 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 			LogDispatcherFallback(options, native_cfg, "structurize");
 		} else {
 			selected_cfg = &structured_cfg;
-			LOGF("%s structured CFG success: blocks=%" PRIu64 "\n", GetDumpLabel(options),
-			     static_cast<uint64_t>(selected_cfg->blocks.size()));
+			LOGF_TRACE("%s structured CFG success: blocks=%" PRIu64 "\n", GetDumpLabel(options),
+			           static_cast<uint64_t>(selected_cfg->blocks.size()));
 		}
-		LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG Structurize blocks=%" PRIu64
-		     " loops=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
-		     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
-		     static_cast<uint64_t>(selected_cfg->blocks.size()),
-		     static_cast<uint64_t>(selected_cfg->natural_loops.size()), phase_ms());
+		LOGF_TRACE("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG Structurize blocks=%" PRIu64
+		           " loops=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
+		           GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+		           static_cast<uint64_t>(selected_cfg->blocks.size()),
+		           static_cast<uint64_t>(selected_cfg->natural_loops.size()), phase_ms());
 	}
 
 	const auto& cfg = *selected_cfg;
@@ -921,8 +921,8 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		    decoded, options.input_info.vertex, options.user_data_base,
 		    static_cast<uint32_t>(options.user_data.size()), options.wave_size);
 		if (!embedded_fetch.loads.empty()) {
-			LOGF("%s embedded vertex fetch plan: detected=%" PRIu64 "\n", GetDumpLabel(options),
-			     static_cast<uint64_t>(embedded_fetch.loads.size()));
+			LOGF_TRACE("%s embedded vertex fetch plan: detected=%" PRIu64 "\n", GetDumpLabel(options),
+			           static_cast<uint64_t>(embedded_fetch.loads.size()));
 		}
 	}
 	Frontend::TranslateOptions translate_options {
@@ -934,13 +934,13 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	    .input_info       = options.input_info,
 	    .embedded_fetch   = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
 	};
-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
-	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
+	LOGF_TRACE("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
+	           GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
-	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
-	     " elapsed_ms=%" PRIu64 "\n",
-	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
-	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
+	LOGF_TRACE("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
+	           " elapsed_ms=%" PRIu64 "\n",
+	           GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+	           static_cast<uint64_t>(ir.blocks.size()), phase_ms());
 	IR::RewriteToSsa(ir.blocks);
 	IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
 	IR::ResolveControlFlowIdentities(ir);
@@ -948,8 +948,8 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	IR::EliminateDeadCode(ir.blocks);
 	const auto read_lane_stats = IR::EliminateReadLane(ir, ir.wave_size);
 	if (read_lane_stats.rewritten_reads != 0) {
-		LOGF("%s read-lane elimination: reads=%" PRIu32 "\n", GetDumpLabel(options),
-		     read_lane_stats.rewritten_reads);
+		LOGF_TRACE("%s read-lane elimination: reads=%" PRIu32 "\n", GetDumpLabel(options),
+		           read_lane_stats.rewritten_reads);
 		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
 		IR::ResolveControlFlowIdentities(ir);
 		IR::RemoveIdentities(ir.blocks);
@@ -1041,16 +1041,16 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		}
 	}
 
-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
-	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash);
+	LOGF_TRACE("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
+	           GetDumpLabel(options), StageName(ir.stage), ir.shader_hash);
 	auto spirv = Spirv::EmitProgram(ir, options.input_info, push_data_start_dword);
-	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
-	     " elapsed_ms=%" PRIu64 "\n",
-	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash,
-	     static_cast<uint64_t>(spirv.size()),
-	     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-	                               std::chrono::steady_clock::now() - emit_begin)
-	                               .count()));
+	LOGF_TRACE("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
+	           " elapsed_ms=%" PRIu64 "\n",
+	           GetDumpLabel(options), StageName(ir.stage), ir.shader_hash,
+	           static_cast<uint64_t>(spirv.size()),
+	           static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+	                                     std::chrono::steady_clock::now() - emit_begin)
+	                                     .count()));
 	CompileResult result;
 	result.spirv   = std::move(spirv);
 	result.program = std::move(ir);

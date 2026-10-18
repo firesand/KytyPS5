@@ -32,6 +32,10 @@ public:
 		static const bool enabled = Flag("KYTY_GPU_DIAGNOSTICS");
 		return enabled;
 	}
+	static bool TraceEnabled() {
+		static const bool trace = Flag("KYTY_TRACE_LOGS");
+		return Enabled() || trace;
+	}
 	static bool Serialize() {
 		static const bool enabled = Flag("KYTY_GPU_DIAGNOSTICS_SYNC");
 		return Enabled() && enabled;

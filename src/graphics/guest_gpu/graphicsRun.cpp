@@ -969,7 +969,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			auto packet_dw = KYTY_PM4_LEN(packet_header);
 			EXIT_NOT_IMPLEMENTED(packet_dw == 0 || packet_dw > remaining_dw);
 			static std::atomic<uint32_t> skip_log_count {0};
-			if (skip_log_count.fetch_add(1) < 2048) {
+			if (GraphicsRunDebugDumpEnabled() && skip_log_count.fetch_add(1) < 2048) {
 				LOGF("\t predicated skip: op=0x%02" PRIx32 ", r=0x%02" PRIx32 ", len=%" PRIu32
 				     ", packet=0x%016" PRIx64 ", cmd_id=0x%08" PRIx32 "\n",
 				     opcode, KYTY_PM4_R(packet_header), packet_dw,
@@ -978,7 +978,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			if (opcode == Pm4::IT_NOP && KYTY_PM4_R(packet_header) == Pm4::R_RELEASE_MEM &&
 			    packet_dw >= 7) {
 				static std::atomic<uint32_t> log_count {0};
-				if (log_count.fetch_add(1) < 128) {
+				if (GraphicsRunDebugDumpEnabled() && log_count.fetch_add(1) < 128) {
 					const auto dst = packet[3] | (static_cast<uint64_t>(packet[4]) << 32u);
 					const auto val = packet[5] | (static_cast<uint64_t>(packet[6]) << 32u);
 					LOGF("\t predicated skip: R_RELEASE_MEM dst=0x%016" PRIx64
@@ -1228,6 +1228,59 @@ bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_c
 		return fallback();
 	}
 
+	const uint64_t args_addr = m_draw_indirect_args_base_addr + data_offset;
+	const uint64_t args_bytes =
+	    static_cast<uint64_t>(max_count_or_count - 1u) * stride_in_bytes + args_size;
+	const uint64_t count_vaddr = reinterpret_cast<uint64_t>(count_addr);
+	auto&          cache       = m_renderer.GetBufferCache();
+	const bool     args_dirty  = cache.HasGpuDirtyBytes(args_addr, args_bytes);
+	const bool     count_dirty =
+	    (count_addr != nullptr) && cache.HasGpuDirtyBytes(count_vaddr, sizeof(uint32_t));
+	const bool has_pending_writes = cache.HasPendingUnboundedWrites();
+	const bool is_gpu_dirty       = args_dirty || count_dirty || has_pending_writes;
+
+	if (!is_gpu_dirty) {
+		uint32_t real_count = max_count_or_count;
+		if (count_addr != nullptr) {
+			real_count = std::min(static_cast<uint32_t>(*count_addr), max_count_or_count);
+		}
+		bool all_empty = true;
+		for (uint32_t i = 0; i < real_count; i++) {
+			const auto record_addr = args_addr + static_cast<uint64_t>(i) * stride_in_bytes;
+			if (indexed) {
+				const auto* rec = reinterpret_cast<const DrawIndexedIndirectArgs*>(record_addr);
+				if (rec->index_count_per_instance != 0 && rec->instance_count != 0) {
+					all_empty = false;
+					break;
+				}
+			} else {
+				const auto* rec = reinterpret_cast<const DrawIndirectArgs*>(record_addr);
+				if (rec->vertex_count_per_instance != 0 && rec->instance_count != 0) {
+					all_empty = false;
+					break;
+				}
+			}
+		}
+		if (all_empty) {
+			if (real_count > 0) {
+				const auto last_addr =
+				    args_addr + static_cast<uint64_t>(real_count - 1u) * stride_in_bytes;
+				if (indexed) {
+					const auto* rec = reinterpret_cast<const DrawIndexedIndirectArgs*>(last_addr);
+					PatchIndirectDrawOffsets(*this, registers, rec->base_vertex_location,
+					                         rec->start_instance_location, rec->start_index_location);
+				} else {
+					const auto* rec = reinterpret_cast<const DrawIndirectArgs*>(last_addr);
+					PatchIndirectDrawOffsets(*this, registers, rec->start_vertex_location,
+					                         rec->start_instance_location, 0);
+				}
+			}
+			HostReadProbe::CountGpuIndirect(HostReadProbe::GpuDraws);
+			return true;
+		}
+		return false;
+	}
+
 	auto& executor = m_renderer.GetRenderExecutor();
 	RenderExecutor::GpuIndirectBlock block = RenderExecutor::GpuIndirectBlock::Other;
 	if (!executor.CanDrawIndirectOnGpu(CurrentBuffer(), indexed, m_index_type_and_size,
@@ -1330,6 +1383,9 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 			auto* args = reinterpret_cast<const DrawIndirectArgs*>(args_addr);
 			PatchIndirectDrawOffsets(*this, registers, args->start_vertex_location,
 			                         args->start_instance_location, 0);
+			if (args->vertex_count_per_instance == 0 || args->instance_count == 0) {
+				continue;
+			}
 			m_num_instances = args->instance_count;
 			DrawIndexAuto({.vertex_count   = args->vertex_count_per_instance,
 			               .instance_count = args->instance_count,
@@ -1343,13 +1399,13 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		PatchIndirectDrawOffsets(*this, registers, args->base_vertex_location,
 		                         args->start_instance_location, args->start_index_location);
 
-		auto* index_addr = reinterpret_cast<const void*>(
-		    m_index_base_addr + static_cast<uint64_t>(args->start_index_location) * index_size);
-
 		const uint32_t index_count =
 		    (m_index_buffer_size != 0
 		         ? std::min(args->index_count_per_instance, m_index_buffer_size)
 		         : args->index_count_per_instance);
+		if (index_count == 0 || args->instance_count == 0) {
+			continue;
+		}
 		if (GraphicsRunDebugDumpEnabled() && index_count != args->index_count_per_instance) {
 			static std::atomic<uint32_t> log_count {0};
 			if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
@@ -1358,6 +1414,9 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 				     args->index_count_per_instance, index_count);
 			}
 		}
+
+		auto* index_addr = reinterpret_cast<const void*>(
+		    m_index_base_addr + static_cast<uint64_t>(args->start_index_location) * index_size);
 
 		m_num_instances = args->instance_count;
 		DrawIndex({.index_count    = index_count,
