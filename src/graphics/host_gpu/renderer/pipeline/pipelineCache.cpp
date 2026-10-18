@@ -971,7 +971,12 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	if (draw_parameters != nullptr && draw_parameters->active) {
 		EXIT_NOT_IMPLEMENTED(tess_active);
 		if (mesh_active) {
-			vertex_info[0].mesh_task_indirect = true;
+			// Pass-through task shader: the mesh entry reads the record's vertex count from the
+			// task payload, and reads of the named offset slots load the payload's first vertex /
+			// first instance. The slots join the program key (BuildStageStaticKey).
+			vertex_info[0].mesh_task_indirect         = true;
+			vertex_info[0].draw_parameters            = *draw_parameters;
+			vertex_info[0].draw_parameters.rebase_ids = false;
 		} else {
 			vertex_info[0].draw_parameters = *draw_parameters;
 			// Native fetch consumes the SGPRs the host path patched and expects ids without the base.
