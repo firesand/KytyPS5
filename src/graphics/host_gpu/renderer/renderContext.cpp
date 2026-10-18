@@ -376,7 +376,7 @@ void RenderContext::PrepareBda() {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
 	}
-	SyncCpuWrites(std::exchange(m_sync_hot_regions_pending, false));
+	SyncCpuWrites();
 	m_fault_process_pending = true;
 }
 
@@ -409,7 +409,7 @@ void RenderContext::NoteGuestAcquire() {
 	}
 }
 
-void RenderContext::SyncCpuWrites(bool include_hot) {
+void RenderContext::SyncCpuWrites() {
 	// Once per command stream (KYTY_BDA_SYNC_PER_DRAW=1 restores the per-draw sync): every sync
 	// re-protects the pages it uploads, so the game's next CPU write to them faults again.
 	static const bool per_draw = [] {
@@ -449,6 +449,7 @@ void RenderContext::SyncCpuWrites(bool include_hot) {
 	} else {
 		// Only regions with new CPU-dirty pages (and regions holding hot pages), clipped to mapped
 		// memory: cached buffers can extend past the mapping and unmapped pages must not be read.
+		const bool include_hot = std::exchange(m_sync_hot_regions_pending, false);
 		m_buffer_cache.ForEachBdaSyncPendingRegion(include_hot, [this](uint64_t vaddr, uint64_t size) {
 			SyncProbe::NoteRegion();
 			m_mapped_ranges.ForEachInRange(vaddr, size, [this](uint64_t start, uint64_t end) {

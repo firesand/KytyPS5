@@ -59,7 +59,7 @@ public:
 	void               PrepareBda();
 	// Uploads CPU writes (pending regions + hot pages) once per command stream; used before
 	// pointer-using draws and before whole-heap descriptor reads.
-	void               SyncCpuWrites(bool include_hot = true);
+	void               SyncCpuWrites();
 	// Called when the command processor starts (or resumes) a guest command stream.
 	void               BeginCommandStream() {
 		++m_bda_sync_epoch;
