@@ -1792,9 +1792,15 @@ bool RenderExecutor::CanDrawIndirectOnGpu(CommandBuffer& buffer, bool indexed,
 	// one of them would pick resources from a stale value. Unknown shaders take the host path once,
 	// which compiles them and records their mask.
 	// Mesh programs keep GS slot k at mask bit kMeshUserSgprBase + k (shader.h).
-	uint64_t plan_mask = 0;
-	if (!m_context.GetPipelineCache().GetVertexUserDataMask(shader_hash, plan_mask) ||
-	    (plan_mask & DrawParameterSlotMask(parameters, is_mesh ? kMeshUserSgprBase : 0u)) != 0) {
+	// A packet that names no offset slot patches nothing, so no plan can read a stale value and the
+	// mask is not needed. This also matters for "compile once on the host path": that path skips
+	// empty records before preparing the draw, so a shader whose records are always empty would
+	// never be compiled and stay on the host path (ng-147: 11 packets per frame).
+	const uint64_t slot_mask = DrawParameterSlotMask(parameters, is_mesh ? kMeshUserSgprBase : 0u);
+	uint64_t       plan_mask = 0;
+	if (slot_mask != 0 &&
+	    (!m_context.GetPipelineCache().GetVertexUserDataMask(shader_hash, plan_mask) ||
+	     (plan_mask & slot_mask) != 0)) {
 		if (block != nullptr) {
 			*block = GpuIndirectBlock::Srt;
 		}

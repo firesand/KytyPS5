@@ -19280,6 +19280,18 @@ public:
                  .offset_source = DrawOffsetSource::IndirectArgs});
             return ReadCachedTexel(name, context, sparse_color.image_id, {}, {extent, extent, 1});
           };
+          // A packet that names no offset slot patches nothing on the host path, so the plan
+          // mask is irrelevant: eligible even before the shader was ever compiled (a shader whose
+          // records are always empty is never compiled by the host path, ng-147).
+          ShaderDrawParameters no_slots;
+          no_slots.active = true;
+          const auto no_slot_eligible = [&] {
+            auto block = RenderExecutor::GpuIndirectBlock::Other;
+            return executor.CanDrawIndirectOnGpu(scheduler.Current(), true, 1, 1, no_slots, &block) &&
+                   block == RenderExecutor::GpuIndirectBlock::None;
+          };
+          Require("GpuIndirectSrt", "no named slot, plan unknown", no_slot_eligible(),
+                  "a packet naming no offset slot waited for the shader's plan mask");
           // Host route for base instances 5 and 6 (the second record of the same packet): the
           // patched SGPR indexes the table, both reach 5, the target is covered.
           for (const u32 first_instance : {5u, 6u}) {
@@ -19293,6 +19305,8 @@ public:
           Require("GpuIndirectSrt", "fallback",
               !executor.CanDrawIndirectOnGpu(scheduler.Current(), true, 1, 1, indirect.parameters),
               "a shader whose resource plan reads the base-instance SGPR was made eligible");
+          Require("GpuIndirectSrt", "no named slot, plan reads s9", no_slot_eligible(),
+                  "a packet naming no offset slot was rejected for a plan read of an unpatched SGPR");
           // Forcing the GPU variant shows what the fallback prevents: slot 1 is stale (0), so the
           // host evaluates table[0] and the target stays clear.
           shaders.SetGsUserSgpr(1, 0, HW::UserSgprType::Unknown);
