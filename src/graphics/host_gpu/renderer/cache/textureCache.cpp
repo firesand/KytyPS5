@@ -1375,8 +1375,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	}();
 	const auto slice_size = range.size / layers;
 	const bool gpu_dirty = m_buffer_cache.IsRegionGpuModified(range.address, range.size);
-	if (gpu_dirty && desc.info.metadata.kind == ImageMetadataKind::Dcc &&
-	    ColorClearResolver::Enabled() && (slice_size & 3u) == 0 &&
+	if (gpu_dirty && ColorClearResolver::Enabled() && (slice_size & 3u) == 0 &&
 	    slice_size <= UINT32_MAX && desc.view_info.level_count == 1 && count <= 2048) {
 		// Volume textures use a 2D-array view over their depth slices (images are created
 		// 2D-array compatible), which also clears only the detected slices.
