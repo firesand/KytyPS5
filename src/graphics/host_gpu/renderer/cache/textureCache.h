@@ -73,6 +73,11 @@ public:
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear, bool decline_if_aliased = false);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
+	// Kernel write-watch: the CPU wrote somewhere in each 4 KiB page of [address, address + size),
+	// found after the fact (InvalidateMemory gets a fault's exact byte). Only pages an image covers
+	// completely are certainly its bytes; an image that merely shares a written page takes the path
+	// of a fault outside its bytes (head/tail untracked, or maybe-dirty).
+	void               InvalidateCpuWrittenPages(uint64_t address, uint64_t size);
 	// GPU buffer writes touching an image's memory hand authority to the buffer cache. write_pending:
 	// the write is recorded after this call (DMA fills/copies, storage descriptors), so the whole image
 	// is seeded into the buffer first; otherwise the seed skips address+size and every `recorded` range
@@ -209,7 +214,7 @@ private:
 	void ValidateImageDesc(const ImageDesc& desc) const;
 
 	// Caller holds m_lock. Clears resolved DCC metadata and updates image page tracking.
-	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
+	void               InvalidateCpuAliases(uint64_t address, uint64_t size, bool whole_pages = false);
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
 
 	GraphicContext&                                   m_graphics;

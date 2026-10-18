@@ -2011,6 +2011,14 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	InvalidateCpuAliases(address, size);
 }
 
+void TextureCache::InvalidateCpuWrittenPages(uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid()) {
+		EXIT("TextureCache: invalid written-page range\n");
+	}
+	std::scoped_lock lock {m_lock};
+	InvalidateCpuAliases(address, size, /*whole_pages=*/true);
+}
+
 void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset) {
 	const auto&    info             = image.info;
 	const auto     layers           = info.resources.layers;
@@ -2641,7 +2649,7 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, bool
 	}
 }
 
-void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
+void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size, bool whole_pages) {
 	InvalidateDccMetadata(address, size);
 	const auto page_begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
 	const auto page_end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
@@ -2650,12 +2658,22 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 		if (owner == nullptr) {
 			continue;
 		}
-		if (owner->Overlaps(address, size)) {
+		// The bytes this write certainly changed in the image: the faulting byte, or with
+		// whole_pages the written pages the image covers completely.
+		uint64_t write_address = address;
+		uint64_t write_size    = size;
+		if (whole_pages) {
+			const auto first = std::max(address, Common::AlignUp(owner->info.data.address, TRACKER_PAGE_SIZE));
+			const auto last  = std::min(address + size, Common::AlignDown(owner->info.data.End(), TRACKER_PAGE_SIZE));
+			write_address = first;
+			write_size    = first < last ? last - first : 0;
+		}
+		if (write_size != 0 && owner->Overlaps(write_address, write_size)) {
 			if (owner->IsGpuModified() && KeepGpuImagesProbe() == 1) {
 				static uint64_t kept = 0;
 				if (++kept == 1 || kept % 1000 == 0) {
 					LOGF("KeepGpuImages: ignored CPU write at 0x%" PRIx64 " inside %s (kept=%" PRIu64 ")\n",
-					     address, DescribeImageInfo(owner->info).c_str(), kept);
+					     write_address, DescribeImageInfo(owner->info).c_str(), kept);
 				}
 				// The pages must still be unprotected or the guest re-faults on the same store forever
 				// (ng-60 froze at t=14 s with 16 M repeated faults).
@@ -2663,11 +2681,11 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 				continue;
 			}
 			const auto flags_before = ZeroCompanyImageLifecycle::Flags(*owner);
-			owner->InvalidateCpuWrite(address, size);
+			owner->InvalidateCpuWrite(write_address, write_size);
 			UntrackImage(id);
 			if (flags_before != ZeroCompanyImageLifecycle::Flags(*owner)) {
 				ZeroCompanyImageLifecycle::Record(m_scheduler, "invalidate-cpu-changed", id, *owner,
-				    {.address = address, .size = size, .value0 = flags_before});
+				    {.address = write_address, .size = write_size, .value0 = flags_before});
 			}
 			continue;
 		}

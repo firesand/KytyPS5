@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
+#include "graphics/host_gpu/writeWatch.h"
 
 #include <atomic>
 #include <cstdlib>
@@ -120,9 +121,13 @@ public:
 
 	// Hot pages: the CPU writes them again and again (one write fault per page per sync point).
 	// After KYTY_HOT_PAGE_FAULTS faults (default 8, 0 disables) a page stays CPU-dirty and
-	// writable; every synchronization re-uploads it instead of re-protecting it.
+	// writable; every synchronization re-uploads it instead of re-protecting it. Off under kernel
+	// write-watch: writes cost no fault there, and a collection names exactly the written pages.
 	static uint32_t HotPageFaultThreshold() {
 		static const uint32_t threshold = [] {
+			if (WriteWatch::Get() != nullptr) {
+				return 0u;
+			}
 			const char* value = std::getenv("KYTY_HOT_PAGE_FAULTS");
 			return value != nullptr ? static_cast<uint32_t>(std::atoi(value)) : 8u;
 		}();
@@ -162,6 +167,29 @@ public:
 		limit      = std::min<size_t>(limit, m_gpu_dirty.FirstRangeFrom(end).first);
 		const auto new_end = std::max(end, limit);
 		return new_end * TRACKER_PAGE_SIZE - (vaddr - m_cpu_addr);
+	}
+
+	// Kernel write-watch: CPU writes collected after they happened. Pages that are not GPU-dirty
+	// become CPU-dirty, as a write fault would have made them; GPU-dirty runs go to
+	// gpu_part(vaddr, size) because they need a download first. Caller holds `lock`.
+	template <typename Func>
+	void MarkCpuWrittenUnlessGpu(uint64_t vaddr, uint64_t size, Func&& gpu_part) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		for (size_t page = start; page < end;) {
+			const bool gpu     = m_gpu_dirty.Get(page);
+			size_t     run_end = page + 1;
+			while (run_end < end && m_gpu_dirty.Get(run_end) == gpu) {
+				++run_end;
+			}
+			const auto address = m_cpu_addr + page * TRACKER_PAGE_SIZE;
+			const auto bytes   = (run_end - page) * TRACKER_PAGE_SIZE;
+			if (gpu) {
+				gpu_part(address, bytes);
+			} else {
+				ChangeState<DirtySource::Cpu, true>(address, bytes);
+			}
+			page = run_end;
+		}
 	}
 
 	template <DirtySource source, bool enable>

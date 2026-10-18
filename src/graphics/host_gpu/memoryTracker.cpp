@@ -2,6 +2,10 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "graphics/host_gpu/writeWatch.h"
+
+#include <utility>
+#include <vector>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
@@ -161,6 +165,42 @@ void MemoryTracker::UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 		std::scoped_lock lock(manager->lock);
 		manager->ChangeState<DirtySource::Gpu, false>(manager->GetCpuAddr() + offset, bytes);
 	});
+}
+
+void MemoryTracker::CollectWrittenPages(uint64_t vaddr, uint64_t size,
+                                        const std::function<void(uint64_t, uint64_t)>& func) {
+	auto* write_watch = WriteWatch::Get();
+	if (write_watch == nullptr) {
+		return;
+	}
+	CheckNotInUploadCallback();
+	const auto collect = [&](uint64_t start, uint64_t bytes) {
+		write_watch->Collect(start, bytes, [&](uint64_t run, uint64_t run_size) {
+			m_page_manager.ForEachWriteWatchedRun(run, run_size, func);
+		});
+	};
+	if (size == 0) {
+		m_page_manager.ForEachWriteWatchedSpan(collect);
+	} else {
+		collect(vaddr, size);
+	}
+}
+
+void MemoryTracker::MarkCpuWrittenUnlessGpuModified(
+    uint64_t vaddr, uint64_t size, const std::function<void(uint64_t, uint64_t)>& gpu_part) {
+	CheckNotInUploadCallback();
+	NoteCpuWriteFault();
+	std::vector<std::pair<uint64_t, uint64_t>> gpu_parts;
+	Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		std::scoped_lock lock(manager->lock);
+		manager->MarkCpuWrittenUnlessGpu(manager->GetCpuAddr() + offset, bytes,
+		                                 [&](uint64_t address, uint64_t run) {
+			                                 gpu_parts.emplace_back(address, run);
+		                                 });
+	});
+	for (const auto& [address, bytes]: gpu_parts) {
+		gpu_part(address, bytes);
+	}
 }
 
 void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {

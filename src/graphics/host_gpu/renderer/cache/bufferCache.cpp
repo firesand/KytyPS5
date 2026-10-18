@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/host_gpu/writeWatch.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -644,6 +645,11 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
+	if (is_written) {
+		// The GPU takes ownership of the range below: CPU writes not collected yet must reach the
+		// upload first, as faulted ones would have (kernel write-watch).
+		CollectCpuWritesInline(vaddr, size);
+	}
 	if (!is_written && !is_texel_buffer) {
 		const uint64_t current_epoch  = m_scheduler.Context().BdaSyncEpoch();
 		const uint64_t current_faults = m_memory_tracker.CpuWriteFaultCount();
@@ -913,8 +919,9 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
 	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size) &&
 	    !m_texture_cache.HasGpuOwnedImageIn(dst_vaddr, size)) {
-		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
-		            size);
+		// RenderContext::StoreGuestMemory: the tracker learns of the store at once, as from a write
+		// fault, and kernel write-watch does not mistake it for a guest CPU write.
+		m_scheduler.Context().StoreGuestMemory(dst_vaddr, reinterpret_cast<const void*>(src_vaddr), size);
 		return;
 	}
 
@@ -1071,10 +1078,67 @@ void BufferCache::OnCommandBoundary() {
 	FlushWriteFaults(false);
 	DrainPendingGpuModified();
 	PublishPendingTextureInvalidations();
+	if (HasPendingCpuWrites()) {
+		m_scheduler.Context().ApplyPendingCpuWrites();
+	}
+}
+
+void BufferCache::CollectCpuWritesInline(uint64_t vaddr, uint64_t size) {
+	if (WriteWatch::Get() == nullptr) {
+		return;
+	}
+	m_memory_tracker.CollectWrittenPages(
+	    vaddr, size, [this](uint64_t start, uint64_t bytes) { CollectCpuWritesApply(start, bytes); });
+}
+
+void BufferCache::CollectCpuWritesApply(uint64_t vaddr, uint64_t size) {
+	const auto queue = [this](uint64_t address, uint64_t length, bool texture_only) {
+		std::lock_guard lock(m_pending_cpu_writes_mutex);
+		m_pending_cpu_writes.push_back({address, length, texture_only});
+		m_has_pending_cpu_writes.store(true, std::memory_order_release);
+	};
+	m_memory_tracker.MarkCpuWrittenUnlessGpuModified(
+	    vaddr, size, [&](uint64_t gpu_start, uint64_t gpu_bytes) { queue(gpu_start, gpu_bytes, false); });
+	queue(vaddr, size, true);
+}
+
+std::vector<BufferCache::PendingCpuWrite> BufferCache::TakePendingCpuWrites() {
+	std::vector<PendingCpuWrite> pending;
+	std::lock_guard              lock(m_pending_cpu_writes_mutex);
+	pending.swap(m_pending_cpu_writes);
+	m_has_pending_cpu_writes.store(false, std::memory_order_release);
+	return pending;
 }
 
 void BufferCache::MarkPageWritten(uint64_t vaddr) {
+	// A CPU write the kernel recorded but nobody collected yet must win, as a faulted one does.
+	CollectCpuWritesInline(vaddr, WRITE_FAULT_PAGESIZE);
 	if (m_memory_tracker.TryMarkRegionAsGpuModified(vaddr, WRITE_FAULT_PAGESIZE)) {
+		// Kernel write-watch: a CPU write between that collection and the read protection the mark
+		// just applied predates the GPU's ownership; it must win too, not be downloaded over.
+		if (WriteWatch::Get() != nullptr) {
+			RangeSet written;
+			m_memory_tracker.CollectWrittenPages(
+			    vaddr, WRITE_FAULT_PAGESIZE,
+			    [&](uint64_t start, uint64_t bytes) { written.Add(start, bytes); });
+			if (!written.Empty()) {
+				// The CPU wins the pages it wrote; the GPU keeps the rest of the fault page.
+				RangeSet gpu;
+				gpu.Add(vaddr, WRITE_FAULT_PAGESIZE);
+				written.ForEach([&](uint64_t start, uint64_t end) {
+					m_memory_tracker.UnmarkRegionAsGpuModified(start, end - start);
+					CollectCpuWritesApply(start, end - start);
+					gpu.Subtract(start, end - start);
+				});
+				gpu.ForEach([&](uint64_t start, uint64_t end) { QueueGpuModified(start, end - start); });
+				static std::atomic<uint32_t> reported {0};
+				if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+					LOGF("BufferCache: CPU write in the marking window of 0x%016" PRIx64 " kept CPU data\n",
+					     vaddr);
+				}
+				return;
+			}
+		}
 		QueueGpuModified(vaddr, WRITE_FAULT_PAGESIZE);
 		return;
 	}
@@ -1097,6 +1161,7 @@ void BufferCache::MarkWriteFaultOverflow() {
 		for (auto address = start; address < end;) {
 			const auto region_end = std::min(end, Common::AlignDown(address, TRACKER_REGION_SIZE) +
 			                                          TRACKER_REGION_SIZE);
+			CollectCpuWritesInline(address, region_end - address);
 			if (m_memory_tracker.TryMarkRegionAsGpuModified(address, region_end - address)) {
 				QueueGpuModified(address, region_end - address);
 			}

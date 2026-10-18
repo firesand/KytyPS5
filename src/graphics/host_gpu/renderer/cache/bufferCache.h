@@ -22,6 +22,7 @@
 #include <unordered_map>
 #include <string>
 #include <atomic>
+#include <functional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -186,6 +187,29 @@ public:
 	void NoteSubmitAhead(uint64_t writer);
 	void MarkPageWritten(uint64_t vaddr);      // any thread (fault-processing operation)
 	void MarkWriteFaultOverflow();             // any thread
+	// Kernel write-watch (writeWatch.h; no-op without it). CPU writes the kernel recorded in
+	// [vaddr, vaddr + size), collected where a full write-fault replay is not allowed (inside cache
+	// operations, GPU completions): the tracker part is applied at once (non-GPU-dirty pages become
+	// CPU-dirty), the texture part and GPU-dirty pages are queued for RenderContext's next
+	// collection or command boundary. Any thread. Called before the GPU takes ownership of a range,
+	// so a CPU write made before it still wins (or reaches the upload) as a faulted one would.
+	void CollectCpuWritesInline(uint64_t vaddr, uint64_t size);
+	// Applies one collected run the inline way (tracker now, texture part and GPU-dirty pages queued).
+	void CollectCpuWritesApply(uint64_t vaddr, uint64_t size);
+	struct PendingCpuWrite {
+		uint64_t vaddr        = 0;
+		uint64_t size         = 0;
+		bool     texture_only = false; // the buffer tracker part was applied inline
+	};
+	[[nodiscard]] bool HasPendingCpuWrites() const noexcept {
+		return m_has_pending_cpu_writes.load(std::memory_order_acquire);
+	}
+	[[nodiscard]] std::vector<PendingCpuWrite> TakePendingCpuWrites();
+	// See MemoryTracker::CollectWrittenPages.
+	void CollectWrittenPages(uint64_t vaddr, uint64_t size,
+	                         const std::function<void(uint64_t, uint64_t)>& func) {
+		m_memory_tracker.CollectWrittenPages(vaddr, size, func);
+	}
 	// Safe point between PM4 packets / at garbage collection: records the pending write-fault
 	// pass, publishes marked pages and deferred texture invalidations.
 	void OnCommandBoundary();
@@ -356,6 +380,9 @@ private:
 	uint64_t                                          m_last_upload_bytes = 0;
 	uint64_t                                          m_last_upload_pages = 0;
 	std::atomic<bool>                                 m_has_pending_gpu_modified {false};
+	std::mutex                                        m_pending_cpu_writes_mutex;
+	std::vector<PendingCpuWrite>                      m_pending_cpu_writes;
+	std::atomic<bool>                                 m_has_pending_cpu_writes {false};
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;

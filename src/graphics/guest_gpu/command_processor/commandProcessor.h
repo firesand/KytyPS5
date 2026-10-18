@@ -138,8 +138,15 @@ public:
 	void WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes);
 	// Publishes pending unbounded-descriptor GPU writes before the host reads guest memory.
 	void PrepareHostRead(uint64_t vaddr, uint64_t size);
-	// A WAIT_REG_MEM / conditional-IB compare passed without suspending (see RenderContext).
-	void NoteGuestAcquire() { m_renderer.NoteGuestAcquire(); }
+	// A WAIT_REG_MEM / conditional-IB compare passed without suspending (see RenderContext):
+	// label_vaddr/label_size is the guest memory it read (0: no memory, e.g. ACQUIRE_MEM).
+	void NoteGuestAcquire(uint64_t label_vaddr = 0, uint64_t label_size = 0) {
+		m_renderer.NoteGuestAcquire(label_vaddr, label_size);
+	}
+	// Host-side stores to guest memory (see RenderContext::StoreGuestMemory).
+	void StoreGuestMemory(uint64_t vaddr, const void* data, uint64_t size) {
+		m_renderer.StoreGuestMemory(vaddr, data, size);
+	}
 	// A host read of GPU-built guest bytes came back implausible (not a PM4 header, a register
 	// offset out of range): land every unbounded GPU write recorded so far and let the tracker
 	// protect the pages; the caller reads the bytes again afterwards.

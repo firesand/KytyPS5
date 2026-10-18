@@ -4,6 +4,7 @@
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/gpuWriteTicks.h"
+#include "graphics/host_gpu/writeWatch.h"
 
 #include <algorithm>
 #include <functional>
@@ -1609,10 +1610,294 @@ void TestFusedCpuNotGpuQuery() {
   Release(memory);
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+// Kernel write-watch (FPS Stage 1): views of a memfd registered with userfaultfd async
+// write-protect, as GuestBackingStore::MapView does. CPU writes reach the tracker only through
+// CollectWrittenPages. Runs in a child process (--write-watch): KYTY_WRITE_WATCH is read once and
+// turns hot pages off for the whole process.
+using Libs::Graphics::TRACKER_PAGE_SIZE;
+using Libs::Graphics::WriteWatch;
+
+struct WriteWatchView {
+  int fd = -1;
+  uint8_t *memory = nullptr;
+  uint64_t size = 0;
+  [[nodiscard]] uint64_t Address() const { return reinterpret_cast<uint64_t>(memory); }
+};
+
+WriteWatchView MapWriteWatchView(uint64_t pages) {
+  WriteWatchView view;
+  view.size = pages * TRACKER_PAGE_SIZE;
+  view.fd = ::memfd_create("WriteWatchTest", MFD_CLOEXEC);
+  Check(view.fd >= 0 && ::ftruncate(view.fd, static_cast<off_t>(view.size)) == 0,
+        "memfd creation failed");
+  // A fixed guest-range placeholder, then the shared view over it.
+  view.memory = AllocateFixedGuestRange(view.size, 0x40000);
+  Check(::mmap(view.memory, view.size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, view.fd,
+               0) == view.memory,
+        "memfd view mapping failed");
+  WriteWatch::Get()->RegisterView(view.Address(), view.size);
+  Check(WriteWatch::Get()->IsCovered(view.Address(), view.size), "view was not registered");
+  return view;
+}
+
+void UnmapWriteWatchView(WriteWatchView &view) {
+  WriteWatch::Get()->UnregisterView(view.Address(), view.size);
+  Release(view.memory);
+  ::close(view.fd);
+}
+
+// RenderContext::CollectCpuWrites without the texture cache: each collected run is applied as the
+// write fault it replaces. Returns the pages collected.
+uint64_t CollectAndApply(MemoryTracker &tracker, uint64_t vaddr, uint64_t size) {
+  uint64_t pages = 0;
+  tracker.CollectWrittenPages(vaddr, size, [&](uint64_t start, uint64_t bytes) {
+    pages += bytes / TRACKER_PAGE_SIZE;
+    tracker.InvalidateWriteFault(start, bytes, [] { Check(false, "unexpected GPU download"); });
+  });
+  return pages;
+}
+
+void UploadAll(MemoryTracker &tracker, uint64_t vaddr, uint64_t size) {
+  tracker.ForEachUploadRange(vaddr, size, false, [](uint64_t, uint64_t, const void *) noexcept {},
+                             []() noexcept {});
+}
+
+void TestWriteWatchCollectsWithoutWriteProtection() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  constexpr uint64_t page = TRACKER_PAGE_SIZE;
+  auto view = MapWriteWatchView(8);
+  const auto address = view.Address();
+  Check(tracker.IsRegionCpuModified(address, view.size), "new region was not CPU dirty");
+  ResetProtectionLog();
+  UploadAll(tracker, address, view.size);
+  Check(!tracker.IsRegionCpuModified(address, view.size), "upload left CPU-dirty pages");
+  Check(g_protection_calls == 0 && IsWritable(view.memory + 3 * page),
+        "a write-watched view was write-protected");
+
+  // Plain stores: no fault, recorded by the kernel only.
+  view.memory[3 * page + 5] = 1;
+  view.memory[6 * page] = 2;
+  Check(!tracker.IsRegionCpuModified(address, view.size),
+        "a CPU write reached the tracker before its collection");
+  Check(CollectAndApply(tracker, address, view.size) == 2,
+        "collection did not report exactly the two written pages");
+  Check(tracker.IsRegionCpuModified(address + 3 * page, page) &&
+            tracker.IsRegionCpuModified(address + 6 * page, page) &&
+            !tracker.IsRegionCpuModified(address, 3 * page) &&
+            !tracker.IsRegionCpuModified(address + 4 * page, 2 * page),
+        "collected writes did not mark exactly their pages CPU-dirty");
+  Check(CollectAndApply(tracker, address, view.size) == 0,
+        "a second collection reported pages again");
+
+  // Whole-tracker collection (size 0) walks the spans that hold write-watched pages.
+  UploadAll(tracker, address, view.size);
+  view.memory[page] = 3;
+  Check(CollectAndApply(tracker, 0, 0) == 1 && tracker.IsRegionCpuModified(address + page, page),
+        "span collection missed a write");
+  Check(g_protection_calls == 0, "write-watch transitions called mprotect");
+
+  tracker.UntrackMemory(address, view.size);
+  UnmapWriteWatchView(view);
+}
+
+void TestWriteWatchWriteBetweenScanAndUpload() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  constexpr uint64_t page = TRACKER_PAGE_SIZE;
+  auto view = MapWriteWatchView(4);
+  const auto address = view.Address();
+  UploadAll(tracker, address, view.size);
+
+  view.memory[2 * page] = 1;
+  Check(CollectAndApply(tracker, address, view.size) == 1, "first write was not collected");
+  // The scan re-protected the page; the guest writes it again while its upload copies it.
+  bool wrote = false;
+  tracker.ForEachUploadRange(
+      address, view.size, false,
+      [&](uint64_t start, uint64_t bytes, const void *) noexcept {
+        if (start <= address + 2 * page && address + 2 * page < start + bytes) {
+          view.memory[2 * page + 7] = 9;
+          wrote = true;
+        }
+      },
+      []() noexcept {});
+  Check(wrote && !tracker.IsRegionCpuModified(address, view.size),
+        "the upload did not consume the collected page");
+  Check(CollectAndApply(tracker, address, view.size) == 1 &&
+            tracker.IsRegionCpuModified(address + 2 * page, page),
+        "a write between scan and upload was lost");
+
+  tracker.UntrackMemory(address, view.size);
+  UnmapWriteWatchView(view);
+}
+
+void TestWriteWatchCpuWriteWinsOverGpuMark() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  constexpr uint64_t page = TRACKER_PAGE_SIZE;
+  auto view = MapWriteWatchView(8);
+  const auto address = view.Address();
+  UploadAll(tracker, address, view.size);
+  std::vector<std::pair<uint64_t, uint64_t>> gpu_parts;
+  // BufferCache::CollectCpuWritesInline: what MarkPageWritten does before TryMark.
+  const auto collect_inline = [&](uint64_t vaddr, uint64_t size) {
+    tracker.CollectWrittenPages(vaddr, size, [&](uint64_t start, uint64_t bytes) {
+      tracker.MarkCpuWrittenUnlessGpuModified(start, bytes, [&](uint64_t gpu, uint64_t length) {
+        gpu_parts.emplace_back(gpu, length);
+      });
+    });
+  };
+
+  // An uncollected CPU write wins over a later GPU write-fault mark, as a faulted one does.
+  view.memory[4 * page] = 1;
+  collect_inline(address + 4 * page, page);
+  Check(gpu_parts.empty() && tracker.IsRegionCpuModified(address + 4 * page, page),
+        "inline collection did not mark the written page CPU-dirty");
+  Check(!tracker.TryMarkRegionAsGpuModified(address + 4 * page, page),
+        "a GPU mark won over an earlier CPU write");
+
+  // Without a CPU write the GPU takes the page, and read protection still applies.
+  collect_inline(address + 5 * page, page);
+  Check(tracker.TryMarkRegionAsGpuModified(address + 5 * page, page),
+        "GPU mark of an unwritten page failed");
+  Check(Protection(view.memory + 5 * page) == PAGE_NOACCESS,
+        "a GPU-owned page lost its read protection under write-watch");
+
+  // A CPU write that landed after the collection but before the mark's read protection.
+  view.memory[6 * page] = 1;
+  Check(tracker.TryMarkRegionAsGpuModified(address + 6 * page, page),
+        "GPU mark in the window failed");
+  // BufferCache::MarkPageWritten verifies after marking: the write predates the GPU's ownership,
+  // so the mark is undone and the CPU wins.
+  std::vector<std::pair<uint64_t, uint64_t>> written;
+  tracker.CollectWrittenPages(address + 6 * page, page, [&](uint64_t start, uint64_t bytes) {
+    written.emplace_back(start, bytes);
+  });
+  Check(written.size() == 1 && written[0].first == address + 6 * page,
+        "the verify collection after the GPU mark missed the window write");
+  tracker.UnmarkRegionAsGpuModified(address + 6 * page, page);
+  for (const auto &[start, bytes] : written) {
+    tracker.MarkCpuWrittenUnlessGpuModified(start, bytes, [&](uint64_t gpu, uint64_t length) {
+      gpu_parts.emplace_back(gpu, length);
+    });
+  }
+  Check(gpu_parts.empty() && tracker.IsRegionCpuModified(address + 6 * page, page) &&
+            !tracker.IsRegionGpuModified(address + 6 * page, page) && IsWritable(view.memory + 6 * page),
+        "the CPU write in the marking window did not win");
+
+  // Without the verify step the same write comes back as a GPU part (download first).
+  view.memory[7 * page] = 1;
+  Check(tracker.TryMarkRegionAsGpuModified(address + 7 * page, page), "GPU mark of page 7 failed");
+  collect_inline(address + 7 * page, page);
+  Check(gpu_parts.size() == 1 && gpu_parts[0].first == address + 7 * page &&
+            tracker.IsRegionGpuModified(address + 7 * page, page) &&
+            !tracker.IsRegionCpuModified(address + 7 * page, page),
+        "a write under a GPU-owned page was not handed back as a GPU part");
+
+  tracker.UnmarkRegionAsGpuModified(address + 5 * page, page);
+  tracker.UnmarkRegionAsGpuModified(address + 7 * page, page);
+  tracker.UntrackMemory(address, view.size);
+  UnmapWriteWatchView(view);
+}
+
+// Anonymous guest memory (flexible commits) is never registered: it keeps mprotect tracking.
+void TestWriteWatchUncoveredMemoryKeepsProtection() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  constexpr uint64_t page = TRACKER_PAGE_SIZE;
+  auto *memory = Allocate(harness.page_manager, 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  Check(!WriteWatch::Get()->IsCovered(address, page), "anonymous memory counted as covered");
+  Check(tracker.IsRegionCpuModified(address, 2 * page), "new region was not CPU dirty");
+  UploadAll(tracker, address, 2 * page);
+  Check(Protection(memory) == PAGE_READONLY && Protection(memory + page) == PAGE_READONLY,
+        "an uncovered page was not write-protected");
+  tracker.UntrackMemory(address, 2 * page);
+  Check(IsWritable(memory), "untracking left an uncovered page protected");
+  Release(memory);
+}
+
+// A page written while nobody watched it (CPU-dirty, or no buffer over it yet) is re-protected
+// when it gains its first write watcher: the old write is no news, as under mprotect.
+void TestWriteWatchFirstWatcherDropsOldWrites() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  constexpr uint64_t page = TRACKER_PAGE_SIZE;
+  auto view = MapWriteWatchView(4);
+  const auto address = view.Address();
+  Check(tracker.IsRegionCpuModified(address, view.size), "new region was not CPU dirty");
+  view.memory[2 * page] = 7; // CPU-dirty page: no watcher yet
+  ResetProtectionLog();
+  UploadAll(tracker, address, view.size);
+  Check(g_protection_calls == 0, "re-arming a first watcher fell back to mprotect");
+  Check(CollectAndApply(tracker, address, view.size) == 0,
+        "a write from before the page was watched came back as a new one");
+  Check(tracker.TryMarkRegionAsGpuModified(address + 2 * page, page),
+        "a stale write blocked a later GPU mark");
+  tracker.UnmarkRegionAsGpuModified(address + 2 * page, page);
+  tracker.UntrackMemory(address, view.size);
+  UnmapWriteWatchView(view);
+}
+
+void TestWriteWatchLabels() {
+  auto *write_watch = WriteWatch::Get();
+  constexpr uint64_t page = TRACKER_PAGE_SIZE;
+  auto view = MapWriteWatchView(4);
+  const auto label = view.Address() + page + 8;
+  Check(write_watch->WasLabelWritten(label, 8), "an unknown label must count as written");
+  write_watch->CollectLabels([](uint64_t, uint64_t) {});
+  Check(!write_watch->WasLabelWritten(label, 8), "an unwritten collected label counted as written");
+  *reinterpret_cast<volatile uint64_t *>(label) = 1;
+  Check(write_watch->WasLabelWritten(label, 8), "a label write after collection was missed");
+  // Another collection re-protects the label page; the label must still read as written.
+  write_watch->Collect(view.Address(), view.size, [](uint64_t, uint64_t) {});
+  Check(write_watch->WasLabelWritten(label, 8), "re-protecting the label page hid its write");
+  write_watch->CollectLabels([](uint64_t, uint64_t) {});
+  Check(!write_watch->WasLabelWritten(label, 8), "CollectLabels did not reset the label");
+  UnmapWriteWatchView(view);
+  Check(write_watch->WasLabelWritten(label, 8), "a label in an unregistered range must count as written");
+}
+
+void RunWriteWatchCases() {
+  setenv("KYTY_WRITE_WATCH", "1", 1);
+  if (WriteWatch::Get() == nullptr) {
+    std::puts("MemoryTrackerTests: write-watch cases skipped (no userfaultfd WP_ASYNC / PAGEMAP_SCAN)");
+    std::exit(0);
+  }
+  TestWriteWatchCollectsWithoutWriteProtection();
+  TestWriteWatchWriteBetweenScanAndUpload();
+  TestWriteWatchCpuWriteWinsOverGpuMark();
+  TestWriteWatchUncoveredMemoryKeepsProtection();
+  TestWriteWatchFirstWatcherDropsOldWrites();
+  TestWriteWatchLabels();
+  std::puts("MemoryTrackerTests: write-watch cases passed");
+  std::exit(0);
+}
+
+void TestWriteWatchInChildProcess() {
+  const pid_t pid = ::fork();
+  Check(pid >= 0, "fork failed");
+  if (pid == 0) {
+    ::execl("/proc/self/exe", "MemoryTrackerTests", "--write-watch", nullptr);
+    std::_Exit(0x7e);
+  }
+  int status = 0;
+  Check(::waitpid(pid, &status, 0) == pid, "waitpid failed");
+  Check(WIFEXITED(status) && WEXITSTATUS(status) == 0, "write-watch cases failed");
+}
+#endif
+
 int main(int argc, char **argv) {
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
   }
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+  if (argc == 2 && std::strcmp(argv[1], "--write-watch") == 0) {
+    RunWriteWatchCases();
+  }
+#endif
   if (argc == 2 && std::strcmp(argv[1], "--benchmark-clean-upload") == 0) {
     BenchmarkCleanUploads();
     return 0;
@@ -1644,6 +1929,7 @@ int main(int argc, char **argv) {
   TestFatalPaths();
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
   TestFaultOnProtectedStack();
+  TestWriteWatchInChildProcess();
 #endif
   std::puts("MemoryTrackerTests: all cases passed");
   return 0;

@@ -14,6 +14,7 @@
 #include <utility>
 #include <vector>
 #include <cstdlib>
+#include <functional>
 
 namespace Libs::Graphics {
 
@@ -36,6 +37,21 @@ public:
 	[[nodiscard]] bool TryMarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
+	// Kernel write-watch (writeWatch.h; no-op without it). Collects, re-protecting them in the
+	// kernel, the pages of [vaddr, vaddr + size) written since their last collection that carry
+	// write watchers, the pages a CPU write would have faulted on: func(vaddr, size). size == 0
+	// collects every region span holding write-watched pages. Any thread; func runs with no
+	// tracker or PageManager lock held, and must apply every run (WriteWatch's invariant). The
+	// scan also re-protects written pages the filter drops; that is safe: a page without write
+	// watchers is CPU-dirty already (its next upload copies the current bytes) or watched by no
+	// one, and gaining its first watcher re-protects it anyway (PageManager).
+	void CollectWrittenPages(uint64_t vaddr, uint64_t size,
+	                         const std::function<void(uint64_t, uint64_t)>& func);
+	// Applies collected CPU writes without a download (safe inside cache operations and GPU
+	// completions): pages that are not GPU-dirty become CPU-dirty; GPU-dirty runs go to
+	// gpu_part(vaddr, size) and need a full write-fault replay at a GPU-thread safe point.
+	void MarkCpuWrittenUnlessGpuModified(uint64_t vaddr, uint64_t size,
+	                                     const std::function<void(uint64_t, uint64_t)>& gpu_part);
 	// A buffer was created or destroyed over the range: hot-page hashes no longer describe its
 	// GPU copy. Called from the GPU thread.
 	void InvalidatePageHashes(uint64_t vaddr, uint64_t size);

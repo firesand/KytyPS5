@@ -1352,12 +1352,13 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 	                                                 (static_cast<uint64_t>(buffer[2]) << 32u));
 
 	if (dst != nullptr && buffer_size != 0) {
-		memset(dst, 0, buffer_size);
+		std::vector<uint8_t> stats(buffer_size, 0);
 		// Hack?
 		if (buffer_size >= sizeof(uint32_t)) {
-			auto* label = static_cast<uint32_t*>(dst);
-			*label      = 1;
+			const uint32_t label = 1;
+			std::memcpy(stats.data(), &label, sizeof(label));
 		}
+		cp.StoreGuestMemory(reinterpret_cast<uint64_t>(dst), stats.data(), stats.size());
 	}
 
 	return 4;
@@ -1444,7 +1445,7 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 
 	cp.PrepareHostRead(addr, sizeof(uint32_t));
 	const bool skip = *reinterpret_cast<const volatile uint32_t*>(addr) == 0;
-	cp.NoteGuestAcquire(); // the label read is an acquire point on both outcomes
+	cp.NoteGuestAcquire(addr, sizeof(uint32_t)); // the label read is an acquire point on both outcomes
 	if (skip) {
 		return payload_dw + exec_count;
 	}
@@ -1482,7 +1483,8 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	cp.PrepareHostRead(reinterpret_cast<uint64_t>(compare_addr), sizeof(uint64_t));
 	const bool take_then = TestWaitRegMemValue(*compare_addr, reference, mask, function);
 	if (function != 0) {
-		cp.NoteGuestAcquire(); // the compare observed the label, whichever branch is taken
+		// the compare observed the label, whichever branch is taken
+		cp.NoteGuestAcquire(reinterpret_cast<uint64_t>(compare_addr), sizeof(uint64_t));
 	}
 	if (::Log::VerboseEnabled()) LOGF("\t branch: take=%u then=0x%016" PRIx64 "/%" PRIu32 " else=0x%016" PRIx64 "/%" PRIu32 "\n",
 	     take_then ? 1u : 0u, reinterpret_cast<uint64_t>(then_buffer), then_num_dw,

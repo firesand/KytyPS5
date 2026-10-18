@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
+#include <functional>
 #include <memory>
 #include <utility>
 
@@ -27,6 +28,16 @@ public:
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);
 	template <bool track, bool is_read = false>
 	void UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask);
+
+	// Kernel write-watch (writeWatch.h): pages inside registered guest views keep write access
+	// whatever their write watchers; read watchers still protect them.
+	// Spans of tracker regions that hold write-watched pages, adjacent regions merged:
+	// func(vaddr, size). Any thread; func runs with no PageManager lock held.
+	void ForEachWriteWatchedSpan(const std::function<void(uint64_t, uint64_t)>& func) const;
+	// Runs of pages in [vaddr, vaddr + size) with write watchers, the pages a CPU write would have
+	// faulted on without write-watch: func(vaddr, size). Any thread; no lock held in func.
+	void ForEachWriteWatchedRun(uint64_t vaddr, uint64_t size,
+	                            const std::function<void(uint64_t, uint64_t)>& func) const;
 
 private:
 	struct Impl;

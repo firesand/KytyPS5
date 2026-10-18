@@ -773,12 +773,24 @@ private:
 			SetFailure(failure_reason, FailureReason::FixedMapViewFailed);
 			return nullptr;
 		}
+		// Kernel write-watch: CPU writes through this view are recorded without faults. The
+		// backing alias (m_backing_base) stays unregistered: its writes are the emulator's GPU
+		// readbacks, never guest CPU writes.
+		if (ptr == reinterpret_cast<void*>(vaddr)) {
+			if (auto* write_watch = Libs::Graphics::WriteWatch::Get(); write_watch != nullptr) {
+				write_watch->RegisterView(vaddr, size);
+			}
+		}
 		return ptr;
 	}
 
 	// Replace the file view atomically instead of exposing an unmapped hole in the
 	// process-lifetime guest reservation.
 	static bool UnmapViewPreservePlaceholder(void* vaddr, uint64_t size) {
+		// Stop write-watch scans first: the placeholder is not registered (a scan would fail).
+		if (auto* write_watch = Libs::Graphics::WriteWatch::Get(); write_watch != nullptr) {
+			write_watch->UnregisterView(reinterpret_cast<uint64_t>(vaddr), size);
+		}
 		void* ptr = mmap(vaddr, size, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
 		return ptr != MAP_FAILED && ptr == vaddr;
 	}

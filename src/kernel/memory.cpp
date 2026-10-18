@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/hostReadStats.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/writeWatch.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 

@@ -373,7 +373,7 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	} else if (func != 0) {
 		// The resume path of a suspended wait starts a new epoch; a wait that passes does not.
 		// func 0 ("always") observes no value, so it is not an acquire.
-		NoteGuestAcquire();
+		NoteGuestAcquire(reinterpret_cast<uint64_t>(addr), sizeof(T));
 	}
 }
 
@@ -399,12 +399,15 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		return;
 	}
 
+	// Through RenderContext::StoreGuestMemory: the tracker learns of the store at once, as from the
+	// write fault of a direct store, and kernel write-watch does not mistake it for a guest write.
 	if (write_one_address) {
 		for (uint32_t i = 0; i < dw_num; i++) {
-			dst[0] = src[i];
+			m_renderer.StoreGuestMemory(reinterpret_cast<uint64_t>(dst), &src[i], sizeof(uint32_t));
 		}
 	} else {
-		memcpy(dst, src, static_cast<size_t>(dw_num) * sizeof(uint32_t));
+		m_renderer.StoreGuestMemory(reinterpret_cast<uint64_t>(dst), src,
+		                            static_cast<uint64_t>(dw_num) * sizeof(uint32_t));
 	}
 }
 
@@ -415,7 +418,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 		     num_bytes);
 	}
 	const auto value = Sync::ReadReferenceClock();
-	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
+	m_renderer.StoreGuestMemory(dst_address, &value, num_bytes); // little-endian low bytes
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
 		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64
@@ -517,6 +520,9 @@ void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(!m_accepting);
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
+	// The guest's CPU writes made before this submission must be collected before it executes
+	// (kernel write-watch; RenderContext::BeginCommandStream).
+	m_renderer.NoteGuestSubmit();
 	m_work_available.Signal();
 }
 
@@ -728,6 +734,9 @@ bool GuestGpu::Process(Submission& submission) {
 			break;
 		}
 		case SubmissionType::FlipPreparation:
+			// A CPU flip presents guest memory without a command stream: CPU writes to the surface
+			// must reach the texture cache first (kernel write-watch).
+			m_renderer.CollectSubmittedCpuWrites();
 			m_renderer.NoteFrameBoundary();
 			m_renderer.RunGarbageCollector();
 			cp.PrepareCpuFlip(submission.flip_request_id);
@@ -906,6 +915,8 @@ void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands,
 					std::vector<uint32_t> restored(commands.size());
 					const bool have_copy =
 					    cache.PeekDeviceCopy(address, restored.data(), commands.size_bytes());
+					// Kernel write-watch: CPU writes to the page reach the tracker only when collected.
+					(void)m_renderer.CollectCpuWrites(address, commands.size_bytes());
 					const bool cpu_dirty = cache.IsRegionCpuModified(address, commands.size_bytes());
 					const bool stream    = have_copy && LooksLikePm4Stream(restored);
 					// Experimental (KYTY_STALE_IB_RECOVER=1): a valid-looking stream in VRAM proves
@@ -1112,7 +1123,8 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 						           0, 16u * 2u * sizeof(uint64_t));
 					} else {
 						m_predicate_skip = false;
-						NoteGuestAcquire();
+						NoteGuestAcquire(reinterpret_cast<uint64_t>(address),
+						                 16u * 2u * sizeof(uint64_t));
 					}
 					return;
 				}
@@ -1131,7 +1143,8 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		default: EXIT("unknown predication op: 0x%08" PRIx32 "\n", op);
 	}
 	// The command processor read the result: acquire point for later BDA / unbounded consumers.
-	NoteGuestAcquire();
+	NoteGuestAcquire(reinterpret_cast<uint64_t>(address),
+	                 op == 0x01 ? 16u * 2u * sizeof(uint64_t) : sizeof(uint64_t));
 	switch (condition) {
 		case 0x00: m_predicate_skip = (value != 0); break;
 		case 0x01: m_predicate_skip = (value == 0); break;
@@ -1751,7 +1764,7 @@ bool CommandProcessor::WriteEopLabel(T* dst, T value, std::function<void()> afte
 	}();
 	auto& cache = m_renderer.GetBufferCache();
 	if (!defer || !cache.HasPendingUnboundedWrites()) {
-		std::memcpy(dst, &value, sizeof(value));
+		m_renderer.StoreGuestMemory(reinterpret_cast<uint64_t>(dst), &value, sizeof(value));
 		return false; // the caller schedules the interrupt as before
 	}
 	cache.FlushWriteFaults(false);
@@ -2094,10 +2107,10 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 			// ready.
 			constexpr uint64_t ready_bit    = 1ull << 63u;
 			constexpr uint64_t counter_mask = ready_bit - 1u;
-			auto*              results      = reinterpret_cast<volatile uint64_t*>(event_address);
+			const uint64_t     results      = event_address;
 			const auto         value        = ready_bit | m_synthetic_occlusion_counter;
 			for (uint32_t db = 0; db < 16u; db++) {
-				results[db * 2u] = value;
+				m_renderer.StoreGuestMemory(results + db * 2u * sizeof(uint64_t), &value, sizeof(value));
 			}
 			m_synthetic_occlusion_counter = (m_synthetic_occlusion_counter + 1u) & counter_mask;
 			break;
@@ -2130,7 +2143,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 		     reinterpret_cast<uint64_t>(dst_gpu_addr), value);
 	}
 
-	std::memcpy(dst_gpu_addr, &value, sizeof(value));
+	m_renderer.StoreGuestMemory(reinterpret_cast<uint64_t>(dst_gpu_addr), &value, sizeof(value));
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
 	Sync::WriteAtEndOfPipeWithFlip32(m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr),
@@ -2155,7 +2168,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	if (eop_event_type != 0x00000004 || cache_action != 0x00000038) {
 		EXIT("unknown event type\n");
 	}
-	std::memcpy(dst_gpu_addr, &value, sizeof(value));
+	m_renderer.StoreGuestMemory(reinterpret_cast<uint64_t>(dst_gpu_addr), &value, sizeof(value));
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
 	Sync::WriteAtEndOfPipeWithInterruptWriteBackFlip32(

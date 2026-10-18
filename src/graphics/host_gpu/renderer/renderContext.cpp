@@ -2,6 +2,7 @@
 
 #include "graphics/host_gpu/hostReadStats.h"
 #include "graphics/host_gpu/renderer/hazardState.h"
+#include "graphics/host_gpu/writeWatch.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -18,6 +19,7 @@
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
@@ -97,6 +99,10 @@ CpuTimes CpuTimes::Read() noexcept {
 }
 
 namespace {
+// Kernel write-watch counters (fault histogram line).
+std::atomic<uint64_t> g_ww_stream_collects {0};
+std::atomic<uint64_t> g_ww_acquire_collects {0};
+std::atomic<uint64_t> g_ww_applied_pages {0};
 struct FaultSampler {
 	static constexpr size_t   Slots = 1u << 16;
 	std::atomic<uint64_t>     entries[Slots] {};
@@ -256,6 +262,15 @@ struct FaultSampler {
 		line += fmt::format(" args-wait-ms={}", reads_all.gpu_indirect_args_wait_ns / 1000000);
 		line += fmt::format(" | wait-pass {} (consumed {}, extra-syncs {}, bytes {})", syncs_all.wait_passes,
 		                    syncs_all.wait_consumed, syncs_all.wait_extra, syncs_all.wait_bytes);
+		if (WriteWatch::Get() != nullptr) {
+			const auto ww = WriteWatch::TakeStats();
+			line += fmt::format(" | write-watch collects {} (stream {} acquire {}) ioctls {} pages {} "
+			                    "applied {} errors {} ms {} labels {}/{}",
+			                    ww.collects, g_ww_stream_collects.exchange(0, std::memory_order_relaxed),
+			                    g_ww_acquire_collects.exchange(0, std::memory_order_relaxed), ww.ioctls,
+			                    ww.pages, g_ww_applied_pages.exchange(0, std::memory_order_relaxed),
+			                    ww.errors, ww.ns / 1000000, ww.label_written, ww.label_checks);
+		}
 		line += fmt::format(" | host-resident binds {} bytes {} KiB fallbacks {}", resident_all.binds,
 		                    resident_all.bytes >> 10, resident_all.fallbacks);
 		// Lazy hazard-tracked barriers (KYTY_LAZY_BARRIERS). Mode 1: per site `emitted/elided`
@@ -429,7 +444,129 @@ void RenderContext::SetSyncOnWaitPassMode(int mode) {
 	SyncOnWaitPassMode().store(mode);
 }
 
-void RenderContext::NoteGuestAcquire() {
+void RenderContext::BeginCommandStream() {
+	++m_bda_sync_epoch;
+	m_wait_pass_pending = false;
+	CollectSubmittedCpuWrites();
+}
+
+void RenderContext::CollectSubmittedCpuWrites() {
+	if (WriteWatch::Get() == nullptr) {
+		return;
+	}
+	const auto submits = m_guest_submits.load(std::memory_order_acquire);
+	if (submits != m_collected_submits) {
+		m_collected_submits = submits;
+		g_ww_stream_collects.fetch_add(1, std::memory_order_relaxed);
+		CollectCpuWrites();
+	} else {
+		ApplyPendingCpuWrites();
+	}
+}
+
+uint64_t RenderContext::ApplyCpuWrite(uint64_t vaddr, uint64_t size, CpuWrite kind) {
+	// HandleFault's write path over a run; only GPU-mapped memory.
+	std::vector<std::pair<uint64_t, uint64_t>> mapped;
+	{
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		m_mapped_ranges.ForEachInRange(vaddr, size,
+		                               [&](uint64_t start, uint64_t end) { mapped.emplace_back(start, end); });
+	}
+	uint64_t pages = 0;
+	for (const auto& [start, end]: mapped) {
+		if (kind != CpuWrite::PagesTextureOnly) {
+			m_buffer_cache.InvalidateWriteFault(start, end - start);
+		}
+		if (kind == CpuWrite::Exact) {
+			m_texture_cache.InvalidateMemory(start, end - start);
+		} else {
+			m_texture_cache.InvalidateCpuWrittenPages(start, end - start);
+		}
+		pages += (end - start + TRACKER_PAGE_SIZE - 1) / TRACKER_PAGE_SIZE;
+	}
+	g_ww_applied_pages.fetch_add(pages, std::memory_order_relaxed);
+	return pages;
+}
+
+uint64_t RenderContext::ApplyPendingCpuWrites() {
+	if (!m_buffer_cache.HasPendingCpuWrites()) {
+		return 0;
+	}
+	uint64_t pages = 0;
+	for (const auto& write: m_buffer_cache.TakePendingCpuWrites()) {
+		pages += ApplyCpuWrite(write.vaddr, write.size,
+		                       write.texture_only ? CpuWrite::PagesTextureOnly : CpuWrite::Pages);
+	}
+	return pages;
+}
+
+uint64_t RenderContext::CollectCpuWrites(uint64_t vaddr, uint64_t size) {
+	auto* write_watch = WriteWatch::Get();
+	if (write_watch == nullptr) {
+		return 0;
+	}
+	uint64_t   pages = ApplyPendingCpuWrites();
+	const auto apply = [&](uint64_t start, uint64_t bytes) {
+		pages += ApplyCpuWrite(start, bytes, CpuWrite::Pages);
+	};
+	if (size == 0) {
+		// Label pages first: a label write found later then proves its data was written after
+		// this collection began (NoteGuestAcquire).
+		write_watch->CollectLabels([&](uint64_t start, uint64_t bytes) {
+			m_page_manager.ForEachWriteWatchedRun(start, bytes, apply);
+		});
+	}
+	m_buffer_cache.CollectWrittenPages(vaddr, size, apply);
+	return pages;
+}
+
+void RenderContext::StoreGuestMemory(uint64_t vaddr, const void* data, uint64_t size) {
+	if (WriteWatch::Get() != nullptr) {
+		// The fault a direct store would take, for its exact bytes and before the store lands
+		// (a GPU-owned page is downloaded first, the store goes on top).
+		const auto end = vaddr + size;
+		m_page_manager.ForEachWriteWatchedRun(vaddr, size, [&](uint64_t start, uint64_t bytes) {
+			const auto first = std::max(start, vaddr);
+			const auto last  = std::min(start + bytes, end);
+			if (first < last) {
+				ApplyCpuWrite(first, last - first, CpuWrite::Exact);
+			}
+		});
+		if (LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
+			return;
+		}
+	}
+	std::memcpy(reinterpret_cast<void*>(vaddr), data, size);
+}
+
+// KYTY_WRITE_WATCH_ACQUIRE=0: no collection at acquire points (measurement; data released by a
+// label after the stream began may then reach the GPU late).
+static bool WriteWatchAcquireEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_WRITE_WATCH_ACQUIRE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+void RenderContext::NoteGuestAcquire(uint64_t label_vaddr, uint64_t label_size) {
+	bool new_cpu_data = false;
+	if (auto* write_watch = WriteWatch::Get();
+	    write_watch != nullptr && label_vaddr != 0 && WriteWatchAcquireEnabled()) {
+		// The label page was not written since the last full collection began: the label write,
+		// and every CPU write made before it, preceded that collection.
+		if (write_watch->WasLabelWritten(label_vaddr, label_size)) {
+			g_ww_acquire_collects.fetch_add(1, std::memory_order_relaxed);
+			new_cpu_data = CollectCpuWrites() != 0;
+		}
+	}
+	NoteWaitPass();
+	if (new_cpu_data && m_bda_synced_epoch == m_bda_sync_epoch) {
+		++m_bda_sync_epoch; // later BDA consumers in this stream sync the new data
+	}
+}
+
+void RenderContext::NoteWaitPass() {
 	const int mode = SyncOnWaitPassMode().load();
 	// Nothing to do when this epoch has not synced yet (the first consumer syncs anyway). This also
 	// excludes a wait re-executed after a resume: BeginCommandStream started a fresh epoch.
@@ -445,6 +582,9 @@ void RenderContext::NoteGuestAcquire() {
 }
 
 void RenderContext::SyncCpuWrites() {
+	// Kernel write-watch: CPU writes were collected when the stream began (BeginCommandStream) or
+	// at an acquire; queued ones are applied at the next command boundary (no cache lock is
+	// guaranteed free here: descriptor preparation also calls this).
 	// Once per command stream (KYTY_BDA_SYNC_PER_DRAW=1 restores the per-draw sync): every sync
 	// re-protects the pages it uploads, so the game's next CPU write to them faults again.
 	static const bool per_draw = [] {

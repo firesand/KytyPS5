@@ -4,6 +4,7 @@
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/hostReadStats.h"
 #include "graphics/host_gpu/regionDefinitions.h"
+#include "graphics/host_gpu/writeWatch.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -12,8 +13,10 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 #if defined(_MSC_VER)
@@ -103,11 +106,13 @@ struct PageManager::Impl {
 		uint8_t write_watchers  : 7 = 0;
 		uint8_t access_watchers : 1 = 0;
 
-		[[nodiscard]] Common::VirtualMemory::Mode Perms() const noexcept {
+		// covered: the page lies in a kernel write-watched view (WriteWatch), which records CPU
+		// writes itself, so write watchers need no write protection there.
+		[[nodiscard]] Common::VirtualMemory::Mode Perms(bool covered) const noexcept {
 			if (access_watchers != 0) {
 				return Common::VirtualMemory::Mode::NoAccess;
 			}
-			if (write_watchers != 0) {
+			if (write_watchers != 0 && !covered) {
 				return Common::VirtualMemory::Mode::Read;
 			}
 			return Common::VirtualMemory::Mode::ReadWrite;
@@ -152,6 +157,12 @@ struct PageManager::Impl {
 	struct Region {
 		std::atomic_flag                    lock = ATOMIC_FLAG_INIT;
 		std::array<PageState, REGION_PAGES> pages;
+		uint64_t                            base = 0;
+		// Pages with write watchers (lock-free reads by write-watch span scans).
+		std::atomic<uint32_t> write_watched {0};
+		// Pages inside kernel write-watched views, as of WriteWatch::ViewsEpoch() covered_epoch.
+		RegionBits covered;
+		uint64_t   covered_epoch = 0;
 	};
 
 	Impl() {
@@ -203,9 +214,80 @@ struct PageManager::Impl {
 		}
 		auto  region = std::make_unique<Region>();
 		auto* ptr    = region.get();
+		ptr->base    = index * REGION_SIZE;
 		region_storage.push_back(std::move(region));
+		sorted_regions.insert(std::upper_bound(sorted_regions.begin(), sorted_regions.end(), ptr,
+		                                       [](const Region* a, const Region* b) { return a->base < b->base; }),
+		                      ptr);
 		regions[index].store(ptr, std::memory_order_release);
 		return ptr;
+	}
+
+	// Pages of the region inside kernel write-watched views (empty without write-watch). Caller
+	// holds region.lock.
+	static const RegionBits& CoveredPages(Region& region) noexcept {
+		auto* write_watch = WriteWatch::Get();
+		if (write_watch == nullptr) {
+			return region.covered;
+		}
+		const auto epoch = write_watch->ViewsEpoch();
+		if (region.covered_epoch != epoch) {
+			write_watch->CoveredPages(region.base, &region.covered);
+			region.covered_epoch = epoch;
+		}
+		return region.covered;
+	}
+
+	void ForEachWriteWatchedSpan(const std::function<void(uint64_t, uint64_t)>& func) {
+		std::vector<std::pair<uint64_t, uint64_t>> spans;
+		{
+			std::lock_guard lock(region_mutex);
+			for (const auto* region: sorted_regions) {
+				if (region->write_watched.load(std::memory_order_acquire) == 0) {
+					continue;
+				}
+				if (!spans.empty() && spans.back().second == region->base) {
+					spans.back().second += REGION_SIZE;
+				} else {
+					spans.emplace_back(region->base, region->base + REGION_SIZE);
+				}
+			}
+		}
+		for (const auto& [start, end]: spans) {
+			func(start, end - start);
+		}
+	}
+
+	void ForEachWriteWatchedRun(uint64_t vaddr, uint64_t size,
+	                            const std::function<void(uint64_t, uint64_t)>& func) {
+		const auto begin = Common::AlignDown(vaddr, PAGE_SIZE);
+		const auto end   = Common::AlignUp(vaddr + size, PAGE_SIZE);
+		std::vector<std::pair<uint64_t, uint64_t>> runs;
+		for (auto chunk = begin; chunk < end;) {
+			const auto region_base = Common::AlignDown(chunk, REGION_SIZE);
+			const auto chunk_end   = std::min(end, region_base + REGION_SIZE);
+			auto*      region      = FindRegion(chunk);
+			if (region != nullptr && region->write_watched.load(std::memory_order_acquire) != 0) {
+				SpinGuard  lock(region->lock);
+				const auto first = static_cast<size_t>((chunk - region_base) / PAGE_SIZE);
+				const auto last  = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
+				for (auto page = first; page < last; ++page) {
+					if (region->pages[page].write_watchers == 0) {
+						continue;
+					}
+					const auto address = region_base + page * PAGE_SIZE;
+					if (!runs.empty() && runs.back().second == address) {
+						runs.back().second += PAGE_SIZE;
+					} else {
+						runs.emplace_back(address, address + PAGE_SIZE);
+					}
+				}
+			}
+			chunk = chunk_end;
+		}
+		for (const auto& [start, stop]: runs) {
+			func(start, stop - start);
+		}
 	}
 
 	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept {
@@ -220,8 +302,9 @@ struct PageManager::Impl {
 	template <bool track, bool is_read, bool masked>
 	void UpdateRegionWatchers(Region& region, uint64_t base_addr, size_t first, size_t last,
 	                          const RegionBits* mask = nullptr) {
-		SpinGuard lock(region.lock);
-		auto      perms                 = region.pages[first].Perms();
+		SpinGuard   lock(region.lock);
+		const auto& covered               = CoveredPages(region);
+		auto        perms                 = region.pages[first].Perms(covered.Get(first));
 		uint64_t  range_begin           = 0;
 		uint64_t  range_bytes           = 0;
 		uint64_t  potential_range_bytes = 0;
@@ -233,16 +316,30 @@ struct PageManager::Impl {
 				potential_range_bytes = 0;
 			}
 		};
+		// Kernel write-watch: covered pages gaining their first write watcher are re-protected in
+		// the kernel, as mprotect(Read) would have protected them: earlier writes to them were
+		// nobody's concern and must not be reported as new ones.
+		size_t     rearm_begin = 0;
+		size_t     rearm_end   = 0;
+		const auto flush_rearm = [&] {
+			if (rearm_end != rearm_begin) {
+				WriteWatch::Get()->Rearm(base_addr + rearm_begin * PAGE_SIZE,
+				                         (rearm_end - rearm_begin) * PAGE_SIZE);
+			}
+			rearm_begin = rearm_end = 0;
+		};
+		(void)flush_rearm; // read-watcher and untrack instantiations never re-arm
 
 		for (size_t page_index = first; page_index < last; page_index++) {
 			auto&      page    = region.pages[page_index];
 			const auto address = base_addr + page_index * PAGE_SIZE;
 			const bool update  = !masked || mask->Get(page_index);
 
-			const auto old_perms = page.Perms();
-			const auto new_count = update ? page.AddDelta<track ? 1 : -1, is_read>(address)
-			                              : page.AddDelta<0, is_read>(address);
-			const auto new_perms = page.Perms();
+			const bool page_covered = covered.Get(page_index);
+			const auto old_perms    = page.Perms(page_covered);
+			const auto new_count    = update ? page.AddDelta<track ? 1 : -1, is_read>(address)
+			                                 : page.AddDelta<0, is_read>(address);
+			const auto new_perms    = page.Perms(page_covered);
 
 			if (new_perms != perms) [[unlikely]] {
 				release_pending();
@@ -256,6 +353,22 @@ struct PageManager::Impl {
 			}
 
 			const bool watcher_edge = (track && new_count == 1) || (!track && new_count == 0);
+			if constexpr (!is_read) {
+				if (watcher_edge) {
+					if constexpr (track) {
+						region.write_watched.fetch_add(1, std::memory_order_acq_rel);
+						if (page_covered) {
+							if (rearm_end != page_index) {
+								flush_rearm();
+								rearm_begin = page_index;
+							}
+							rearm_end = page_index + 1;
+						}
+					} else {
+						region.write_watched.fetch_sub(1, std::memory_order_acq_rel);
+					}
+				}
+			}
 			if (watcher_edge && old_perms != new_perms) {
 				if (range_bytes == 0) {
 					range_begin           = page_index;
@@ -266,6 +379,9 @@ struct PageManager::Impl {
 		}
 
 		release_pending();
+		if constexpr (track && !is_read) {
+			flush_rearm();
+		}
 	}
 
 	template <bool track, bool is_read>
@@ -289,6 +405,7 @@ struct PageManager::Impl {
 
 	std::unique_ptr<std::atomic<Region*>[]> regions;
 	std::vector<std::unique_ptr<Region>>    region_storage;
+	std::vector<Region*>                    sorted_regions; // by base, under region_mutex
 	std::mutex                              region_mutex;
 };
 
@@ -347,5 +464,15 @@ template void PageManager::UpdatePageWatchersForRegion<true, true>(uint64_t, Reg
 template void PageManager::UpdatePageWatchersForRegion<true, false>(uint64_t, RegionBits&);
 template void PageManager::UpdatePageWatchersForRegion<false, true>(uint64_t, RegionBits&);
 template void PageManager::UpdatePageWatchersForRegion<false, false>(uint64_t, RegionBits&);
+
+void PageManager::ForEachWriteWatchedSpan(
+    const std::function<void(uint64_t, uint64_t)>& func) const {
+	m_impl->ForEachWriteWatchedSpan(func);
+}
+
+void PageManager::ForEachWriteWatchedRun(
+    uint64_t vaddr, uint64_t size, const std::function<void(uint64_t, uint64_t)>& func) const {
+	m_impl->ForEachWriteWatchedRun(vaddr, size, func);
+}
 
 } // namespace Libs::Graphics
