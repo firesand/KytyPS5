@@ -1247,6 +1247,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// writes in flight are covered by HasPendingUnboundedWrites.
 	uint64_t indirect_args_bytes = 0;
 	bool     indirect_barrier    = false;
+	bool     args_unpublished    = false; // unpublished unbounded GPU writes may cover the args
+	bool     count_unpublished   = false;
 	if (gpu_indirect != nullptr) {
 		auto& cache = m_context.GetBufferCache();
 		const uint64_t record_size =
@@ -1258,29 +1260,25 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		const auto wait_begin = std::chrono::steady_clock::now();
 		// Lazy mode 1 decides the barrier from the tracker's indirect_write_stages below and
 		// discards the HasGpuDirtyBytes result, whose PrepareHostRead waits for the write-fault
-		// pass when the range intersects pending unbounded writes. Only ObtainBuffer still needs
-		// the publish: it must not upload CPU-modified bytes over unpublished GPU writes, so the
-		// wait stays exactly when the range has both. KYTY_CP_GPU_INDIRECT_ARGS_WAIT=1 keeps it always.
+		// pass when the range intersects pending unbounded writes. Without the wait the GPU
+		// writes stay unpublished for ObtainBuffer: SynchronizeBuffer only uploads CPU-dirty pages,
+		// which the CPU bytes win either way (MarkPageWritten skips them), but the stream path
+		// would memcpy the whole range from guest memory, so it is refused for such ranges
+		// (args_unpublished). KYTY_CP_GPU_INDIRECT_ARGS_WAIT=1 keeps the waiting check.
 		static const bool force_wait = [] {
 			const char* value = std::getenv("KYTY_CP_GPU_INDIRECT_ARGS_WAIT");
 			return value != nullptr && value[0] == '1';
 		}();
-		bool keep_wait = LazyBarrierMode() != 1 || force_wait;
+		const bool keep_wait = LazyBarrierMode() != 1 || force_wait;
 		if (!keep_wait) {
-			bool pending = cache.PublishGpuWritesNoWait(gpu_indirect->args_addr, indirect_args_bytes);
-			bool cpu_dirty = pending && cache.IsRegionCpuModified(gpu_indirect->args_addr, indirect_args_bytes);
-			if (gpu_indirect->count_addr != 0 &&
-			    cache.PublishGpuWritesNoWait(gpu_indirect->count_addr, sizeof(uint32_t))) {
-				pending   = true;
-				cpu_dirty = cpu_dirty || cache.IsRegionCpuModified(gpu_indirect->count_addr, sizeof(uint32_t));
+			args_unpublished =
+			    cache.PublishGpuWritesNoWait(gpu_indirect->args_addr, indirect_args_bytes);
+			count_unpublished = gpu_indirect->count_addr != 0 &&
+			                    cache.PublishGpuWritesNoWait(gpu_indirect->count_addr, sizeof(uint32_t));
+			if (args_unpublished || count_unpublished) {
+				HostReadProbe::CountGpuIndirect(HostReadProbe::ArgsWaitSkipped);
 			}
-			if (pending) {
-				HostReadProbe::CountGpuIndirect(cpu_dirty ? HostReadProbe::ArgsWaitKept
-				                                          : HostReadProbe::ArgsWaitSkipped);
-			}
-			keep_wait = cpu_dirty;
-		}
-		if (keep_wait) {
+		} else {
 			// Lazy mode replaces the sticky HasPendingUnboundedWrites() (true until a host wait)
 			// with the tracker's per-command-buffer indirect_write_stages, evaluated at the barrier
 			// site.
@@ -1338,10 +1336,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	std::pair<Buffer*, uint64_t> indirect_count {};
 	if (gpu_indirect != nullptr) {
 		auto& cache   = m_context.GetBufferCache();
-		indirect_args = cache.ObtainBuffer(gpu_indirect->args_addr, indirect_args_bytes, false);
+		indirect_args = cache.ObtainBuffer(gpu_indirect->args_addr, indirect_args_bytes, false, false,
+		                                   {}, !args_unpublished);
 		EXIT_IF(indirect_args.first == nullptr || (indirect_args.second & 3u) != 0);
 		if (gpu_indirect->count_addr != 0) {
-			indirect_count = cache.ObtainBuffer(gpu_indirect->count_addr, sizeof(uint32_t), false);
+			indirect_count = cache.ObtainBuffer(gpu_indirect->count_addr, sizeof(uint32_t), false, false,
+			                                    {}, !count_unpublished);
 			EXIT_IF(indirect_count.first == nullptr || (indirect_count.second & 3u) != 0);
 		}
 		// Obtaining the arguments can merge cache buffers; finalize shader bindings afterward.

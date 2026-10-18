@@ -53,9 +53,8 @@ struct HostReadProbe {
 	// - FallbackDenied: a vertex-stage hash in KYTY_CP_GPU_INDIRECT_DENY_HASH (counted in "other" too);
 	// - MeshClampedRecords / MeshEmptyRecords: argument records the task shader clamped to the
 	//   device's mesh workgroup limits / found empty (GPU atomics, read back with a delay);
-	// - ArgsWaitSkipped / ArgsWaitKept (lazy mode 1): GPU packets whose argument range intersected
-	//   pending unbounded writes and skipped the waiting publish, or kept it because the range also
-	//   has CPU-modified pages that ObtainBuffer would upload over the unpublished GPU writes;
+	// - ArgsWaitSkipped (lazy mode 1): GPU packets whose argument range intersected pending
+	//   unbounded writes and skipped the waiting publish (ObtainBuffer then avoids the stream path);
 	// - StaleInstances: a later draw that took its instance count from m_num_instances while a GPU
 	//   packet had left it at the pre-packet value (the host path stores the last record's count);
 	// - StaleSgpr: a later draw whose shader can read a GS user-data register that a GPU packet left
@@ -64,12 +63,12 @@ struct HostReadProbe {
 	enum GpuIndirect : uint32_t { GpuDraws = 0, FallbackIndexOffset, FallbackOther, FallbackMesh, FallbackSrt,
 	                              MeshGpuDraws, FallbackMeshDenied, FallbackMeshCountAddr, FallbackMeshPrim,
 	                              FallbackDenied, MeshClampedRecords, MeshEmptyRecords, ArgsWaitSkipped,
-	                              ArgsWaitKept, StaleInstances, StaleSgpr, GpuIndirectCount };
+	                              StaleInstances, StaleSgpr, GpuIndirectCount };
 	// Short names, one per enumerator in order; the size is deduced, so adding an enumerator without
 	// a name (or the reverse) fails to compile.
 	static constexpr auto kGpuIndirectNames = std::to_array<const char*>(
 	    {"gpu", "index_offset", "other", "mesh", "srt", "mesh-gpu", "mesh-denied", "mesh-count-addr",
-	     "mesh-prim", "denied", "mesh-clamped", "mesh-empty", "args-wait-skipped", "args-wait-kept",
+	     "mesh-prim", "denied", "mesh-clamped", "mesh-empty", "args-wait-skipped",
 	     "stale-instances", "stale-sgpr"});
 	static_assert(kGpuIndirectNames.size() == GpuIndirectCount, "GpuIndirect enum / name table mismatch");
 	struct Snapshot {
