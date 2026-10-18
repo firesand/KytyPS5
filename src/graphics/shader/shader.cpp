@@ -747,7 +747,7 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	auto        params = GetShaderParams(
 	    regs.es_regs.data_addr, hash,
 	    std::span<const uint32_t>(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr), data,
-	    merged || native_ngg ? 8u : 0u);
+	    merged || native_ngg ? kMeshUserSgprBase : 0u);
 	params.gate_hash = hash;
 	if (!merged && !native_ngg) {
 		if (!ShaderGetStaticVertexInputInfo(regs.es_regs.data_addr, regs.gs_user_sgpr,

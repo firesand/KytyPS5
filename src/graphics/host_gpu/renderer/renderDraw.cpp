@@ -1719,14 +1719,10 @@ bool RenderExecutor::CanDrawIndirectOnGpu(CommandBuffer& buffer, bool indexed,
 	// the user-data snapshot. The GPU variant never patches the offset SGPRs, so a plan that reads
 	// one of them would pick resources from a stale value. Unknown shaders take the host path once,
 	// which compiles them and records their mask.
+	// Mesh programs keep GS slot k at mask bit kMeshUserSgprBase + k (shader.h).
 	uint64_t plan_mask = 0;
-	const auto slot_bit = [](uint32_t slot) {
-		return slot == ShaderDrawParameters::kNoSlot ? uint64_t {0}
-		                                             : (slot < 64u ? uint64_t {1} << slot : ~uint64_t {0});
-	};
 	if (!m_context.GetPipelineCache().GetVertexUserDataMask(shader_hash, plan_mask) ||
-	    (plan_mask & (slot_bit(parameters.base_vertex_slot) |
-	                  slot_bit(parameters.base_instance_slot))) != 0) {
+	    (plan_mask & DrawParameterSlotMask(parameters, is_mesh ? kMeshUserSgprBase : 0u)) != 0) {
 		if (block != nullptr) {
 			*block = GpuIndirectBlock::Srt;
 		}

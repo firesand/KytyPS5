@@ -138,6 +138,27 @@ struct ShaderDrawParameters {
 	bool     rebase_ids         = false;
 };
 
+// First IR scalar register of the GS user-data dwords in merged / native NGG (mesh) programs: GS
+// user SGPR k is copied to params.user_data[kMeshUserSgprBase + k] (PrepareProgram) and mesh programs
+// compile with user_data_base 0, so packet slot k is register s(kMeshUserSgprBase + k) and bit
+// kMeshUserSgprBase + k of ResourcePlan::user_data_mask. Vertex programs compile with
+// user_data_base 8 and params base 0: register 8 + k, mask bit k.
+inline constexpr uint32_t kMeshUserSgprBase = 8;
+
+// The ResourcePlan::user_data_mask bits the packet's named slots occupy; `bit_offset` is
+// kMeshUserSgprBase for mesh programs, 0 for vertex programs. A slot past bit 63 cannot be tracked
+// and yields all bits (the plan marks such registers all-consumed too).
+[[nodiscard]] constexpr uint64_t DrawParameterSlotMask(const ShaderDrawParameters& draw,
+                                                       uint32_t bit_offset) {
+	const auto bit = [bit_offset](uint32_t slot) {
+		if (slot == ShaderDrawParameters::kNoSlot) {
+			return uint64_t {0};
+		}
+		return slot + bit_offset < 64u ? uint64_t {1} << (slot + bit_offset) : ~uint64_t {0};
+	};
+	return bit(draw.base_vertex_slot) | bit(draw.base_instance_slot);
+}
+
 struct ShaderVertexInputInfo {
 	static constexpr int RES_MAX = 32;
 
