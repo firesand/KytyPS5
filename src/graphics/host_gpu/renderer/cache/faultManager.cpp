@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
+#include "graphics/host_gpu/hostReadStats.h"
 #include "graphics/host_gpu/renderer/gpuTimestamps.h"
 
 #include "common/assert.h"
@@ -98,6 +99,7 @@ void FaultManager::Process(bool write_faults) {
 	auto&      areas        = write_faults ? m_write_areas : m_fault_areas;
 	auto&      current_area = write_faults ? m_current_write_area : m_current_area;
 	if (const auto wait_tick = areas[current_area].load(std::memory_order_acquire); wait_tick != 0) {
+		WaitReasonScope reason(WaitReasonProbe::FaultAreas);
 		m_scheduler.Wait(wait_tick);
 		if (write_faults) {
 			m_scheduler.WaitPriorityOperations(wait_tick);

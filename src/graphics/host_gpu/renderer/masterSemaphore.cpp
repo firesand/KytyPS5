@@ -58,7 +58,8 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	if (IsFree(tick)) {
 		return;
 	}
-	BudgetScope budget(BudgetProbe::Wait, GpuThreadMark::on);
+	BudgetScope     budget(BudgetProbe::Wait, GpuThreadMark::on);
+	WaitReasonTimer wait_reason(GpuThreadMark::on);
 	Refresh();
 	if (IsFree(tick)) {
 		return;

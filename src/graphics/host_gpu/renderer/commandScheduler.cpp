@@ -181,12 +181,14 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 }
 
 void CommandScheduler::FlushAndWait() {
-	const auto tick = Submit();
+	WaitReasonScope reason(WaitReasonProbe::Finish);
+	const auto      tick = Submit();
 	m_master.Wait(tick);
 	BeginNext();
 }
 
 void CommandScheduler::Finish() {
+	WaitReasonScope reason(WaitReasonProbe::Finish);
 	CheckActive();
 	if (!m_command.IsInvalid()) {
 		Submit();

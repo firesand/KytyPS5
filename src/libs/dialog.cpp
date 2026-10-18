@@ -445,6 +445,7 @@ static char             g_save_dir_name[sizeof(SaveDataDirName::data)] {};
 
 int KYTY_SYSV_ABI SaveDataDialogInitialize() {
 	PRINT_NAME();
+	LOGF("SaveDataDialog: %s\n", __func__); // low volume (status polls stay unlogged)
 
 	g_save_status         = SAVE_STATUS_INITIALIZED;
 	g_save_running_polled = false;
@@ -477,6 +478,7 @@ int KYTY_SYSV_ABI SaveDataDialogUpdateStatus() {
 
 int KYTY_SYSV_ABI SaveDataDialogGetResult(void* result) {
 	PRINT_NAME();
+	LOGF("SaveDataDialog: %s\n", __func__); // low volume (status polls stay unlogged)
 
 	if (result != nullptr) {
 		auto* r      = static_cast<SaveDataDialogResult*>(result);
@@ -495,6 +497,7 @@ int KYTY_SYSV_ABI SaveDataDialogGetResult(void* result) {
 
 int KYTY_SYSV_ABI SaveDataDialogOpen(const void* param) {
 	PRINT_NAME();
+	LOGF("SaveDataDialog: %s\n", __func__); // low volume (status polls stay unlogged)
 
 	const auto* p = static_cast<const SaveDataDialogParam*>(param);
 	if (p != nullptr) {
@@ -514,6 +517,22 @@ int KYTY_SYSV_ABI SaveDataDialogOpen(const void* param) {
 		     reinterpret_cast<uint64_t>(p->sys_msg_param),
 		     reinterpret_cast<uint64_t>(p->prog_bar_param),
 		     reinterpret_cast<uint64_t>(p->user_data));
+		// Mode 4 shows an error code and mode 3 a system message: log what the game wants to tell the player
+		// (both parameter structs start with a 32-bit code; the system message carries a 64-bit value at +8).
+		if (p->error_code_param != nullptr) {
+			uint32_t code = 0;
+			std::memcpy(&code, p->error_code_param, sizeof(code));
+			LOGF("\t error_code_param = 0x%016" PRIx64 " error_code = 0x%08" PRIx32 "\n",
+			     reinterpret_cast<uint64_t>(p->error_code_param), code);
+		}
+		if (p->sys_msg_param != nullptr) {
+			const auto* m     = static_cast<const uint8_t*>(p->sys_msg_param);
+			uint32_t    type  = 0;
+			uint64_t    value = 0;
+			std::memcpy(&type, m, sizeof(type));
+			std::memcpy(&value, m + 8, sizeof(value));
+			LOGF("\t sys_msg_type = %" PRIu32 " sys_msg_value = 0x%016" PRIx64 "\n", type, value);
+		}
 
 		const auto* items = static_cast<const SaveDataDialogItems*>(p->items);
 		if (items != nullptr && items->dir_names != nullptr) {
@@ -535,6 +554,7 @@ int KYTY_SYSV_ABI SaveDataDialogOpen(const void* param) {
 
 int KYTY_SYSV_ABI SaveDataDialogClose(const void* close_param) {
 	PRINT_NAME();
+	LOGF("SaveDataDialog: %s\n", __func__); // low volume (status polls stay unlogged)
 
 	LOGF("\t close_param = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(close_param));
 
@@ -552,6 +572,7 @@ int KYTY_SYSV_ABI SaveDataDialogIsReadyToDisplay() {
 
 int KYTY_SYSV_ABI SaveDataDialogTerminate() {
 	PRINT_NAME();
+	LOGF("SaveDataDialog: %s\n", __func__); // low volume (status polls stay unlogged)
 
 	g_save_status         = SAVE_STATUS_NONE;
 	g_save_running_polled = false;

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/hostReadStats.h"
 #include "graphics/host_gpu/renderer/gpuTimestamps.h"
 
 #include "graphics/host_gpu/renderer/gpuDiagnostics.h"
@@ -253,8 +254,9 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	if constexpr (async) {
 		m_scheduler.DeferPriorityOperation(std::move(publish));
 	} else {
-		const auto tick  = m_scheduler.CurrentTick();
-		const auto start = std::chrono::steady_clock::now();
+		const auto      tick  = m_scheduler.CurrentTick();
+		const auto      start = std::chrono::steady_clock::now();
+		WaitReasonScope reason(WaitReasonProbe::Download);
 		m_scheduler.Wait(tick);
 		m_scheduler.WaitPriorityOperations(tick);
 		m_sync_stats.download_calls++;
@@ -1064,6 +1066,7 @@ void BufferCache::FlushWriteFaults(bool wait) {
 	}
 	const auto tick    = m_write_fault_tick;
 	m_write_fault_tick = 0;
+	WaitReasonScope reason(WaitReasonProbe::WriteFaults);
 	m_scheduler.Wait(tick);
 	m_scheduler.WaitPriorityOperations(tick);
 	DrainPendingGpuModified();
@@ -1181,7 +1184,8 @@ void BufferCache::RunGarbageCollector() {
 	}
 
 	// Publish all queued downloads before releasing their tracked pages and owners.
-	const auto completion_tick = m_scheduler.CurrentTick();
+	const auto      completion_tick = m_scheduler.CurrentTick();
+	WaitReasonScope reason(WaitReasonProbe::Gc);
 	m_scheduler.Wait(completion_tick);
 	m_scheduler.WaitPriorityOperations(completion_tick);
 	for (const auto id: dirty_buffers) {

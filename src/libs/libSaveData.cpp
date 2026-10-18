@@ -5,6 +5,7 @@
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/hostMemory.h"
 #include "kernel/fileSystem.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -24,6 +25,34 @@ namespace Libs {
 LIB_VERSION("SaveData", 1, "SaveData", 1, 1);
 
 namespace SaveData {
+
+// Always-on, low-volume call trace: PRINT_NAME is off for this library, so without this the log shows a function's
+// parameters without its name. A few dozen lines per run.
+static void SaveDataTrace(const char* func) {
+	LOGF("SaveData: %s\n", func);
+}
+
+// Logs a call to a save-data NID we do not implement yet: the six integer argument registers, the guest return
+// address, and 64 bytes behind every argument that points to readable memory. Returns 0 like the unresolved-import
+// stub did, so behaviour is unchanged; the log is for identifying the function and what the game expects back.
+static void LogUnknownSaveDataCall(const char* nid, const uint64_t (&args)[6], const void* ret_addr) {
+	LOGF("SaveData: unimplemented %s ret=0x%016" PRIx64 " args=%016" PRIx64 " %016" PRIx64 " %016" PRIx64
+	     " %016" PRIx64 " %016" PRIx64 " %016" PRIx64 "\n",
+	     nid, reinterpret_cast<uint64_t>(ret_addr), args[0], args[1], args[2], args[3], args[4], args[5]);
+	for (int i = 0; i < 6; i++) {
+		if (args[i] < 0x10000 || !Graphics::HostMemoryRangeIsReadable(args[i], 64)) {
+			continue;
+		}
+		const auto* b = reinterpret_cast<const uint8_t*>(args[i]);
+		for (int row = 0; row < 4; row++) {
+			LOGF("\t arg%d+%02x: %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n", i,
+			     row * 16, b[row * 16 + 0], b[row * 16 + 1], b[row * 16 + 2], b[row * 16 + 3], b[row * 16 + 4],
+			     b[row * 16 + 5], b[row * 16 + 6], b[row * 16 + 7], b[row * 16 + 8], b[row * 16 + 9],
+			     b[row * 16 + 10], b[row * 16 + 11], b[row * 16 + 12], b[row * 16 + 13], b[row * 16 + 14],
+			     b[row * 16 + 15]);
+		}
+	}
+}
 
 // TODO(): specify dir at launcher
 static constexpr char     SAVE_DATA_DIR[]      = "_SaveData";
@@ -519,6 +548,7 @@ static int mount_save_data(int slot, const std::filesystem::path& directory,
 
 int KYTY_SYSV_ABI SaveDataInitialize3(const void* /*init*/) {
 	PRINT_NAME();
+	SaveDataTrace(__func__);
 
 	// EXIT_NOT_IMPLEMENTED(init != nullptr);
 
@@ -527,6 +557,7 @@ int KYTY_SYSV_ABI SaveDataInitialize3(const void* /*init*/) {
 
 int KYTY_SYSV_ABI SaveDataTerminate() {
 	PRINT_NAME();
+	SaveDataTrace(__func__);
 
 	Common::LockGuard lock(g_mount_mutex);
 	if (!g_mount_slots.Empty()) {
@@ -540,6 +571,7 @@ int KYTY_SYSV_ABI SaveDataTerminate() {
 
 int KYTY_SYSV_ABI SaveDataCreateTransactionResource(uint32_t size) {
 	PRINT_NAME();
+	SaveDataTrace(__func__);
 
 	LOGF("\t size = %" PRIu32 "\n", size);
 
@@ -548,6 +580,7 @@ int KYTY_SYSV_ABI SaveDataCreateTransactionResource(uint32_t size) {
 
 int KYTY_SYSV_ABI SaveDataDeleteTransactionResource(int32_t resource) {
 	PRINT_NAME();
+	SaveDataTrace(__func__);
 
 	LOGF("\t resource = %" PRId32 "\n", resource);
 
@@ -557,6 +590,7 @@ int KYTY_SYSV_ABI SaveDataDeleteTransactionResource(int32_t resource) {
 int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
                                         SaveDataDirNameSearchResult*     result) {
 	PRINT_NAME();
+	SaveDataTrace(__func__);
 
 	if (cond == nullptr || result == nullptr ||
 	    (cond->title_id != nullptr && !valid_path_component(cond->title_id->data)) ||
@@ -651,6 +685,7 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 
 int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResult* mount_result) {
 	PRINT_NAME();
+	SaveDataTrace(__func__);
 
 	if (mount == nullptr || mount_result == nullptr || mount->dir_name == nullptr ||
 	    !valid_path_component(mount->dir_name->data)) {
@@ -731,6 +766,7 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 int KYTY_SYSV_ABI SaveDataSetupSaveDataMemory2(const SaveDataMemorySetup2* setup_param,
                                                SaveDataMemorySetupResult*  result) {
 	PRINT_NAME();
+	SaveDataTrace(__func__);
 
 	if (setup_param == nullptr || setup_param->slot_id >= 4 || setup_param->memory_size == 0 ||
 	    setup_param->memory_size > SAVE_DATA_MEMORY_MAX_SIZE || (setup_param->option & ~3u) != 0) {
@@ -790,6 +826,7 @@ int KYTY_SYSV_ABI SaveDataSetupSaveDataMemory2(const SaveDataMemorySetup2* setup
 
 int KYTY_SYSV_ABI SaveDataGetSaveDataMemory2(SaveDataMemoryGet2* get_param) {
 	PRINT_NAME();
+	SaveDataTrace(__func__);
 
 	if (get_param == nullptr || get_param->slot_id >= 4) {
 		return SAVE_DATA_ERROR_PARAMETER;
@@ -834,6 +871,7 @@ int KYTY_SYSV_ABI SaveDataGetSaveDataMemory2(SaveDataMemoryGet2* get_param) {
 
 int KYTY_SYSV_ABI SaveDataSetSaveDataMemory2(const SaveDataMemorySet2* set_param) {
 	PRINT_NAME();
+	SaveDataTrace(__func__);
 
 	if (set_param == nullptr || set_param->slot_id >= 4 || set_param->data_num > 5 ||
 	    (set_param->data == nullptr && set_param->data_num != 0)) {
@@ -894,6 +932,7 @@ int KYTY_SYSV_ABI SaveDataSetSaveDataMemory2(const SaveDataMemorySet2* set_param
 int KYTY_SYSV_ABI SaveDataTransferringMount(const SaveDataTransferringMount* mount,
                                             SaveDataMountResult*             mount_result) {
 	PRINT_NAME();
+	SaveDataTrace(__func__);
 
 	if (mount == nullptr || mount_result == nullptr || mount->title_id == nullptr ||
 	    mount->dir_name == nullptr || !valid_path_component(mount->title_id->data) ||
@@ -931,6 +970,7 @@ int KYTY_SYSV_ABI SaveDataTransferringMount(const SaveDataTransferringMount* mou
 
 int KYTY_SYSV_ABI SaveDataUmount2(uint32_t mode, const SaveDataMountPoint* mount_point) {
 	PRINT_NAME();
+	SaveDataTrace(__func__);
 
 	if (mount_point == nullptr) {
 		return SAVE_DATA_ERROR_PARAMETER;
@@ -959,6 +999,7 @@ int KYTY_SYSV_ABI SaveDataUmount2(uint32_t mode, const SaveDataMountPoint* mount
 int KYTY_SYSV_ABI SaveDataPrepare(const SaveDataMountPoint*   mount_point,
                                   const SaveDataPrepareParam* param) {
 	PRINT_NAME();
+	SaveDataTrace(__func__);
 
 	if (mount_point == nullptr || param == nullptr) {
 		return SAVE_DATA_ERROR_PARAMETER;
@@ -974,6 +1015,7 @@ int KYTY_SYSV_ABI SaveDataPrepare(const SaveDataMountPoint*   mount_point,
 
 int KYTY_SYSV_ABI SaveDataCommit(const SaveDataCommitParam* param) {
 	PRINT_NAME();
+	SaveDataTrace(__func__);
 
 	if (param == nullptr) {
 		return SAVE_DATA_ERROR_PARAMETER;
@@ -993,6 +1035,7 @@ int KYTY_SYSV_ABI SaveDataCommit(const SaveDataCommitParam* param) {
 
 int KYTY_SYSV_ABI SaveDataDelete(const SaveDataDelete* del) {
 	PRINT_NAME();
+	SaveDataTrace(__func__);
 
 	if (del == nullptr || del->dir_name == nullptr || !valid_path_component(del->dir_name->data) ||
 	    (del->title_id != nullptr && !valid_path_component(del->title_id->data))) {
@@ -1024,6 +1067,7 @@ int KYTY_SYSV_ABI SaveDataDelete(const SaveDataDelete* del) {
 int KYTY_SYSV_ABI SaveDataGetParam(const SaveDataMountPoint* mount_point, uint32_t param_type,
                                    void* param_buf, size_t param_buf_size, size_t* got_size) {
 	PRINT_NAME();
+	SaveDataTrace(__func__);
 
 	if (mount_point == nullptr || param_buf == nullptr || param_type > 5 ||
 	    std::memchr(mount_point->data, 0, sizeof(mount_point->data)) == nullptr) {
@@ -1079,6 +1123,7 @@ int KYTY_SYSV_ABI SaveDataGetParam(const SaveDataMountPoint* mount_point, uint32
 
 int KYTY_SYSV_ABI SaveDataLoadIcon(const SaveDataMountPoint* mount_point, SaveDataIcon* icon) {
 	PRINT_NAME();
+	SaveDataTrace(__func__);
 
 	if (mount_point == nullptr || icon == nullptr) {
 		return SAVE_DATA_ERROR_PARAMETER;
@@ -1096,6 +1141,7 @@ int KYTY_SYSV_ABI SaveDataLoadIcon(const SaveDataMountPoint* mount_point, SaveDa
 
 int KYTY_SYSV_ABI SaveDataSaveIconByPath(const SaveDataMountPoint* mount_point, const char* path) {
 	PRINT_NAME();
+	SaveDataTrace(__func__);
 
 	if (mount_point == nullptr || path == nullptr) {
 		return SAVE_DATA_ERROR_PARAMETER;
@@ -1110,6 +1156,7 @@ int KYTY_SYSV_ABI SaveDataSaveIconByPath(const SaveDataMountPoint* mount_point, 
 
 int KYTY_SYSV_ABI SaveDataSyncSaveDataMemory(const SaveDataMemorySync* sync_param) {
 	PRINT_NAME();
+	SaveDataTrace(__func__);
 
 	if (sync_param == nullptr || sync_param->slot_id >= 4 || sync_param->option > 1) {
 		return SAVE_DATA_ERROR_PARAMETER;
@@ -1143,6 +1190,7 @@ int KYTY_SYSV_ABI SaveDataSyncSaveDataMemory(const SaveDataMemorySync* sync_para
 
 int KYTY_SYSV_ABI SaveDataGetEventResult(const void* event_param, SaveDataEvent* event) {
 	PRINT_NAME();
+	SaveDataTrace(__func__);
 
 	LOGF("\t event_param = 0x%016" PRIx64 "\n"
 	     "\t event       = 0x%016" PRIx64 "\n",
@@ -1173,6 +1221,7 @@ int KYTY_SYSV_ABI SaveDataGetEventResult(const void* event_param, SaveDataEvent*
 
 int KYTY_SYSV_ABI SaveDataBackup(const SaveDataBackup* backup) {
 	PRINT_NAME();
+	SaveDataTrace(__func__);
 
 	LOGF("\t backup = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(backup));
 
@@ -1196,6 +1245,7 @@ int KYTY_SYSV_ABI SaveDataBackup(const SaveDataBackup* backup) {
 int KYTY_SYSV_ABI SaveDataSetParam(const SaveDataMountPoint* mount_point, uint32_t param_type,
                                    const void* param_buf, size_t param_buf_size) {
 	PRINT_NAME();
+	SaveDataTrace(__func__);
 
 	if (mount_point == nullptr || param_buf == nullptr || param_type > 4 ||
 	    std::memchr(mount_point->data, 0, sizeof(mount_point->data)) == nullptr ||
@@ -1249,6 +1299,7 @@ int KYTY_SYSV_ABI SaveDataSetParam(const SaveDataMountPoint* mount_point, uint32
 int KYTY_SYSV_ABI SaveDataGetMountInfo(const SaveDataMountPoint* mount_point,
                                        SaveDataMountInfo*        info) {
 	PRINT_NAME();
+	SaveDataTrace(__func__);
 
 	if (mount_point == nullptr || info == nullptr ||
 	    std::memchr(mount_point->data, 0, sizeof(mount_point->data)) == nullptr) {
@@ -1281,6 +1332,22 @@ int KYTY_SYSV_ABI SaveDataSaveIcon(const SaveDataMountPoint* mount_point,
 	     "\t data_size = %" PRIu64 "\n",
 	     reinterpret_cast<uint64_t>(icon->buf), icon->buf_size, icon->data_size);
 
+	return OK;
+}
+
+// Unidentified SaveData_native NIDs called by STAR WARS Zero Company (2mfSRGdshtk: once per existing save folder at
+// boot, followed by a progress dialog and an error-code dialog; 8EA5OMIL1lQ: imported, not seen called yet).
+int KYTY_SYSV_ABI SaveDataUnknown_2mfSRGdshtk(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+                                              uint64_t a5) {
+	const uint64_t args[6] = {a0, a1, a2, a3, a4, a5};
+	LogUnknownSaveDataCall("2mfSRGdshtk", args, __builtin_return_address(0));
+	return OK;
+}
+
+int KYTY_SYSV_ABI SaveDataUnknown_8EA5OMIL1lQ(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+                                              uint64_t a5) {
+	const uint64_t args[6] = {a0, a1, a2, a3, a4, a5};
+	LogUnknownSaveDataCall("8EA5OMIL1lQ", args, __builtin_return_address(0));
 	return OK;
 }
 
@@ -1317,6 +1384,8 @@ LIB_DEFINE(InitSaveDataNative_1) {
 	LIB_FUNC("cGjO3wM3V28", ::Libs::SaveData::SaveDataLoadIcon);
 	LIB_FUNC("X4MYzukPc3g", ::Libs::SaveData::SaveDataDirNameSearch);
 	LIB_FUNC("yKDy8S5yLA0", ::Libs::SaveData::SaveDataTerminate);
+	LIB_FUNC("2mfSRGdshtk", ::Libs::SaveData::SaveDataUnknown_2mfSRGdshtk);
+	LIB_FUNC("8EA5OMIL1lQ", ::Libs::SaveData::SaveDataUnknown_8EA5OMIL1lQ);
 }
 
 } // namespace LibSaveDataNative

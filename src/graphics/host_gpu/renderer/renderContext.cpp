@@ -294,6 +294,18 @@ struct FaultSampler {
 		                    cpu_delta.process_user_ms, cpu_delta.process_sys_ms, cat(BudgetProbe::Wait),
 		                    cat(BudgetProbe::Sync), cat(BudgetProbe::Draw), cat(BudgetProbe::Dispatch),
 		                    cat(BudgetProbe::Protect), cat(BudgetProbe::Submit));
+		// The budget's wait split by the outermost declared reason (WaitReasonProbe); taken here, like the
+		// barrier counters, so it covers the same interval.
+		{
+			const auto wr = WaitReasonProbe::Take();
+			line += " | wait reasons ms (calls):";
+			for (uint32_t r = 0; r < WaitReasonProbe::ReasonCount; ++r) {
+				if (wr.reasons[r].first != 0) {
+					line += fmt::format(" {} {} ({})", WaitReasonProbe::Name(r), ms(wr.reasons[r].second),
+					                    wr.reasons[r].first);
+				}
+			}
+		}
 		LOGF("%s\n", line.c_str());
 		last_total = now;
 	}

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/hostReadStats.h"
 #include "graphics/host_gpu/renderer/gpuTimestamps.h"
 #include <cstdlib>
 #include <atomic>
@@ -385,6 +386,7 @@ bool StreamBuffer::WaitPendingOperations(const std::vector<Watch>& watches,
 		if (!Scheduler().IsFree(watch.tick) && !allow_wait) {
 			return false;
 		}
+		WaitReasonScope reason(WaitReasonProbe::StreamWrap);
 		Scheduler().Wait(watch.tick);
 		if (Usage() == MemoryUsage::Download) {
 			Scheduler().WaitPriorityOperations(watch.tick);

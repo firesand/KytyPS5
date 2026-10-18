@@ -93,10 +93,85 @@ struct HostReadProbe {
 	}
 };
 
+// Why the GPU thread waits for the GPU (KYTY_PROBE_FAULT_HISTOGRAM=1, printed as "wait reasons" on the FaultHistogram
+// line): every MasterSemaphore::Wait on the GPU thread is charged to the reason the OUTERMOST enclosing
+// WaitReasonScope declared, so a download wait reached from an indirect-argument read counts as draw-args rather
+// than download. "other" = a wait below no declared reason. The budget's wait category is the total.
+struct WaitReasonProbe {
+	enum Reason : uint32_t {
+		Other = 0, DrawArgs, DrawCount, DispatchArgs, Predication, // the HostReadProbe sites, in the same order
+		Download, WriteFaults, FaultAreas, StreamWrap, Gc, Finish, DescriptorPool, ReasonCount
+	};
+	struct Snapshot {
+		std::array<std::pair<uint64_t, uint64_t>, ReasonCount> reasons {}; // calls, nanoseconds
+	};
+	inline static thread_local uint32_t s_current = Other;
+	inline static std::array<HostReadCounters, ReasonCount> s_reasons {};
+	static void Add(uint32_t reason, uint64_t ns) noexcept {
+		s_reasons[reason].calls.fetch_add(1, std::memory_order_relaxed);
+		s_reasons[reason].ns.fetch_add(ns, std::memory_order_relaxed);
+	}
+	static Snapshot Take() noexcept {
+		Snapshot snapshot;
+		for (uint32_t i = 0; i < ReasonCount; ++i) {
+			snapshot.reasons[i] = {s_reasons[i].calls.exchange(0, std::memory_order_relaxed),
+			                       s_reasons[i].ns.exchange(0, std::memory_order_relaxed)};
+		}
+		return snapshot;
+	}
+	static const char* Name(uint32_t reason) noexcept {
+		static constexpr const char* names[ReasonCount] = {
+		    "other", "draw-args", "draw-count", "dispatch-args", "predication", "download",
+		    "write-faults", "fault-areas", "stream-wrap", "gc", "finish", "descriptor-pool"};
+		return names[reason];
+	}
+};
+
+// Declares why waits below this point happen; an enclosing scope's reason wins. Cheap enough for any path (one
+// thread-local read and write), independent of the probe switch.
+class WaitReasonScope {
+public:
+	explicit WaitReasonScope(WaitReasonProbe::Reason reason) noexcept: m_previous(WaitReasonProbe::s_current) {
+		if (m_previous == WaitReasonProbe::Other) {
+			WaitReasonProbe::s_current = reason;
+		}
+	}
+	~WaitReasonScope() { WaitReasonProbe::s_current = m_previous; }
+	WaitReasonScope(const WaitReasonScope&)            = delete;
+	WaitReasonScope& operator=(const WaitReasonScope&) = delete;
+
+private:
+	uint32_t m_previous;
+};
+
+// Times one MasterSemaphore::Wait on the GPU thread and charges it to the current reason.
+class WaitReasonTimer {
+public:
+	explicit WaitReasonTimer(bool active) noexcept
+	    : m_enabled(active && ProbeEnabled::Get()), m_reason(WaitReasonProbe::s_current),
+	      m_begin(m_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {}) {}
+	~WaitReasonTimer() {
+		if (!m_enabled) {
+			return;
+		}
+		const auto elapsed = std::chrono::steady_clock::now() - m_begin;
+		WaitReasonProbe::Add(m_reason, static_cast<uint64_t>(
+		                                   std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()));
+	}
+	WaitReasonTimer(const WaitReasonTimer&)            = delete;
+	WaitReasonTimer& operator=(const WaitReasonTimer&) = delete;
+
+private:
+	bool                                  m_enabled;
+	uint32_t                              m_reason;
+	std::chrono::steady_clock::time_point m_begin;
+};
+
 class HostReadScope {
 public:
 	explicit HostReadScope(HostReadProbe::Site site) noexcept
-	    : m_site(site), m_enabled(ProbeEnabled::Get()),
+	    : m_reason(static_cast<WaitReasonProbe::Reason>(uint32_t {WaitReasonProbe::DrawArgs} + uint32_t {site})), m_site(site),
+	      m_enabled(ProbeEnabled::Get()),
 	      m_begin(m_enabled ? std::chrono::steady_clock::now()
 	                        : std::chrono::steady_clock::time_point {}) {}
 	~HostReadScope() {
@@ -112,6 +187,7 @@ public:
 	HostReadScope& operator=(const HostReadScope&) = delete;
 
 private:
+	WaitReasonScope                       m_reason; // waits inside a host read are charged to its site
 	HostReadProbe::Site                   m_site;
 	bool                                  m_enabled;
 	std::chrono::steady_clock::time_point m_begin;

@@ -898,6 +898,7 @@ struct FrameCapture {
 	vk::Extent2D            extent {};
 	vk::Format              format = vk::Format::eUndefined;
 	std::string             path;
+	uint32_t                scale = 1;
 };
 
 const char* CaptureDirectory() {
@@ -906,6 +907,18 @@ const char* CaptureDirectory() {
 		return value != nullptr && value[0] != '\0' ? value : nullptr;
 	}();
 	return dir;
+}
+
+// KYTY_CAPTURE_SCALE=2|4 writes the PNG box-filtered down by that factor (a 4K frame becomes 1920x1080 or 960x540),
+// which makes frequent burst captures cheap on disk and in PNG encoding; the GPU readback stays full size.
+// A request stem ending in "@half" asks for scale 2 for that one capture.
+uint32_t CaptureScale() {
+	static const uint32_t scale = [] {
+		const char* value = std::getenv("KYTY_CAPTURE_SCALE");
+		const int   v     = value != nullptr ? std::atoi(value) : 1;
+		return v == 2 || v == 4 ? static_cast<uint32_t>(v) : 1u;
+	}();
+	return scale;
 }
 
 bool CaptureFormatSupported(vk::Format format) {
@@ -923,7 +936,7 @@ bool CaptureFormatSupported(vk::Format format) {
 std::deque<FrameCapture> g_captures; // touched by the thread that prepares frames only
 
 void WriteCapturePng(std::string path, vk::Extent2D extent, vk::Format format,
-                     std::vector<uint8_t> pixels) {
+                     std::vector<uint8_t> pixels, uint32_t scale) {
 	const size_t         count = size_t {extent.width} * extent.height;
 	std::vector<uint8_t> rgba(count * 4);
 	for (size_t i = 0; i < count; ++i) {
@@ -959,6 +972,31 @@ void WriteCapturePng(std::string path, vk::Extent2D extent, vk::Format format,
 		}
 		q[3] = 255;
 	}
+	if (scale > 1 && extent.width >= scale && extent.height >= scale) {
+		const uint32_t       w = extent.width / scale;
+		const uint32_t       h = extent.height / scale;
+		std::vector<uint8_t> small(size_t {w} * h * 4);
+		for (uint32_t y = 0; y < h; ++y) {
+			for (uint32_t x = 0; x < w; ++x) {
+				uint32_t sum[3] = {0, 0, 0};
+				for (uint32_t dy = 0; dy < scale; ++dy) {
+					const uint8_t* row = rgba.data() + (size_t {y * scale + dy} * extent.width + x * scale) * 4;
+					for (uint32_t dx = 0; dx < scale; ++dx) {
+						sum[0] += row[dx * 4 + 0];
+						sum[1] += row[dx * 4 + 1];
+						sum[2] += row[dx * 4 + 2];
+					}
+				}
+				uint8_t* q = small.data() + (size_t {y} * w + x) * 4;
+				for (int c = 0; c < 3; ++c) {
+					q[c] = static_cast<uint8_t>(sum[c] / (scale * scale));
+				}
+				q[3] = 255;
+			}
+		}
+		rgba   = std::move(small);
+		extent = vk::Extent2D {w, h};
+	}
 	const auto tmp = path + ".part";
 	const int  ok  = stbi_write_png(tmp.c_str(), static_cast<int>(extent.width),
 	                                static_cast<int>(extent.height), 4, rgba.data(),
@@ -981,7 +1019,7 @@ void CompleteCaptures(CommandScheduler& scheduler) {
 		const auto           mapped = staging.Mapped();
 		std::vector<uint8_t> pixels(mapped.begin(), mapped.begin() + static_cast<ptrdiff_t>(bytes));
 		std::thread(WriteCapturePng, capture.path, capture.extent, capture.format,
-		            std::move(pixels))
+		            std::move(pixels), capture.scale)
 		    .detach();
 	} // the staging buffer dies here, after its tick completed
 }
@@ -1006,6 +1044,11 @@ void RequestCapture(GraphicContext& graphics, CommandScheduler& scheduler,
 	std::filesystem::remove(request, ec);
 	while (!stem.empty() && (stem.back() == '\r' || stem.back() == ' ')) {
 		stem.pop_back();
+	}
+	uint32_t scale = CaptureScale();
+	if (stem.size() > 5 && stem.compare(stem.size() - 5, 5, "@half") == 0) {
+		stem.resize(stem.size() - 5);
+		scale = 2;
 	}
 	if (stem.empty()) {
 		stem = "capture-" + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1046,9 +1089,9 @@ void RequestCapture(GraphicContext& graphics, CommandScheduler& scheduler,
 	command.pipelineBarrier2(dependency);
 	const auto tick = scheduler.CurrentTick();
 	g_captures.push_back({std::move(staging), tick, {image.extent.width, image.extent.height},
-	                      image.format, (std::filesystem::path(dir) / (stem + ".png")).string()});
-	LOGF("FrameCapture: requested %s %ux%u tick=%" PRIu64 "\n", stem.c_str(), image.extent.width,
-	     image.extent.height, tick);
+	                      image.format, (std::filesystem::path(dir) / (stem + ".png")).string(), scale});
+	LOGF("FrameCapture: requested %s %ux%u scale=%u tick=%" PRIu64 "\n", stem.c_str(), image.extent.width,
+	     image.extent.height, scale, tick);
 }
 
 } // namespace
