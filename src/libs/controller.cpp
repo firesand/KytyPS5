@@ -168,6 +168,10 @@ private:
 	ControllerState  m_states[STATES_MAX];
 	bool             m_obtained[STATES_MAX] {};
 	uint32_t         m_states_num    = 0;
+	// Buttons pressed since the last ReadState: a press released between two reads is still reported down once.
+	// At 2-4 fps (Zero Company) a quick tap otherwise falls between two scePadReadState calls and never reaches the
+	// game (KYTY_PAD_LATCH=0 turns this off).
+	uint32_t         m_latched_buttons = 0;
 	uint32_t         m_first_state   = 0;
 	uint8_t          m_next_touch_id = 1;
 	// The game's last requests, re-sent when their intensity setting changes.
@@ -576,6 +580,7 @@ void GameController::CheckActive() {
 	m_active_id     = new_active_id;
 	m_connected     = new_connected;
 	m_state         = {};
+	m_latched_buttons = 0;
 	m_gyro_time     = 0;
 	m_up_reference_valid = false;
 	m_states_num    = 0;
@@ -607,6 +612,9 @@ void GameController::Button(int id, uint32_t button, bool down) {
 		m_state.time = LibKernel::KernelGetProcessTime();
 
 		m_state.buttons = down ? m_state.buttons | button : m_state.buttons & ~button;
+		if (down) {
+			m_latched_buttons |= button;
+		}
 
 		AddState();
 	}
@@ -970,6 +978,14 @@ void GameController::ReadState(ControllerState* state, bool* flag, int* count) {
 	*flag  = m_connected;
 	*count = m_connected_count;
 	*state = m_state;
+	static const bool latch = [] {
+		const char* value = std::getenv("KYTY_PAD_LATCH");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (latch) {
+		state->buttons |= m_latched_buttons;
+	}
+	m_latched_buttons = 0;
 }
 
 int GameController::ReadStates(ControllerState* states, int states_num, bool* flag, int* count) {
@@ -1215,6 +1231,36 @@ int KYTY_SYSV_ABI PadIsRemoteController(int handle, bool* is_remote) {
 	return OK;
 }
 
+// Which pad API the game polls and what it sees (Zero Company's move confirm is ignored at 2 fps): counters every
+// 4096 calls; KYTY_PAD_TRACE=1 also logs every change of the button mask a read returns (first 4000).
+static void PadTraceRead(const char* api, int requested, int returned, const PadData* data) {
+	static std::atomic_uint64_t calls[2] {};
+	static std::atomic_uint64_t samples[2] {};
+	static std::atomic_uint32_t trace_lines {0};
+	static uint32_t             last_buttons = 0;
+	static const bool           trace        = [] {
+        const char* value = std::getenv("KYTY_PAD_TRACE");
+        return value != nullptr && value[0] == '1';
+	}();
+	const int  k = api[4] == 'S' ? 0 : 1; // "ReadState" vs "Read"
+	const auto n = calls[k].fetch_add(1, std::memory_order_relaxed) + 1;
+	samples[k].fetch_add(static_cast<uint64_t>(returned), std::memory_order_relaxed);
+	if ((n & 4095u) == 1u) {
+		LOGF("Pad: %s call %" PRIu64 " (requested %d, returned %d); totals ReadState %" PRIu64 " Read %" PRIu64
+		     " samples %" PRIu64 "\n",
+		     api, n, requested, returned, calls[0].load(), calls[1].load(), samples[1].load());
+	}
+	if (trace) {
+		for (int i = 0; i < returned; i++) {
+			if (data[i].buttons != last_buttons && trace_lines.fetch_add(1, std::memory_order_relaxed) < 4000) {
+				LOGF("Pad: %s sample %d/%d buttons 0x%08" PRIx32 " -> 0x%08" PRIx32 " ts=%" PRIu64 "\n", api, i + 1,
+				     returned, last_buttons, data[i].buttons, data[i].timestamp);
+			}
+			last_buttons = data[i].buttons;
+		}
+	}
+}
+
 int KYTY_SYSV_ABI PadReadState(int handle, PadData* data) {
 	PRINT_NAME();
 
@@ -1232,6 +1278,7 @@ int KYTY_SYSV_ABI PadReadState(int handle, PadData* data) {
 	g_controller->ReadState(&state, &connected, &connected_count);
 
 	pad_fill_data(data, state, connected, connected_count);
+	PadTraceRead("ReadState", 1, 1, data);
 
 	return OK;
 }
@@ -1265,6 +1312,7 @@ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 	for (int i = 0; i < ret_num; i++) {
 		pad_fill_data(&data[i], states[i], connected, connected_count);
 	}
+	PadTraceRead("Read", num, ret_num, data);
 
 	return ret_num;
 }
