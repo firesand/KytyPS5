@@ -700,7 +700,11 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 				std::memcpy(mapped + copy.srcOffset, sources[i], copy.size);
 			} else {
 				const auto address = buffer.CpuAddress() + copy.dstOffset;
-				std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
+				if (const void* ptr = LibKernel::Memory::TryGetBackingPointer(address, copy.size)) {
+					std::memcpy(mapped + copy.srcOffset, ptr, copy.size);
+				} else if (!LibKernel::Memory::CopySparseMemory(address, mapped + copy.srcOffset, copy.size)) {
+					std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
+				}
 			}
 			copy.srcOffset += base_offset;
 		}
@@ -722,7 +726,11 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
 		if (mapped != nullptr) {
-			std::memcpy(mapped, reinterpret_cast<const void*>(vaddr), size);
+			if (const void* ptr = LibKernel::Memory::TryGetBackingPointer(vaddr, size)) {
+				std::memcpy(mapped, ptr, size);
+			} else if (!LibKernel::Memory::CopySparseMemory(vaddr, mapped, size)) {
+				std::memcpy(mapped, reinterpret_cast<const void*>(vaddr), size);
+			}
 			m_stream_buffer.Commit();
 			return {&m_stream_buffer, offset};
 		}
