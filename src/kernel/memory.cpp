@@ -7,6 +7,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/hostReadStats.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -878,6 +879,7 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 			return false;
 		}
 		auto& buffers = GetGpuResources().GetBufferCache();
+		Graphics::WaitReasonScope reason(Graphics::WaitReasonProbe::BackingRead);
 		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
 			buffers.ReadMemory(vaddr, size);
 		}

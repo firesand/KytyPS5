@@ -221,6 +221,18 @@ private:
 	bool m_num_instances_stale   = false; // a GPU packet ran since the last host write
 	void PoisonGpuIndirectSlots(const ShaderDrawParameters& parameters, uint64_t last_record_addr,
 	                            bool indexed);
+
+	// KYTY_CP_GPU_INDIRECT (b1) diagnostics: running packet counts by class and the state at the
+	// last GPU mesh packet (HostReadProbe Merge* counters).
+	struct MergeProbe {
+		uint64_t ctx = 0, sh = 0, draw = 0, other = 0;
+		bool     valid     = false;
+		uint64_t mesh_hash = 0, ps_addr = 0, user_data = 0;
+		uint64_t at_ctx = 0, at_draw = 0, at_other = 0;
+	};
+	MergeProbe m_merge_probe;
+	void NoteMergeOpcode(uint32_t opcode);
+	void CountMergeRun(uint64_t mesh_hash);
 	void CountStaleDrawState(bool instances_from_state, const GpuIndirectDraw* gpu_indirect);
 
 	uint32_t m_de_count    = 0;

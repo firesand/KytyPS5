@@ -1279,6 +1279,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				HostReadProbe::CountGpuIndirect(HostReadProbe::ArgsWaitSkipped);
 			}
 		} else {
+			WaitReasonScope reason(WaitReasonProbe::ArgsCheck);
 			// Lazy mode replaces the sticky HasPendingUnboundedWrites() (true until a host wait)
 			// with the tracker's per-command-buffer indirect_write_stages, evaluated at the barrier
 			// site.
@@ -1294,6 +1295,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				BarrierProbe::NoteOld(BarrierProbe::DrawIndirectArgs);
 			}
 		}
+		// Diagnostics: who wrote the argument range (both branches above published what had
+		// completed), and remember its pages for the readback attribution in ReadMemory.
+		HostReadProbe::CountGpuIndirect(
+		    args_unpublished || (cache.HasPendingUnboundedWrites() &&
+		                         cache.InUnboundedWriteRange(gpu_indirect->args_addr, indirect_args_bytes))
+		        ? HostReadProbe::ArgsUnbounded
+		    : cache.HasPublishedGpuWrites(gpu_indirect->args_addr, indirect_args_bytes)
+		        ? HostReadProbe::ArgsGpuBound
+		        : HostReadProbe::ArgsCpuOnly);
+		cache.NoteGpuIndirectArgs(gpu_indirect->args_addr, indirect_args_bytes);
 		HostReadProbe::AddGpuIndirectArgsWait(static_cast<uint64_t>(
 		    std::chrono::duration_cast<std::chrono::nanoseconds>(
 		        std::chrono::steady_clock::now() - wait_begin).count()));
@@ -1920,6 +1931,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		// GPU-indirect draws keep this too: ObtainBuffer must not upload stale CPU bytes over
 		// GPU-built indices whose write-fault records are still unpublished.
 		const auto begin = std::chrono::steady_clock::now();
+		WaitReasonScope reason(WaitReasonProbe::IndexRange);
 		m_context.GetBufferCache().PrepareHostRead(index_source.address, index_source.size);
 		if (args.gpu_indirect != nullptr) {
 			HostReadProbe::AddGpuIndirectWait(static_cast<uint64_t>(

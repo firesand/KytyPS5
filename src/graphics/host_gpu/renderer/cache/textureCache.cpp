@@ -1455,7 +1455,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			     static_cast<int>(desc.info.metadata.kind), static_cast<int>(desc.type),
 			     volume_texture ? 1 : 0, desc.view_info.level_count, slice_size, count);
 		}
-		m_buffer_cache.ReadMemory(range.address, range.size, false);
+		m_buffer_cache.ReadMemory(range.address, range.size, false, WaitReasonProbe::TextureReadback);
 	}
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = range.address + slice_size * (first + slice);

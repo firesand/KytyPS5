@@ -44710,8 +44710,35 @@ static void CheckApplyDrawParameters() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// Wait-reason attribution of readbacks: names complete and distinct; the outermost declared
+// reason wins and CurrentOr (what ReadMemory carries to the GPU thread) honours it.
+static void CheckWaitReasonAttribution() {
+  const char *name = "WaitReasonAttribution";
+  using Probe = Libs::Graphics::WaitReasonProbe;
+  for (uint32_t i = 0; i < Probe::ReasonCount; ++i) {
+    for (uint32_t j = 0; j < i; ++j) {
+      Require(name, "names distinct", std::strcmp(Probe::Name(i), Probe::Name(j)) != 0,
+              "two wait reasons share a name");
+    }
+  }
+  Require(name, "undeclared", Probe::CurrentOr(Probe::ReadFaultGuest) == Probe::ReadFaultGuest,
+          "with no declared reason the caller's fallback must be used");
+  {
+    Libs::Graphics::WaitReasonScope outer(Probe::DrawArgs);
+    Require(name, "declared wins", Probe::CurrentOr(Probe::ReadFaultGpu) == Probe::DrawArgs,
+            "a host read inside a declared scope lost its reason");
+    Libs::Graphics::WaitReasonScope inner(Probe::Download);
+    Require(name, "outermost wins", Probe::CurrentOr(Probe::Other) == Probe::DrawArgs,
+            "an inner scope overrode the outer reason");
+  }
+  Require(name, "scope restored", Probe::CurrentOr(Probe::BackingRead) == Probe::BackingRead,
+          "a wait-reason scope leaked past its end");
+  std::printf("[host]    %-32s ok (%u)\n", name, static_cast<uint32_t>(Probe::ReasonCount));
+}
+
 void CheckMeshTaskIndirect() {
   CheckGpuIndirectReasonNames();
+  CheckWaitReasonAttribution();
   CheckGpuIndirectHashFilter();
   CheckMeshTaskPathEmission();
   CheckMeshTaskPushLayout();

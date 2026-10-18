@@ -323,20 +323,31 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
+	const auto reason = GuestGpu::IsGpuThread() ? WaitReasonProbe::InvalidateGpu : WaitReasonProbe::InvalidateGuest;
 	m_memory_tracker.InvalidateRegion(vaddr, size,
-	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
+	                                  [this, vaddr, size, reason] { ReadMemory(vaddr, size, true, reason); });
 }
 
 void BufferCache::InvalidateWriteFault(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid write-fault range\n");
 	}
+	const auto reason = GuestGpu::IsGpuThread() ? WaitReasonProbe::WriteFaultGpu : WaitReasonProbe::WriteFaultGuest;
 	m_memory_tracker.InvalidateWriteFault(
-	    vaddr, size, [this, vaddr, size] { ReadMemory(vaddr, size, true); });
+	    vaddr, size, [this, vaddr, size, reason] { ReadMemory(vaddr, size, true, reason); });
 }
 
-void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
+void BufferCache::NoteGpuIndirectArgs(uint64_t vaddr, uint64_t size) {
+	m_gpu_indirect_args[m_gpu_indirect_args_next] = {vaddr >> 12u, ((vaddr + size - 1u) >> 12u) + 1u};
+	m_gpu_indirect_args_next = (m_gpu_indirect_args_next + 1u) % kGpuIndirectArgsRing;
+}
+
+void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write,
+                             WaitReasonProbe::Reason reason) {
 	m_sync_stats.read_memory_calls++; // counted on the calling thread; approximate
+	// The calling thread's declared reason wins (a host read inside HostReadScope stays draw-args);
+	// the GPU thread runs the readback below with it.
+	const auto wait_reason = WaitReasonProbe::CurrentOr(reason);
 	// KYTY_PROBE_READBACK_LOG=1: one line per synchronous readback request (first 4000, then 1/100).
 	static const bool readback_log = [] {
 		const char* value = std::getenv("KYTY_PROBE_READBACK_LOG");
@@ -348,27 +359,42 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	struct ReadbackReport {
 		bool enabled; uint64_t index; uint64_t vaddr, size; bool is_write; bool gpu_thread;
 		std::chrono::steady_clock::time_point start; const bool* bar; const int* reason;
+		uint32_t wait_reason;
 		~ReadbackReport() {
 			if (!enabled || (index >= 4000 && index % 100 != 0)) return;
 			const auto ms = std::chrono::duration_cast<std::chrono::microseconds>(
 			                    std::chrono::steady_clock::now() - start).count() / 1000.0;
-			LOGF("Readback: #%llu %s 0x%016" PRIx64 "+0x%" PRIx64 " from %s %.2f ms %s\n",
+			LOGF("Readback: #%llu %s 0x%016" PRIx64 "+0x%" PRIx64 " from %s %.2f ms %s reason=%s\n",
 			     static_cast<unsigned long long>(index), is_write ? "write-fault" : "read",
 			     vaddr, size, gpu_thread ? "gpu-thread" : "game-thread", ms,
 			     *bar ? "bar" : (*reason == 1 ? "unmapped" : *reason == 2 ? "notick" :
-			                     *reason == 3 ? "inflight" : "copy"));
+			                     *reason == 3 ? "inflight" : "copy"),
+			     WaitReasonProbe::Name(wait_reason));
 		}
 	} readback_report {readback_log, readback_index, vaddr, size, is_write,
 	                   GuestGpu::IsGpuThread(), readback_start, &m_last_download_bar,
-	                   &m_last_bar_reason};
+	                   &m_last_bar_reason, wait_reason};
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
+	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, wait_reason] {
+		WaitReasonScope reason_scope(wait_reason);
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
+		}
+		// Diagnostics: a readback of a page that recent GPU-indirect draws took arguments from.
+		if (const auto first = vaddr >> 12u, last = ((vaddr + size - 1u) >> 12u) + 1u;
+		    std::ranges::any_of(m_gpu_indirect_args, [&](const auto& range) {
+			    return range.second != 0 && first < range.second && range.first < last;
+		    })) {
+			HostReadProbe::CountGpuIndirect(HostReadProbe::ArgsPageReadback);
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+				LOGF("GpuIndirect(args-page-readback): %s 0x%016" PRIx64 "+0x%" PRIx64 " reason=%s\n",
+				     is_write ? "write" : "read", vaddr, size, WaitReasonProbe::Name(wait_reason));
+			}
 		}
 		uint64_t publish_vaddr = vaddr;
 		uint64_t publish_size  = size;

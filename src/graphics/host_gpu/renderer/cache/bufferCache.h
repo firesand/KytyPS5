@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/lruCache.h"
 #include "common/slotVector.h"
+#include "graphics/host_gpu/hostReadStats.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
@@ -13,6 +14,7 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <array>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -83,7 +85,10 @@ public:
 	// Write-fault entry: InvalidateMemory with the fault-ahead window (see MemoryTracker).
 
 	void InvalidateWriteFault(uint64_t vaddr, uint64_t size);
-	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
+	// `reason`: what a download wait inside is charged to when the calling thread declares nothing
+	// (WaitReasonProbe; carried to the GPU thread).
+	void ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false,
+	                WaitReasonProbe::Reason reason = WaitReasonProbe::Download);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	// `allow_stream` false: never serve the range from the stream buffer (a host memcpy of guest
@@ -163,6 +168,14 @@ public:
 	// waiting for it; publishes marks that already completed. Returns true when unpublished
 	// unbounded writes may still cover the range.
 	[[nodiscard]] bool PublishGpuWritesNoWait(uint64_t vaddr, uint64_t size);
+	// GPU thread: published bound GPU writes cover part of the range (no drain, no publish).
+	[[nodiscard]] bool HasPublishedGpuWrites(uint64_t vaddr, uint64_t size) const {
+		return m_gpu_modified_ranges.Intersects(vaddr, size);
+	}
+	// GPU thread, diagnostics (KYTY_CP_GPU_INDIRECT): the last kGpuIndirectArgsRing argument ranges
+	// drawn with GPU-resident arguments; ReadMemory counts and logs readbacks that touch their pages
+	// (does a host reader still consume GPU-built arguments?).
+	void NoteGpuIndirectArgs(uint64_t vaddr, uint64_t size);
 	void MarkPageWritten(uint64_t vaddr);      // any thread (fault-processing operation)
 	void MarkWriteFaultOverflow();             // any thread
 	// Safe point between PM4 packets / at garbage collection: records the pending write-fault
@@ -325,6 +338,9 @@ private:
 	SyncStats                                         m_sync_stats;
 	GpuWriteTicks<CACHING_PAGEBITS>                    m_gpu_write_ticks;
 	uint64_t                                          m_bar_block_tick = 0;
+	static constexpr size_t                           kGpuIndirectArgsRing = 64;
+	std::array<std::pair<uint64_t, uint64_t>, kGpuIndirectArgsRing> m_gpu_indirect_args {}; // page range [first, last)
+	size_t                                            m_gpu_indirect_args_next = 0;
 	bool                                              m_last_download_bar = false;
 	int                                               m_last_bar_reason   = 0; // 1 unmapped, 2 no tick, 3 in flight
 	uint64_t                                          m_last_upload_bytes = 0;

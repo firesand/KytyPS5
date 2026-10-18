@@ -55,6 +55,16 @@ struct HostReadProbe {
 	//   device's mesh workgroup limits / found empty (GPU atomics, read back with a delay);
 	// - ArgsWaitSkipped (lazy mode 1): GPU packets whose argument range intersected pending
 	//   unbounded writes and skipped the waiting publish (ObtainBuffer then avoids the stream path);
+	// - ArgsUnbounded / ArgsGpuBound / ArgsCpuOnly: who wrote a GPU-indirect packet's argument
+	//   range at draw time: pending fault-tracked (unbounded) writes, published bound GPU writes, or
+	//   neither (CPU data);
+	// - ArgsPageReadback: ReadMemory calls that touched a page recent GPU-indirect packets took
+	//   arguments from (first 32 logged as "GpuIndirect(args-page-readback)");
+	// - Merge*: consecutive GPU mesh packets (b1, can N packets become one task dispatch?).
+	//   MergeSame: same mesh/pixel hash, identical GS/PS user SGPR values, nothing but SH register
+	//   writes and NOPs in between. MergeUserData: same hashes, user SGPR values differ.
+	//   MergeBreakCtx: context/uconfig register writes in between. MergeBreakShader: other hashes.
+	//   MergeBreakOp: another draw, dispatch or side-effect packet (event, wait, DMA, ...) in between;
 	// - StaleInstances: a later draw that took its instance count from m_num_instances while a GPU
 	//   packet had left it at the pre-packet value (the host path stores the last record's count);
 	// - StaleSgpr: a later draw whose shader can read a GS user-data register that a GPU packet left
@@ -63,12 +73,16 @@ struct HostReadProbe {
 	enum GpuIndirect : uint32_t { GpuDraws = 0, FallbackIndexOffset, FallbackOther, FallbackMesh, FallbackSrt,
 	                              MeshGpuDraws, FallbackMeshDenied, FallbackMeshCountAddr, FallbackMeshPrim,
 	                              FallbackDenied, MeshClampedRecords, MeshEmptyRecords, ArgsWaitSkipped,
+	                              ArgsUnbounded, ArgsGpuBound, ArgsCpuOnly, ArgsPageReadback, MergeSame,
+	                              MergeUserData, MergeBreakCtx, MergeBreakShader, MergeBreakOp,
 	                              StaleInstances, StaleSgpr, GpuIndirectCount };
 	// Short names, one per enumerator in order; the size is deduced, so adding an enumerator without
 	// a name (or the reverse) fails to compile.
 	static constexpr auto kGpuIndirectNames = std::to_array<const char*>(
 	    {"gpu", "index_offset", "other", "mesh", "srt", "mesh-gpu", "mesh-denied", "mesh-count-addr",
 	     "mesh-prim", "denied", "mesh-clamped", "mesh-empty", "args-wait-skipped",
+	     "args-unbounded", "args-gpu-bound", "args-cpu", "args-page-readback", "merge-same", "merge-userdata",
+	     "merge-break-ctx", "merge-break-shader", "merge-break-op",
 	     "stale-instances", "stale-sgpr"});
 	static_assert(kGpuIndirectNames.size() == GpuIndirectCount, "GpuIndirect enum / name table mismatch");
 	struct Snapshot {
@@ -133,10 +147,21 @@ struct HostReadProbe {
 // line): every MasterSemaphore::Wait on the GPU thread is charged to the reason the OUTERMOST enclosing
 // WaitReasonScope declared, so a download wait reached from an indirect-argument read counts as draw-args rather
 // than download. "other" = a wait below no declared reason. The budget's wait category is the total.
+// BufferCache::ReadMemory runs on the GPU thread (SendCommandSync) and carries its caller's reason
+// there: "download" is now only a ReadMemory caller that declares nothing. Readback callers:
+// read-fault-guest / read-fault-gpu (a host read of a GPU-dirty page, HandleFault, by thread),
+// write-fault-guest / write-fault-gpu (a host write into a GPU-dirty page: readback before the
+// write), invalidate-guest / invalidate-gpu (explicit range invalidation: file reads into guest
+// memory, unmap, texture slices), texture-readback (texture cache host check), backing-read
+// (TryReadBufferBacking), dispatch-args-lds (indirect dispatch sizing its LDS buffer from GPU-built
+// arguments). Flush waits: index-range (DrawIndex publishing an index range), args-check
+// (GPU-indirect argument check, lazy modes 0/2).
 struct WaitReasonProbe {
 	enum Reason : uint32_t {
 		Other = 0, DrawArgs, DrawCount, DispatchArgs, Predication, // the HostReadProbe sites, in the same order
-		Download, WriteFaults, FaultAreas, StreamWrap, Gc, Finish, DescriptorPool, ReasonCount
+		Download, WriteFaults, FaultAreas, StreamWrap, Gc, Finish, DescriptorPool,
+		ReadFaultGuest, ReadFaultGpu, WriteFaultGuest, WriteFaultGpu, InvalidateGuest, InvalidateGpu,
+		TextureReadback, BackingRead, DispatchArgsLds, IndexRange, ArgsCheck, ReasonCount
 	};
 	struct Snapshot {
 		std::array<std::pair<uint64_t, uint64_t>, ReasonCount> reasons {}; // calls, nanoseconds
@@ -155,11 +180,16 @@ struct WaitReasonProbe {
 		}
 		return snapshot;
 	}
-	static const char* Name(uint32_t reason) noexcept {
-		static constexpr const char* names[ReasonCount] = {
-		    "other", "draw-args", "draw-count", "dispatch-args", "predication", "download",
-		    "write-faults", "fault-areas", "stream-wrap", "gc", "finish", "descriptor-pool"};
-		return names[reason];
+	static constexpr auto kNames = std::to_array<const char*>(
+	    {"other", "draw-args", "draw-count", "dispatch-args", "predication", "download", "write-faults",
+	     "fault-areas", "stream-wrap", "gc", "finish", "descriptor-pool", "read-fault-guest",
+	     "read-fault-gpu", "write-fault-guest", "write-fault-gpu", "invalidate-guest", "invalidate-gpu",
+	     "texture-readback", "backing-read", "dispatch-args-lds", "index-range", "args-check"});
+	static_assert(kNames.size() == ReasonCount, "WaitReasonProbe reason / name table mismatch");
+	static const char* Name(uint32_t reason) noexcept { return kNames[reason]; }
+	// The reason a wait below this point on the calling thread would be charged to, or `fallback`.
+	static Reason CurrentOr(Reason fallback) noexcept {
+		return s_current != Other ? static_cast<Reason>(s_current) : fallback;
 	}
 };
 

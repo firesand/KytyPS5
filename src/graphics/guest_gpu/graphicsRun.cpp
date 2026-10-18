@@ -58,6 +58,17 @@ struct DrawIndexedIndirectArgs {
 	uint32_t start_instance_location;
 };
 
+// KYTY_CP_GPU_INDIRECT=1: indirect draws read their argument records on the GPU
+// (vkCmdDraw[Indexed]Indirect[Count]) instead of through host reads that wait for the producing
+// dispatch. Default off.
+static bool GpuIndirectEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_CP_GPU_INDIRECT");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 static bool GraphicsRunDebugDumpEnabled() {
 	return Config::GraphicsDebugDumpEnabled() &&
 	       Config::GetPrintfDirection() != Config::LogDirection::Silent;
@@ -243,6 +254,7 @@ void CommandProcessor::Reset() {
 	m_index_base_addr                  = 0;
 	m_num_instances                    = 1;
 	m_sgpr_poison                      = {};
+	m_merge_probe                      = {};
 	m_any_sgpr_poison                  = false;
 	m_num_instances_stale              = false;
 	m_predicate_skip                   = false;
@@ -1016,6 +1028,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			     total_dw - remaining_dw, packet_header);
 		}
 
+		if (GpuIndirectEnabled()) {
+			NoteMergeOpcode(opcode);
+		}
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		EXIT_IF(packet_dw > remaining_dw);
@@ -1129,15 +1144,84 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 	}
 }
 
-// KYTY_CP_GPU_INDIRECT=1: indirect draws read their argument records on the GPU
-// (vkCmdDraw[Indexed]Indirect[Count]) instead of through host reads that wait for the producing
-// dispatch. Default off.
-static bool GpuIndirectEnabled() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_CP_GPU_INDIRECT");
-		return value != nullptr && value[0] == '1';
-	}();
-	return enabled;
+
+// (b1) diagnostics: classify every PM4 packet so consecutive GPU mesh packets can be compared.
+void CommandProcessor::NoteMergeOpcode(uint32_t opcode) {
+	auto& probe = m_merge_probe;
+	switch (opcode) {
+		case Pm4::IT_SET_SH_REG:
+		case Pm4::IT_SET_SH_REG_INDIRECT: probe.sh++; break;
+		case Pm4::IT_SET_CONTEXT_REG:
+		case Pm4::IT_SET_CONTEXT_REG_INDIRECT:
+		case Pm4::IT_SET_UCONFIG_REG:
+		case Pm4::IT_SET_UCONFIG_REG_INDEX:
+		case Pm4::IT_SET_UCONFIG_REG_INDIRECT:
+		case Pm4::IT_CLEAR_STATE: probe.ctx++; break;
+		case Pm4::IT_DRAW_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_INDIRECT:
+		case Pm4::IT_DRAW_INDIRECT_MULTI:
+		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI:
+		case Pm4::IT_DRAW_INDEX_2:
+		case Pm4::IT_DRAW_INDEX_OFFSET_2:
+		case Pm4::IT_DRAW_INDEX_AUTO:
+		case Pm4::IT_DISPATCH_DIRECT:
+		case Pm4::IT_DISPATCH_INDIRECT:
+		case Pm4::IT_DISPATCH_DRAW_PREAMBLE: probe.draw++; break;
+		// No side effect on a merged dispatch: per-packet state the records carry, or CE/DE sync.
+		case Pm4::IT_NOP:
+		case Pm4::IT_INDIRECT_BUFFER: // control flow only; its packets are classified one by one
+		case Pm4::IT_SET_BASE:
+		case Pm4::IT_INDEX_BASE:
+		case Pm4::IT_INDEX_TYPE:
+		case Pm4::IT_INDEX_BUFFER_SIZE:
+		case Pm4::IT_NUM_INSTANCES:
+		case Pm4::IT_PFP_SYNC_ME:
+		case Pm4::IT_INCREMENT_DE_COUNTER:
+		case Pm4::IT_INCREMENT_CE_COUNTER:
+		case Pm4::IT_WAIT_ON_CE_COUNTER:
+		case Pm4::IT_WAIT_ON_DE_COUNTER_DIFF:
+		case Pm4::IT_WRITE_CONST_RAM: break;
+		default: probe.other++; break;
+	}
+}
+
+// Called for each GPU mesh packet after it was recorded (the packet itself is one probe.draw).
+void CommandProcessor::CountMergeRun(uint64_t mesh_hash) {
+	auto&       probe = m_merge_probe;
+	const auto& vs    = m_sh_ctx.GetVs();
+	const auto& ps    = m_sh_ctx.GetPs();
+	uint64_t    user_data = 0xcbf29ce484222325ull; // FNV-1a over the GS and PS user SGPR values
+	const auto  mix = [&](uint64_t value) {
+		 user_data = (user_data ^ value) * 0x100000001b3ull;
+	};
+	for (uint32_t i = 0; i < vs.gs_user_sgpr.count && i < HW::UserSgprInfo::SGPRS_MAX; ++i) {
+		mix(vs.gs_user_sgpr.value[i]);
+	}
+	mix(UINT64_MAX);
+	for (uint32_t i = 0; i < ps.ps_user_sgpr.count && i < HW::UserSgprInfo::SGPRS_MAX; ++i) {
+		mix(ps.ps_user_sgpr.value[i]);
+	}
+	const uint64_t ps_addr = ps.ps_regs.data_addr;
+	if (probe.valid) {
+		if (probe.other != probe.at_other || probe.draw != probe.at_draw + 1u) {
+			HostReadProbe::CountGpuIndirect(HostReadProbe::MergeBreakOp);
+		} else if (mesh_hash != probe.mesh_hash || ps_addr != probe.ps_addr) {
+			HostReadProbe::CountGpuIndirect(HostReadProbe::MergeBreakShader);
+		} else if (probe.ctx != probe.at_ctx) {
+			HostReadProbe::CountGpuIndirect(HostReadProbe::MergeBreakCtx);
+		} else if (user_data != probe.user_data) {
+			HostReadProbe::CountGpuIndirect(HostReadProbe::MergeUserData);
+		} else {
+			HostReadProbe::CountGpuIndirect(HostReadProbe::MergeSame);
+		}
+	}
+	probe.valid     = true;
+	probe.mesh_hash = mesh_hash;
+	probe.ps_addr   = ps_addr;
+	probe.user_data = user_data;
+	probe.at_ctx    = probe.ctx;
+	probe.at_draw   = probe.draw;
+	probe.at_other  = probe.other;
 }
 
 void CommandProcessor::PoisonGpuIndirectSlots(const ShaderDrawParameters& parameters,
@@ -1403,6 +1487,7 @@ bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_c
 	HostReadProbe::CountGpuIndirect(HostReadProbe::GpuDraws);
 	if (shader.mesh) {
 		HostReadProbe::CountGpuIndirect(HostReadProbe::MeshGpuDraws);
+		CountMergeRun(shader.hash);
 	}
 	PoisonGpuIndirectSlots(parameters,
 	                       draw.args_addr + static_cast<uint64_t>(max_count_or_count - 1u) * stride_in_bytes,
