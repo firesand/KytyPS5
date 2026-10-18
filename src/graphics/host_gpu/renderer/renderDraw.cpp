@@ -1423,6 +1423,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			task_pc.stride         = gpu_indirect->stride;
 			task_pc.primitive_info = PackMeshTaskPrimitiveInfo(
 			    mesh.primitives_per_group, mesh.InputPrimitiveSize(), mesh.InputPrimitiveStep());
+			task_pc.counters_bda   = TaskCountersAddress();
 			vk_buffer.pushConstants(pipeline.pipeline_layout,
 			                        vk::ShaderStageFlagBits::eTaskEXT |
 			                            vk::ShaderStageFlagBits::eMeshEXT |
@@ -1655,6 +1656,34 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	m_context.GetCommandScheduler().DiagnosticOperationComplete();
 }
 
+uint64_t RenderExecutor::TaskCountersAddress() {
+	if (!ProbeEnabled::Get()) {
+		return 0;
+	}
+	if (m_task_counters == nullptr) {
+		m_task_counters = std::make_unique<Buffer>(
+		    m_context.GetGraphics(), m_context.GetCommandScheduler(), MemoryUsage::Download, 0,
+		    vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+		    sizeof(MeshTaskCounters));
+		EXIT_IF(m_task_counters->Mapped().size() < sizeof(MeshTaskCounters));
+		std::memset(m_task_counters->Mapped().data(), 0, sizeof(MeshTaskCounters));
+		m_task_counters->Flush(0, sizeof(MeshTaskCounters));
+	} else {
+		// Diagnostic read without synchronization: the GPU atomics show up here a few
+		// submissions late.
+		m_task_counters->Invalidate(0, sizeof(MeshTaskCounters));
+		MeshTaskCounters now {};
+		std::memcpy(&now, m_task_counters->Mapped().data(), sizeof(now));
+		const std::array<uint32_t, 2> values {now.clamped_records, now.empty_records};
+		HostReadProbe::CountGpuIndirect(HostReadProbe::MeshClampedRecords,
+		                                values[0] - m_task_counters_seen[0]);
+		HostReadProbe::CountGpuIndirect(HostReadProbe::MeshEmptyRecords,
+		                                values[1] - m_task_counters_seen[1]);
+		m_task_counters_seen = values;
+	}
+	return m_task_counters->BufferDeviceAddress();
+}
+
 bool RenderExecutor::CanDrawIndirectOnGpu(CommandBuffer& buffer, bool indexed,
                                           uint32_t index_type_and_size, uint32_t draw_count,
                                           const ShaderDrawParameters& parameters,
@@ -1718,9 +1747,13 @@ bool RenderExecutor::CanDrawIndirectOnGpu(CommandBuffer& buffer, bool indexed,
 			}
 			return false;
 		}
-		// The task shader's group count is ceil(vertex_count / primitives_per_group), the host
-		// formula only for one-vertex primitives.
-		if (primitive != Prospero::PrimitiveType::kPointList) {
+		// The primitive types the mesh path assembles (PrepareProgram); the task shader computes
+		// the host's group count from the input primitive size / step.
+		if (primitive != Prospero::PrimitiveType::kPointList &&
+		    primitive != Prospero::PrimitiveType::kLineList &&
+		    primitive != Prospero::PrimitiveType::kTriList &&
+		    primitive != Prospero::PrimitiveType::kTriFan &&
+		    primitive != Prospero::PrimitiveType::kTriStrip) {
 			if (block != nullptr) {
 				*block = GpuIndirectBlock::MeshPrim;
 			}

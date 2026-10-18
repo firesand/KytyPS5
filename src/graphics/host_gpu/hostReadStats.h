@@ -51,16 +51,19 @@ struct HostReadProbe {
 	// - FallbackMeshCountAddr: the packet names a count dword (the task shader ignores it);
 	// - FallbackMeshPrim: the input primitive type is not supported by the task shader;
 	// - FallbackDenied: a vertex-stage hash in KYTY_CP_GPU_INDIRECT_DENY_HASH (counted in "other" too);
+	// - MeshClampedRecords / MeshEmptyRecords: argument records the task shader clamped to the
+	//   device's mesh workgroup limits / found empty (GPU atomics, read back with a delay);
 	// - StaleSgpr: a later draw whose shader can read a GS user-data register that a GPU packet left
 	//   at its pre-packet value (the host path would have patched it with the last record's offset).
 	enum GpuIndirect : uint32_t { GpuDraws = 0, FallbackIndexOffset, FallbackOther, FallbackMesh, FallbackSrt,
 	                              MeshGpuDraws, FallbackMeshDenied, FallbackMeshCountAddr, FallbackMeshPrim,
-	                              FallbackDenied, StaleSgpr, GpuIndirectCount };
+	                              FallbackDenied, MeshClampedRecords, MeshEmptyRecords, StaleSgpr,
+	                              GpuIndirectCount };
 	// Short names, one per enumerator in order; the size is deduced, so adding an enumerator without
 	// a name (or the reverse) fails to compile.
 	static constexpr auto kGpuIndirectNames = std::to_array<const char*>(
 	    {"gpu", "index_offset", "other", "mesh", "srt", "mesh-gpu", "mesh-denied", "mesh-count-addr",
-	     "mesh-prim", "denied", "stale-sgpr"});
+	     "mesh-prim", "denied", "mesh-clamped", "mesh-empty", "stale-sgpr"});
 	static_assert(kGpuIndirectNames.size() == GpuIndirectCount, "GpuIndirect enum / name table mismatch");
 	struct Snapshot {
 		std::array<std::pair<uint64_t, uint64_t>, SiteCount> sites {}; // calls, nanoseconds
@@ -77,8 +80,8 @@ struct HostReadProbe {
 		s_gpu_indirect_wait_ns.fetch_add(ns, std::memory_order_relaxed);
 	}
 
-	static void CountGpuIndirect(GpuIndirect kind) noexcept {
-		s_gpu_indirect[kind].fetch_add(1, std::memory_order_relaxed);
+	static void CountGpuIndirect(GpuIndirect kind, uint64_t count = 1) noexcept {
+		s_gpu_indirect[kind].fetch_add(count, std::memory_order_relaxed);
 	}
 
 	static void Add(Site site, uint64_t ns) noexcept {

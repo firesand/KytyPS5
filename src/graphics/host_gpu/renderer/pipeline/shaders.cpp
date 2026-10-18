@@ -331,12 +331,14 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	uint32_t                          shader_stage_count = 0;
 	// Task stage limits as specialization constants (meshTaskIndirect.h): its push block has to
 	// stay within the 24 bytes the mesh program leaves free.
-	const std::array<uint32_t, 2> task_limits {
+	const std::array<uint32_t, 3> task_limits {
 	    graphics.mesh_shader_properties.maxMeshWorkGroupCount[0],
-	    graphics.mesh_shader_properties.maxMeshWorkGroupCount[1]};
-	const std::array<vk::SpecializationMapEntry, 2> task_limit_entries {
+	    graphics.mesh_shader_properties.maxMeshWorkGroupCount[1],
+	    graphics.mesh_shader_properties.maxMeshWorkGroupTotalCount};
+	const std::array<vk::SpecializationMapEntry, 3> task_limit_entries {
 	    vk::SpecializationMapEntry {kTaskSpecMaxGroupsX, 0, sizeof(uint32_t)},
-	    vk::SpecializationMapEntry {kTaskSpecMaxGroupsY, sizeof(uint32_t), sizeof(uint32_t)}};
+	    vk::SpecializationMapEntry {kTaskSpecMaxGroupsY, sizeof(uint32_t), sizeof(uint32_t)},
+	    vk::SpecializationMapEntry {kTaskSpecMaxGroupsTotal, 2 * sizeof(uint32_t), sizeof(uint32_t)}};
 	const vk::SpecializationInfo task_specialization {
 	    static_cast<uint32_t>(task_limit_entries.size()), task_limit_entries.data(),
 	    sizeof(task_limits), task_limits.data()};

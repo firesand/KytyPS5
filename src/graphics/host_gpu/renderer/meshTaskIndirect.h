@@ -13,6 +13,7 @@ struct MeshTaskPushConstants {
 	uint64_t args_bda       = 0; // first DrawIndirectArgs record
 	uint32_t stride         = 0; // bytes between records
 	uint32_t primitive_info = 0; // PackMeshTaskPrimitiveInfo
+	uint64_t counters_bda   = 0; // MeshTaskCounters, 0 = not counted (probe off)
 };
 inline constexpr uint32_t kTaskPushBytes = sizeof(MeshTaskPushConstants);
 
@@ -26,8 +27,18 @@ inline constexpr uint32_t kTaskPushBytes = sizeof(MeshTaskPushConstants);
 }
 
 // Specialization constant ids of the task shader: the device's mesh workgroup limits.
-inline constexpr uint32_t kTaskSpecMaxGroupsX = 0;
-inline constexpr uint32_t kTaskSpecMaxGroupsY = 1;
+inline constexpr uint32_t kTaskSpecMaxGroupsX     = 0;
+inline constexpr uint32_t kTaskSpecMaxGroupsY     = 1;
+inline constexpr uint32_t kTaskSpecMaxGroupsTotal = 2;
+
+// Probe counters the task shader increments (KYTY_PROBE_FAULT_HISTOGRAM): records whose group
+// counts exceeded a device limit and were clamped (the host path EXITs there: missing geometry,
+// not a crash), and empty records (no primitives or instances; the host path skips them, the GPU
+// path still records one draw per packet).
+struct MeshTaskCounters {
+	uint32_t clamped_records = 0;
+	uint32_t empty_records   = 0;
+};
 
 } // namespace Libs::Graphics
 

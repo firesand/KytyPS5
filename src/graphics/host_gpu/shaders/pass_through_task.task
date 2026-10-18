@@ -14,12 +14,19 @@ layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
 // Device mesh workgroup limits (meshTaskIndirect.h kTaskSpec*).
 layout(constant_id = 0) const uint MAX_GROUPS_X = 65535u;
 layout(constant_id = 1) const uint MAX_GROUPS_Y = 65535u;
+layout(constant_id = 2) const uint MAX_GROUPS_TOTAL = 65535u;
 
 layout(buffer_reference, scalar) readonly buffer DrawIndirectArgsBuffer {
 	uint vertex_count;
 	uint instance_count;
 	uint first_vertex;
 	uint first_instance;
+};
+
+// meshTaskIndirect.h MeshTaskCounters.
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer TaskCounters {
+	uint clamped_records;
+	uint empty_records;
 };
 
 // Field order is fixed by the mesh side (spirvEmitterModule.cpp DefineInputs).
@@ -38,6 +45,7 @@ layout(push_constant) uniform PushConstants {
 	uint64_t args_bda;
 	uint stride;
 	uint primitive_info; // primitives_per_group | size << 16 | step << 24
+	uint64_t counters_bda; // 0: probe off
 } pc;
 
 void main() {
@@ -50,15 +58,41 @@ void main() {
 	uint first_vertex = args.first_vertex;
 	uint first_instance = args.first_instance;
 
-	if (vertex_count == 0u || instance_count == 0u) {
+	// Host formula (ShaderMeshInputInfo::InputPrimitiveCount, ExecutePreparedDraw): primitives from
+	// the vertex count by input primitive size / step, then ceil(primitives / primitives_per_group).
+	uint ppg = max(pc.primitive_info & 0xffffu, 1u);
+	uint size = max((pc.primitive_info >> 16u) & 0xffu, 1u);
+	uint step = max(pc.primitive_info >> 24u, 1u);
+	uint primitives = vertex_count < size ? 0u : (vertex_count - size) / step + 1u;
+
+	if (primitives == 0u || instance_count == 0u) {
+		if (pc.counters_bda != 0ul) {
+			atomicAdd(TaskCounters(pc.counters_bda).empty_records, 1u);
+		}
 		EmitMeshTasksEXT(0u, 0u, 0u);
 		return;
 	}
 
-	uint ppg = max(pc.primitive_info & 0xffffu, 1u);
-	uint groups_x = (vertex_count + ppg - 1u) / ppg;
-	groups_x = min(groups_x, MAX_GROUPS_X);
-	uint groups_y = min(instance_count, MAX_GROUPS_Y);
+	uint groups_x = (primitives - 1u) / ppg + 1u;
+	uint groups_y = instance_count;
+	// The host path EXITs past a device limit; here the record is clamped (and counted).
+	bool clamped = false;
+	if (groups_x > MAX_GROUPS_X) {
+		groups_x = MAX_GROUPS_X;
+		clamped = true;
+	}
+	if (groups_y > MAX_GROUPS_Y) {
+		groups_y = MAX_GROUPS_Y;
+		clamped = true;
+	}
+	if (uint64_t(groups_x) * uint64_t(groups_y) > uint64_t(MAX_GROUPS_TOTAL)) {
+		groups_x = min(groups_x, MAX_GROUPS_TOTAL);
+		groups_y = max(MAX_GROUPS_TOTAL / groups_x, 1u);
+		clamped = true;
+	}
+	if (clamped && pc.counters_bda != 0ul) {
+		atomicAdd(TaskCounters(pc.counters_bda).clamped_records, 1u);
+	}
 
 	payload.vertex_count = vertex_count;
 	payload.first_vertex = first_vertex;
