@@ -83,6 +83,7 @@
 #include <fstream>
 #include <initializer_list>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -44325,9 +44326,208 @@ static void CheckGpuIndirectHashFilter() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// SPIR-V disassembly (friendly names) split into token lines, with OpConstant values by id.
+struct SpirvListing {
+  std::vector<std::vector<std::string>> lines;
+  std::map<std::string, uint64_t> constants;
+
+  explicit SpirvListing(const std::string &text) {
+    std::istringstream input(text);
+    for (std::string line; std::getline(input, line);) {
+      std::istringstream words(line);
+      std::vector<std::string> tokens;
+      for (std::string word; words >> word;) {
+        tokens.push_back(word);
+      }
+      if (tokens.size() >= 5 && tokens[1] == "=" && tokens[2] == "OpConstant") {
+        constants[tokens[0]] = std::strtoull(tokens[4].c_str(), nullptr, 0);
+      }
+      lines.push_back(std::move(tokens));
+    }
+  }
+  // Result id of the OpVariable in `storage_class` ("" when absent).
+  [[nodiscard]] std::string Variable(const char *storage_class) const {
+    for (const auto &tokens : lines) {
+      if (tokens.size() >= 5 && tokens[2] == "OpVariable" && tokens[4] == storage_class) {
+        return tokens[0];
+      }
+    }
+    return {};
+  }
+  // Constant index operands (in order) of every OpAccessChain based on `base`; a non-constant
+  // index is reported as UINT64_MAX.
+  [[nodiscard]] std::vector<std::vector<uint64_t>> AccessChains(const std::string &base) const {
+    std::vector<std::vector<uint64_t>> chains;
+    for (const auto &tokens : lines) {
+      if (base.empty() || tokens.size() < 5 || tokens[2] != "OpAccessChain" || tokens[4] != base) {
+        continue;
+      }
+      std::vector<uint64_t> indices;
+      for (size_t i = 5; i < tokens.size(); ++i) {
+        const auto found = constants.find(tokens[i]);
+        indices.push_back(found == constants.end() ? UINT64_MAX : found->second);
+      }
+      chains.push_back(std::move(indices));
+    }
+    return chains;
+  }
+};
+
+// T1: a non-fast-launch point-list mesh program (this title's packet shape: fl=0, prim=1,
+// ppg=1) on the task path. Guest code stores GS slots 5 and 6 (registers s13 / s14 with
+// user_data_base 0). The slot reads must load payload.first_vertex / first_instance (fields 1 / 2)
+// and no draw dword may come from push constants (the task shader's push block occupies push
+// dwords 0-5). Fails on bc40a55: the reads came from the shader-data dwords, dwords 3-5 from
+// push constants.
+static void CheckMeshTaskPathEmission() {
+  const char *name = "MeshTaskPathEmission";
+  const u32 code[] = {
+      EncodeSMovB32(124, 255), 0x1001u, // m0: 1 primitive, 1 vertex
+      EncodeSopp(0x10, 9),              // s_sendmsg GS_ALLOC_REQ
+      EncodeVop1(0x01, 0, 128),         // v0 = 0
+      EncodeVop1(0x01, 9, 13),          // v9 = s13 (GS slot 5)
+      EncodeMubuf0(0x1c), EncodeMubuf1(9, 2, 5),
+      EncodeVop1(0x01, 10, 14),         // v10 = s14 (GS slot 6)
+      EncodeMubuf0(0x1c, 4), EncodeMubuf1(10, 2, 5),
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 0, 0, 0),
+      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0),
+      EncodeSopp(0x01),
+  };
+  const auto compile = [&](bool task_path, std::string &assembly) {
+    ShaderVertexInputInfo input{};
+    input.logical_stage = ShaderType::Mesh;
+    input.pa_cl_vs_out_cntl = 0x00c0f00fu;
+    auto &mesh = input.mesh;
+    mesh.input_primitive = static_cast<u32>(Prospero::PrimitiveType::kPointList);
+    mesh.fast_launch = false;
+    mesh.wave_size = 64;
+    mesh.host_subgroup_size = 32;
+    mesh.threads_num[0] = 64;
+    mesh.threads_num[1] = mesh.threads_num[2] = 1;
+    mesh.lds_size_dwords = 3840;
+    mesh.primitives_per_group = 1;
+    mesh.vertices_per_group = 1;
+    mesh.max_vertices = 64;
+    mesh.max_primitives = 64;
+    if (task_path) {
+      // What GetGraphicsPrograms sets for a GPU-indirect mesh packet naming GS slots 5 / 6.
+      input.mesh_task_indirect = true;
+      input.draw_parameters.active = true;
+      input.draw_parameters.base_vertex_slot = 5;
+      input.draw_parameters.base_instance_slot = 6;
+    }
+    std::array<u32, 16> user_data{};
+    user_data[8] = 0x10000008u; // V# in s[8:11]
+    user_data[9] = 4u << 16u;
+    user_data[10] = 64u;
+    user_data[11] = 0x00027000u;
+    user_data[13] = 0x1234u;
+    user_data[14] = 0x5678u;
+    ShaderRecompiler::CompileOptions options{};
+    options.stage = ShaderType::Mesh;
+    options.wave_size = 64;
+    options.input_info.vertex = &input;
+    options.user_data = user_data;
+    options.user_data_base = 0; // production value for Mesh (pipelineCache.cpp)
+    auto translated = ShaderRecompiler::TranslateProgram(code, options);
+    auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+    ShaderRecompiler::IR::ResourceSnapshot resources;
+    ShaderRecompiler::IR::ResourceSpecialization specialization;
+    const ShaderRecompiler::IR::SrtRuntime runtime{
+        .user_data = options.user_data,
+        .shader_base = reinterpret_cast<uint64_t>(code),
+    };
+    Require(name, "resource materialization",
+            ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization),
+            "mesh test resources did not materialize");
+    const auto result = ShaderRecompiler::CompileProgram(
+        std::move(translated), options, specialization,
+        ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
+    std::string messages;
+    tools.SetMessageConsumer([&messages](spv_message_level_t, const char *,
+                                         const spv_position_t &position, const char *message) {
+      char buffer[512];
+      std::snprintf(buffer, sizeof(buffer), "%zu:%zu: %s\n", position.line, position.column,
+                    message);
+      messages += buffer;
+    });
+    if (!tools.Validate(result.spirv)) {
+      Fail(name, task_path ? "task-path SPIR-V validation" : "host-path SPIR-V validation",
+           messages);
+    }
+    Require(name, "disassembly", tools.Disassemble(result.spirv, &assembly),
+            "failed to disassemble the mesh program");
+    return plan.user_data_mask;
+  };
+  // Constant push-constant dword indices below MeshDrawDwordCount (draw dwords).
+  const auto draw_dword_reads = [](const SpirvListing &listing) {
+    std::set<uint64_t> dwords;
+    // Push-constant element loads are {member 0, dword}.
+    for (const auto &chain : listing.AccessChains(listing.Variable("PushConstant"))) {
+      if (chain.size() == 2 && chain[1] < ShaderRecompiler::IR::PushData::MeshDrawDwordCount) {
+        dwords.insert(chain[1]);
+      }
+    }
+    return dwords;
+  };
+
+  // Negative control: the host-path program reads draw dwords 3-5 (index size / address) from
+  // push constants, so the check below can see the pattern.
+  std::string host_assembly;
+  (void)compile(false, host_assembly);
+  const SpirvListing host(host_assembly);
+  const auto host_dwords = draw_dword_reads(host);
+  Require(name, "host path control",
+          host.Variable("TaskPayloadWorkgroupEXT").empty() && host_dwords.count(3) != 0 &&
+              host_dwords.count(4) != 0 && host_dwords.count(5) != 0,
+          "the host-path mesh program no longer reads draw dwords 3-5 from push constants; the "
+          "task-path assertions below would prove nothing");
+
+  std::string task_assembly;
+  const auto task_mask = compile(true, task_assembly);
+  const SpirvListing task(task_assembly);
+  const auto payload = task.Variable("TaskPayloadWorkgroupEXT");
+  Require(name, "payload declared", !payload.empty(),
+          "the task-path mesh program declares no TaskPayloadWorkgroupEXT variable");
+  std::set<uint64_t> fields;
+  for (const auto &chain : task.AccessChains(payload)) {
+    Require(name, "payload chain shape", chain.size() == 1 && chain[0] != UINT64_MAX,
+            "a payload access chain does not use one constant field index");
+    fields.insert(chain[0]);
+  }
+  Require(name, "vertex count from payload", fields.count(0) != 0,
+          "draw dword 0 (vertex count) is not loaded from payload field 0");
+  Require(name, "base vertex slot from payload", fields.count(1) != 0,
+          "the GS slot 5 read (s13) is not served by payload field 1 (first_vertex)");
+  Require(name, "base instance slot from payload", fields.count(2) != 0,
+          "the GS slot 6 read (s14) is not served by payload field 2 (first_instance)");
+  const auto task_dwords = draw_dword_reads(task);
+  std::string listed;
+  for (const auto dword : task_dwords) {
+    listed += " " + std::to_string(dword);
+  }
+  Require(name, "no draw dwords from push constants", task_dwords.empty(),
+          "the task-path program reads draw dword(s)" + listed +
+              " from push constants, which the task shader's push block overwrites");
+  Require(name, "no draw-parameter built-ins",
+          task_assembly.find("BuiltIn BaseVertex") == std::string::npos &&
+              task_assembly.find("BuiltIn BaseInstance") == std::string::npos,
+          "a mesh program declared a vertex-stage draw-parameter built-in");
+  // The resource plan must not depend on the slots (else the gate's SRT check rejects them).
+  ShaderDrawParameters slots;
+  slots.base_vertex_slot = 5;
+  slots.base_instance_slot = 6;
+  Require(name, "plan independent of the slots",
+          (task_mask & DrawParameterSlotMask(slots, kMeshUserSgprBase)) == 0,
+          "the resource plan reads a GS offset slot; the gate would keep this program on the host");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckMeshTaskIndirect() {
   CheckGpuIndirectReasonNames();
   CheckGpuIndirectHashFilter();
+  CheckMeshTaskPathEmission();
 }
 
 void CheckDepthTargetFootprints() {
