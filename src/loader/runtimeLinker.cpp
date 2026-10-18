@@ -24,6 +24,7 @@
 #include "loader/x64InstructionEmulator.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -130,6 +131,10 @@ struct StubbedImportRecord {
 
 static std::vector<StubbedImportRecord> g_stubbed_imports;
 static std::atomic_uint32_t             g_unresolved_stub_call_log_count {0};
+// Per-import call counters: the first 4 calls of every unresolved import are logged, then calls 8, 16, 32, ... The
+// old global cap (1024 lines) was used up by ~25 s into Zero Company, hiding everything called later.
+static constexpr size_t                  UNRESOLVED_STUB_COUNTERS = 8192;
+static std::array<std::atomic_uint32_t, UNRESOLVED_STUB_COUNTERS> g_unresolved_stub_calls {};
 static std::vector<uint64_t>            g_unresolved_stub_thunk_pages;
 static uint64_t                         g_unresolved_stub_thunk_offset = 0;
 static constexpr uint64_t               UNRESOLVED_STUB_PAGE_SIZE      = 4096;
@@ -200,14 +205,20 @@ static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
 }
 
 static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id) {
+	const uint32_t calls =
+	    record_id < UNRESOLVED_STUB_COUNTERS ? g_unresolved_stub_calls[record_id].fetch_add(1) + 1 : 1;
+	const bool log_call = calls <= 4 || (calls & (calls - 1)) == 0;
+	if (!log_call) {
+		return 0;
+	}
 	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
-	if (log_index < 1024) {
+	if (log_index < 65536) {
 		if (record_id < g_stubbed_imports.size()) {
 			const auto& record = g_stubbed_imports[record_id];
 			printf("Unresolved import stub called: %s\n", record.name.c_str());
-			LOGF("Unresolved import stub called [%u]: patch_vaddr=0x%016" PRIx64
+			LOGF("Unresolved import stub called [%u]: call=%u patch_vaddr=0x%016" PRIx64
 			     " jmprela_index=%" PRIu32 " symbol=%s type=%s bind=%s program=%s\n",
-			     log_index, record.patch_vaddr, record.index, record.name.c_str(),
+			     log_index, calls, record.patch_vaddr, record.index, record.name.c_str(),
 			     magic_enum::enum_name(record.type), magic_enum::enum_name(record.bind),
 			     record.program.c_str());
 		} else {

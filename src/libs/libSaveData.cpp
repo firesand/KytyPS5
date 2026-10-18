@@ -33,9 +33,10 @@ static void SaveDataTrace(const char* func) {
 }
 
 // Logs a call to a save-data NID we do not implement yet: the six integer argument registers, the guest return
-// address, and 64 bytes behind every argument that points to readable memory. Returns 0 like the unresolved-import
+// address, and 64 bytes behind every argument that points to readable memory (kept for the next unidentified NID;
+// sceSaveDataConvert and sceSaveDataGetConvertProgress were found this way). Returns 0 like the unresolved-import
 // stub did, so behaviour is unchanged; the log is for identifying the function and what the game expects back.
-static void LogUnknownSaveDataCall(const char* nid, const uint64_t (&args)[6], const void* ret_addr) {
+[[maybe_unused]] static void LogUnknownSaveDataCall(const char* nid, const uint64_t (&args)[6], const void* ret_addr) {
 	LOGF("SaveData: unimplemented %s ret=0x%016" PRIx64 " args=%016" PRIx64 " %016" PRIx64 " %016" PRIx64
 	     " %016" PRIx64 " %016" PRIx64 " %016" PRIx64 "\n",
 	     nid, reinterpret_cast<uint64_t>(ret_addr), args[0], args[1], args[2], args[3], args[4], args[5]);
@@ -1335,19 +1336,53 @@ int KYTY_SYSV_ABI SaveDataSaveIcon(const SaveDataMountPoint* mount_point,
 	return OK;
 }
 
-// Unidentified SaveData_native NIDs called by STAR WARS Zero Company (2mfSRGdshtk: once per existing save folder at
-// boot, followed by a progress dialog and an error-code dialog; 8EA5OMIL1lQ: imported, not seen called yet).
-int KYTY_SYSV_ABI SaveDataUnknown_2mfSRGdshtk(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
-                                              uint64_t a5) {
-	const uint64_t args[6] = {a0, a1, a2, a3, a4, a5};
-	LogUnknownSaveDataCall("2mfSRGdshtk", args, __builtin_return_address(0));
-	return OK;
+// sceSaveDataConvert (NID 2mfSRGdshtk, PS5). PPSA18054 zeroes 56 bytes and fills only these two fields (eboot
+// 0xa1768fb-0xa176920); AnyPS5 assumes 64 bytes. Nothing reads past dir_name.
+struct SaveDataConvert {
+	int32_t                   user_id;
+	int32_t                   pad;
+	const SceSaveDataDirName* dir_name;
+	uint8_t                   reserved[40];
+};
+
+// Host saves are always in the current format, so there is never anything to convert. Returning OK ("conversion
+// started") made PPSA18054 open a progress dialog, poll sceSaveDataGetEventResult for a CONVERT_END event (type 5)
+// and, on our empty-queue NOT_FOUND, show an error-code dialog: four times per boot (ng-127, smoke-ecd4f5a). The
+// title treats both CONVERT_NOT_NEEDED and NOT_FOUND as "nothing to convert" and skips the dialogs.
+int KYTY_SYSV_ABI SaveDataConvert(const SaveDataConvert* param) {
+	PRINT_NAME();
+	SaveDataTrace(__func__);
+
+	if (param == nullptr || param->dir_name == nullptr || !valid_path_component(param->dir_name->data)) {
+		return SAVE_DATA_ERROR_PARAMETER;
+	}
+	if (param->user_id < 0) {
+		return SAVE_DATA_ERROR_INVALID_LOGIN_USER;
+	}
+
+	LOGF("\t user_id  = %" PRId32 "\n"
+	     "\t dir_name = %s\n",
+	     param->user_id, param->dir_name->data);
+
+	Common::LockGuard lock(g_mount_mutex);
+	std::error_code   error;
+	if (!std::filesystem::is_directory(save_directory(get_title_id(), param->dir_name->data, param->user_id),
+	                                   error)) {
+		return SAVE_DATA_ERROR_NOT_FOUND;
+	}
+	return SAVE_DATA_ERROR_CONVERT_NOT_NEEDED;
 }
 
-int KYTY_SYSV_ABI SaveDataUnknown_8EA5OMIL1lQ(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
-                                              uint64_t a5) {
-	const uint64_t args[6] = {a0, a1, a2, a3, a4, a5};
-	LogUnknownSaveDataCall("8EA5OMIL1lQ", args, __builtin_return_address(0));
+// sceSaveDataGetConvertProgress (NID 8EA5OMIL1lQ, PS5): float 0..1 (PPSA18054 multiplies it by 100 for the dialog's
+// progress bar). No conversion is ever in flight.
+int KYTY_SYSV_ABI SaveDataGetConvertProgress(float* progress) {
+	PRINT_NAME();
+	SaveDataTrace(__func__);
+
+	if (progress == nullptr) {
+		return SAVE_DATA_ERROR_PARAMETER;
+	}
+	*progress = 1.0f;
 	return OK;
 }
 
@@ -1384,8 +1419,8 @@ LIB_DEFINE(InitSaveDataNative_1) {
 	LIB_FUNC("cGjO3wM3V28", ::Libs::SaveData::SaveDataLoadIcon);
 	LIB_FUNC("X4MYzukPc3g", ::Libs::SaveData::SaveDataDirNameSearch);
 	LIB_FUNC("yKDy8S5yLA0", ::Libs::SaveData::SaveDataTerminate);
-	LIB_FUNC("2mfSRGdshtk", ::Libs::SaveData::SaveDataUnknown_2mfSRGdshtk);
-	LIB_FUNC("8EA5OMIL1lQ", ::Libs::SaveData::SaveDataUnknown_8EA5OMIL1lQ);
+	LIB_FUNC("2mfSRGdshtk", ::Libs::SaveData::SaveDataConvert);
+	LIB_FUNC("8EA5OMIL1lQ", ::Libs::SaveData::SaveDataGetConvertProgress);
 }
 
 } // namespace LibSaveDataNative
@@ -1416,6 +1451,8 @@ LIB_DEFINE(InitSaveData_1) {
 	LIB_FUNC("cGjO3wM3V28", SaveData::SaveDataLoadIcon);
 	LIB_FUNC("X4MYzukPc3g", SaveData::SaveDataDirNameSearch);
 	LIB_FUNC("yKDy8S5yLA0", SaveData::SaveDataTerminate);
+	LIB_FUNC("2mfSRGdshtk", SaveData::SaveDataConvert);
+	LIB_FUNC("8EA5OMIL1lQ", SaveData::SaveDataGetConvertProgress);
 
 	LibSaveDataNative::InitSaveDataNative_1(s);
 }

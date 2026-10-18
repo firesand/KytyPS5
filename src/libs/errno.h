@@ -658,6 +658,9 @@ constexpr int SAVE_DATA_ERROR_BUSY_FOR_SAVING                      = -2137063402
 constexpr int SAVE_DATA_ERROR_LIMITATION_OVER                      = -2137063401; /* 0x809F0017 */
 constexpr int SAVE_DATA_ERROR_EVENT_BUSY                           = -2137063400; /* 0x809F0018 */
 constexpr int SAVE_DATA_ERROR_PARAMSFO_TRANSFER_TITLE_ID_NOT_FOUND = -2137063399; /* 0x809F0019 */
+// PS5. PPSA18054 treats it like NOT_FOUND after sceSaveDataConvert ("nothing to convert"); the SDK name is
+// not known locally (reviews/savedata-nids-2026-10-18.md in the Zero Company workspace).
+constexpr int SAVE_DATA_ERROR_CONVERT_NOT_NEEDED                  = -2137063394; /* 0x809F001E */
 
 } // namespace SaveData
 

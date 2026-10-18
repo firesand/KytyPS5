@@ -593,6 +593,51 @@ void RunChild(const fs::path& executable, const char* mode) {
 	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 #endif
 }
+// sceSaveDataConvert / sceSaveDataGetConvertProgress (PS5): host saves never need converting, so an existing save
+// reports CONVERT_NOT_NEEDED, a missing one NOT_FOUND, no event is queued, and the progress is complete.
+void TestConvert() {
+	Reset("CONVERT");
+	auto                   name = DirName("slot");
+	struct SaveDataConvert convert {}; // 'struct': the function SaveDataConvert hides the type name
+	convert.user_id  = 1;
+	convert.dir_name = &name;
+	CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_NOT_FOUND); // nothing saved yet
+
+	struct SaveDataMount3 mount {};
+	mount.user_id    = 1;
+	mount.dir_name   = &name;
+	mount.mount_mode = 4;
+	mount.blocks     = 48;
+	SaveDataMountResult mounted {};
+	CHECK(SaveDataMount3(&mount, &mounted) == OK);
+	std::ofstream(g_mounted_directory / "data") << "kept";
+	CHECK(SaveDataUmount2(0, &mounted.mount_point) == OK);
+
+	CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_CONVERT_NOT_NEEDED);
+	CHECK(std::ifstream(fs::path("_SaveData") / "CONVERT" / "slot" / "data").good()); // files untouched
+	SaveDataEvent event {};
+	CHECK(SaveDataGetEventResult(nullptr, &event) == SAVE_DATA_ERROR_NOT_FOUND); // no CONVERT_END event queued
+
+	for (const char* bad: {"", ".", "..", "a/b", "a\\b", "c:d"}) {
+		auto invalid     = DirName(bad);
+		convert.dir_name = &invalid;
+		CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_PARAMETER);
+	}
+	SceSaveDataDirName unterminated {};
+	std::memset(unterminated.data, 'a', sizeof(unterminated.data));
+	convert.dir_name = &unterminated;
+	CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_PARAMETER);
+	convert.dir_name = nullptr;
+	CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_PARAMETER);
+	CHECK(SaveDataConvert(nullptr) == SAVE_DATA_ERROR_PARAMETER);
+	convert.dir_name = &name;
+	convert.user_id  = -1;
+	CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_INVALID_LOGIN_USER);
+
+	float progress = -1.0f;
+	CHECK(SaveDataGetConvertProgress(&progress) == OK && progress == 1.0f);
+	CHECK(SaveDataGetConvertProgress(nullptr) == SAVE_DATA_ERROR_PARAMETER);
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -619,6 +664,7 @@ int main(int argc, char** argv) {
 	TestClassicSavePaths();
 	TestSaveAllocations();
 	TestClassicSaveParams();
+	TestConvert();
 	CHECK(SaveDataTerminate() == OK);
 	fs::current_path(previous);
 	fs::remove_all(temp);
