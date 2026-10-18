@@ -44413,11 +44413,14 @@ static void CheckMeshTaskPathEmission() {
     mesh.max_vertices = 64;
     mesh.max_primitives = 64;
     if (task_path) {
-      // What GetGraphicsPrograms sets for a GPU-indirect mesh packet naming GS slots 5 / 6.
-      input.mesh_task_indirect = true;
-      input.draw_parameters.active = true;
-      input.draw_parameters.base_vertex_slot = 5;
-      input.draw_parameters.base_instance_slot = 6;
+      // What GetGraphicsPrograms applies for a GPU-indirect mesh packet naming GS slots 5 / 6.
+      ShaderDrawParameters draw;
+      draw.active = true;
+      draw.base_vertex_slot = 5;
+      draw.base_instance_slot = 6;
+      ApplyDrawParameters(input, &draw);
+      Require(name, "task path applied", input.mesh_task_indirect,
+              "ApplyDrawParameters did not select the task path for a mesh program");
     }
     std::array<u32, 16> user_data{};
     user_data[8] = 0x10000008u; // V# in s[8:11]
@@ -44622,11 +44625,83 @@ static void CheckMeshTaskPushLayout() {
   std::printf("[host]    %-32s ok (%u bytes)\n", name, kTaskPushBytes);
 }
 
+// T3: ApplyDrawParameters (what GetGraphicsPrograms does for a GPU-indirect packet). Mesh programs
+// take the task path and keep the packet's slots, so the static program key separates programs by
+// slot (the slot reads are compiled in); vertex programs keep their rebase rule.
+static void CheckApplyDrawParameters() {
+  const char *name = "ApplyDrawParameters";
+  const auto parameters = [](u32 vertex_slot, u32 instance_slot) {
+    ShaderDrawParameters draw;
+    draw.active = true;
+    draw.base_vertex_slot = vertex_slot;
+    draw.base_instance_slot = instance_slot;
+    return draw;
+  };
+  const auto mesh_input = [] {
+    ShaderVertexInputInfo input{};
+    input.logical_stage = ShaderType::Mesh;
+    input.mesh.threads_num[0] = 64;
+    input.mesh.primitives_per_group = 1;
+    input.mesh.input_primitive = static_cast<u32>(Prospero::PrimitiveType::kPointList);
+    return input;
+  };
+  const auto key_of = [](const ShaderVertexInputInfo &input) {
+    std::vector<u32> key;
+    BuildStageStaticKey(input, key);
+    return key;
+  };
+
+  auto untouched = mesh_input();
+  ApplyDrawParameters(untouched, nullptr);
+  ShaderDrawParameters inactive;
+  inactive.base_vertex_slot = 5;
+  ApplyDrawParameters(untouched, &inactive);
+  Require(name, "no packet map", !untouched.mesh_task_indirect && !untouched.draw_parameters.active,
+          "a missing or inactive map changed the program");
+
+  const auto slots_56 = parameters(5, 6);
+  auto mesh = mesh_input();
+  ApplyDrawParameters(mesh, &slots_56);
+  Require(name, "mesh keeps its slots",
+          mesh.mesh_task_indirect && mesh.draw_parameters.active &&
+              mesh.draw_parameters.base_vertex_slot == 5 &&
+              mesh.draw_parameters.base_instance_slot == 6 && !mesh.draw_parameters.rebase_ids,
+          "a mesh program did not take the task path with the packet's slots");
+
+  auto mesh_same = mesh_input();
+  ApplyDrawParameters(mesh_same, &slots_56);
+  const auto slots_57 = parameters(5, 7);
+  auto mesh_other = mesh_input();
+  ApplyDrawParameters(mesh_other, &slots_57);
+  const auto slots_none = parameters(ShaderDrawParameters::kNoSlot, 6);
+  auto mesh_none = mesh_input();
+  ApplyDrawParameters(mesh_none, &slots_none);
+  const auto key = key_of(mesh);
+  Require(name, "same slots share a program", key == key_of(mesh_same),
+          "identical packets produced different program keys");
+  Require(name, "slots separate programs",
+          key != key_of(mesh_other) && key != key_of(mesh_none) && key != key_of(mesh_input()),
+          "mesh programs with different packet slots (or none) share a program key");
+
+  ShaderVertexInputInfo vertex{};
+  ApplyDrawParameters(vertex, &slots_56);
+  ShaderVertexInputInfo embedded{};
+  embedded.fetch_embedded = true;
+  ApplyDrawParameters(embedded, &slots_56);
+  Require(name, "vertex rule unchanged",
+          !vertex.mesh_task_indirect && vertex.draw_parameters.rebase_ids &&
+              vertex.draw_parameters.base_vertex_slot == 5 && !embedded.mesh_task_indirect &&
+              !embedded.draw_parameters.rebase_ids,
+          "vertex programs lost the native-fetch rebase rule or took the mesh path");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckMeshTaskIndirect() {
   CheckGpuIndirectReasonNames();
   CheckGpuIndirectHashFilter();
   CheckMeshTaskPathEmission();
   CheckMeshTaskPushLayout();
+  CheckApplyDrawParameters();
 }
 
 void CheckDepthTargetFootprints() {

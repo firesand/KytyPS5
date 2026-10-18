@@ -31,6 +31,11 @@ struct ShaderParams {
 };
 
 void BuildStageStaticKey(const ShaderVertexInputInfo& input_info, std::vector<uint32_t>& key);
+// GPU-side indirect draws: applies the packet's draw-parameter map to the first vertex-stage
+// program (no-op for nullptr or an inactive map). Vertex programs read the offset slots from
+// gl_BaseVertex / gl_BaseInstance (rebased ids for native fetch); mesh programs take the task-shader
+// path (mesh_task_indirect) and keep the slots, which BuildStageStaticKey makes part of the key.
+void ApplyDrawParameters(ShaderVertexInputInfo& input_info, const ShaderDrawParameters* draw_parameters);
 void BuildStageStaticKey(const ShaderPixelInputInfo& input_info, std::vector<uint32_t>& key);
 void BuildStageStaticKey(const ShaderComputeInputInfo& input_info, std::vector<uint32_t>& key);
 
