@@ -194,8 +194,10 @@ public:
 	// `parameters` names the user-data slots the packet patches; a vertex shader whose resource plan
 	// evaluates one of them on the host (or one not compiled yet) keeps the host path (Srt).
 	// MeshDenied / Denied: the bisection hash lists (gpuIndirectFilter.h) keep the program on the
-	// host path. `shader` (optional) receives the bound vertex-stage facts for the caller's log.
-	enum class GpuIndirectBlock { None, Mesh, MeshDenied, Denied, Srt, Other };
+	// host path. MeshCountAddr: the pass-through task shader reads `draw_count` records and cannot
+	// honour a GPU count dword. MeshPrim: an input primitive type the task shader's group formula
+	// does not cover. `shader` (optional) receives the bound vertex-stage facts for the caller's log.
+	enum class GpuIndirectBlock { None, Mesh, MeshDenied, MeshCountAddr, MeshPrim, Denied, Srt, Other };
 	struct GpuIndirectShaderInfo {
 		bool     known       = false; // a valid vertex-stage shader is bound
 		bool     mesh        = false;
@@ -208,7 +210,8 @@ public:
 	                                        uint32_t index_type_and_size, uint32_t draw_count,
 	                                        const ShaderDrawParameters& parameters,
 	                                        GpuIndirectBlock* block = nullptr,
-	                                        GpuIndirectShaderInfo* shader = nullptr);
+	                                        GpuIndirectShaderInfo* shader = nullptr,
+	                                        bool has_count_addr = false);
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	void                           FindBuffers(std::span<PreparedBindings* const> stages);

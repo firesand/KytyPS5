@@ -1265,13 +1265,16 @@ bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_c
 	Block                                   block = Block::Other;
 	RenderExecutor::GpuIndirectShaderInfo shader;
 	const bool eligible = executor.CanDrawIndirectOnGpu(CurrentBuffer(), indexed, m_index_type_and_size,
-	                                                    max_count_or_count, parameters, &block, &shader);
+	                                                    max_count_or_count, parameters, &block, &shader,
+	                                                    count_addr != nullptr);
 	if (shader.known && shader.mesh) {
 		const char* decision = "gpu";
 		switch (block) {
 			case Block::None: break;
 			case Block::Mesh: decision = "fallback(mesh)"; break;
 			case Block::MeshDenied: decision = "fallback(mesh-denied)"; break;
+			case Block::MeshCountAddr: decision = "fallback(mesh-count-addr)"; break;
+			case Block::MeshPrim: decision = "fallback(mesh-prim)"; break;
 			case Block::Denied: decision = "fallback(denied)"; break;
 			case Block::Srt: decision = "fallback(srt)"; break;
 			case Block::Other: decision = "fallback(other)"; break;
@@ -1287,8 +1290,12 @@ bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_c
 				return false;
 			case Block::Mesh: HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackMesh); break;
 			case Block::MeshDenied:
+			case Block::MeshCountAddr:
+			case Block::MeshPrim:
 				HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackMesh);
-				HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackMeshDenied);
+				HostReadProbe::CountGpuIndirect(block == Block::MeshDenied      ? HostReadProbe::FallbackMeshDenied
+				                                : block == Block::MeshCountAddr ? HostReadProbe::FallbackMeshCountAddr
+				                                                                : HostReadProbe::FallbackMeshPrim);
 				break;
 			case Block::Denied: HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackDenied); break;
 			default: break;

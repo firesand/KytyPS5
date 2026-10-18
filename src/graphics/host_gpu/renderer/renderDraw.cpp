@@ -1663,7 +1663,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 bool RenderExecutor::CanDrawIndirectOnGpu(CommandBuffer& buffer, bool indexed,
                                           uint32_t index_type_and_size, uint32_t draw_count,
                                           const ShaderDrawParameters& parameters,
-                                          GpuIndirectBlock* block, GpuIndirectShaderInfo* shader) {
+                                          GpuIndirectBlock* block, GpuIndirectShaderInfo* shader,
+                                          bool has_count_addr) {
 	if (block != nullptr) {
 		*block = GpuIndirectBlock::Other;
 	}
@@ -1708,9 +1709,25 @@ bool RenderExecutor::CanDrawIndirectOnGpu(CommandBuffer& buffer, bool indexed,
 		return false;
 	}
 	if (is_mesh) {
-		if (!graphics.task_shader_enabled || indexed || fast_launch == 0) {
+		// Non-fast-launch programs are admitted since Stage 2: their mesh entry takes the record's
+		// vertex count from the task payload and every other draw dword is 0 there (item 5).
+		if (!graphics.task_shader_enabled || indexed) {
 			if (block != nullptr) {
 				*block = GpuIndirectBlock::Mesh;
+			}
+			return false;
+		}
+		if (has_count_addr) {
+			if (block != nullptr) {
+				*block = GpuIndirectBlock::MeshCountAddr;
+			}
+			return false;
+		}
+		// The task shader's group count is ceil(vertex_count / primitives_per_group), the host
+		// formula only for one-vertex primitives.
+		if (primitive != Prospero::PrimitiveType::kPointList) {
+			if (block != nullptr) {
+				*block = GpuIndirectBlock::MeshPrim;
 			}
 			return false;
 		}
