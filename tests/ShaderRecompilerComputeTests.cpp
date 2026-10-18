@@ -998,6 +998,15 @@ void AppendStoreSgprPair(std::vector<u32> *code, u32 value_sgpr,
 
 void AppendEnd(std::vector<u32> *code) { code->push_back(0xbf810000u); }
 
+// Kernel write-watch (KYTY_WRITE_WATCH=1): a direct CPU store does not fault; the emulator applies
+// it at its next collection point (stream start, acquire). Checks written for the fault path apply
+// their stores here first. GPU thread.
+void ApplyCpuStores(Libs::Graphics::RenderContext &context) {
+  if (Libs::Graphics::WriteWatch::Get() != nullptr) {
+    (void)context.CollectCpuWrites();
+  }
+}
+
 std::string Hex(u32 value) {
   char buffer[32] = {};
   std::snprintf(buffer, sizeof(buffer), "0x%08" PRIx32, value);
@@ -9956,6 +9965,7 @@ public:
         auto *sync_store =
             reinterpret_cast<volatile uint32_t *>(base + sync_b_offset + sync_dirty_page);
         *sync_store = sync_written;
+        ApplyCpuStores(resources);
         Require(name, "page-driven sync dirty page",
                 sync_cache.IsRegionCpuModified(base + sync_b_offset + sync_dirty_page,
                                                sizeof(sync_written)) &&
@@ -9997,6 +10007,7 @@ public:
             reinterpret_cast<volatile uint32_t *>(base + sync_b_offset + 0x3000);
         *sync_store_a = 0xa11ce5edu;
         *sync_store_b = 0xb0bbe5edu;
+        ApplyCpuStores(resources);
         (void)sync_cache.TakeSyncStats();
         sync_cache.BeginUploadBatch();
         sync_cache.SynchronizeBuffersInRange(base + sync_a_offset,
@@ -10053,10 +10064,12 @@ public:
                             : base + (scenario == 1 ? p_offset : q_offset) + 0x3000;
           BufferCacheTestAccess::SetSyncRepass(cache, repass);
           *reinterpret_cast<volatile uint32_t *>(first_address) = first_value;
+          ApplyCpuStores(resources);
           const uint64_t range_begin = base + p_offset;
           const uint64_t range_size = q_offset + owner_size - p_offset;
           BufferCacheTestAccess::CollectSyncOwners(cache, range_begin, range_size);
           *reinterpret_cast<volatile uint32_t *>(sentinel_address) = sentinel; // after the snapshot
+          ApplyCpuStores(resources);
           (void)cache.TakeSyncStats();
           cache.BeginUploadBatch();
           BufferCacheTestAccess::SyncCollectedOwners(cache);
@@ -10100,7 +10113,8 @@ public:
       // A hot page inside a pass-1 hull is visited exactly once per synchronization even when the
       // repass uploads a second page of the same owner outside that hull (a pass-k piece merged
       // into the owner's hull would visit the hot page twice and advance its unchanged counter twice).
-      {
+      // Hot pages do not exist under kernel write-watch.
+      if (Libs::Graphics::WriteWatch::Get() == nullptr) {
         auto &cache = resources.GetBufferCache();
         constexpr uint64_t hot_offset = 0x2fa0000;
         constexpr uint64_t hot_size = 0x10000;
@@ -10157,22 +10171,26 @@ public:
         scheduler.FlushAndWait();
         (void)Libs::Graphics::SyncProbe::Take();
         *reinterpret_cast<volatile uint32_t *>(x_address) = written; // after the sync, before the label
-        context.NoteGuestAcquire(); // the satisfied WAIT_REG_MEM
+        // The satisfied WAIT_REG_MEM; its label shares x's page (write-watch collects on its write).
+        context.NoteGuestAcquire(x_address, sizeof(written));
         context.SyncCpuWrites();    // the BDA / unbounded consumer
         scheduler.FlushAndWait();
         const auto probe = Libs::Graphics::SyncProbe::Take();
+        // Kernel write-watch collects at an acquire whose label page was written and starts a new
+        // epoch when it found CPU data, so the write is published in both modes.
+        const bool publishes = wait_mode != 0 || Libs::Graphics::WriteWatch::Get() != nullptr;
         uint32_t x_device = 0;
         if (cache.PeekDeviceCopy(x_address, &x_device, sizeof(x_device))) {
-          Require(name, "wait-pass contents", x_device == (wait_mode != 0 ? written : initial),
-                  wait_mode != 0 ? "KYTY_SYNC_ON_WAIT_PASS=1 left the consumer with a stale copy"
-                                 : "KYTY_SYNC_ON_WAIT_PASS=0 published the write without a new epoch");
+          Require(name, "wait-pass contents", x_device == (publishes ? written : initial),
+                  publishes ? "the acquire left the consumer with a stale copy"
+                            : "KYTY_SYNC_ON_WAIT_PASS=0 published the write without a new epoch");
         } else {
           std::printf("[host]    %s: wait-pass contents: device copy not host-visible, skipped\n", name);
         }
         Require(name, "wait-pass counters",
                 probe.wait_passes == 1 && probe.wait_consumed == 1 &&
-                    probe.wait_extra == (wait_mode != 0 ? 1u : 0u) &&
-                    (wait_mode != 0) == (probe.wait_bytes != 0),
+                    probe.wait_extra == (publishes ? 1u : 0u) &&
+                    publishes == (probe.wait_bytes != 0),
                 "the wait-pass counters did not match the switch");
         // Deliver the stale write for the next iteration and restore the default.
         context.BeginCommandStream();
