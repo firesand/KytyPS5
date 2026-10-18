@@ -213,6 +213,22 @@ struct ReadbackProbe {
 	}
 };
 
+// KYTY_SUBMIT_AHEAD (submitAhead.h): early submits by trigger, producers learned from waited
+// readbacks, and the current producer count.
+struct SubmitAheadProbe {
+	enum Counter : uint32_t { ProducerSubmits = 0, TimerSubmits, Learned, Forgotten, CounterCount };
+	inline static std::array<std::atomic<uint64_t>, CounterCount> s_counts {};
+	inline static std::atomic<uint64_t>                          s_producers {0};
+	static void Count(Counter counter) noexcept { s_counts[counter].fetch_add(1, std::memory_order_relaxed); }
+	static std::array<uint64_t, CounterCount> Take() noexcept {
+		std::array<uint64_t, CounterCount> snapshot {};
+		for (uint32_t i = 0; i < CounterCount; ++i) {
+			snapshot[i] = s_counts[i].exchange(0, std::memory_order_relaxed);
+		}
+		return snapshot;
+	}
+};
+
 // Declares why waits below this point happen; an enclosing scope's reason wins. Cheap enough for any path (one
 // thread-local read and write), independent of the probe switch.
 class WaitReasonScope {

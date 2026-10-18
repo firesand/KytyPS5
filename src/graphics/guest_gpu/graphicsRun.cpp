@@ -255,6 +255,7 @@ void CommandProcessor::Reset() {
 	m_num_instances                    = 1;
 	m_sgpr_poison                      = {};
 	m_merge_probe                      = {};
+	m_submit_ahead                     = {};
 	m_any_sgpr_poison                  = false;
 	m_num_instances_stale              = false;
 	m_predicate_skip                   = false;
@@ -1031,6 +1032,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		if (GpuIndirectEnabled()) {
 			NoteMergeOpcode(opcode);
 		}
+		if (SubmitAheadConfig::Get().Enabled()) {
+			SubmitAheadBeforePacket(opcode);
+		}
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		EXIT_IF(packet_dw > remaining_dw);
@@ -1145,18 +1149,19 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 }
 
 
-// (b1) diagnostics: classify every PM4 packet so consecutive GPU mesh packets can be compared.
-void CommandProcessor::NoteMergeOpcode(uint32_t opcode) {
-	auto& probe = m_merge_probe;
+enum class PacketClass { ShRegs, CtxRegs, Work, Benign, Other };
+
+// Classifies PM4 packets for the (b1) merge probe and KYTY_SUBMIT_AHEAD.
+static PacketClass ClassifyPacket(uint32_t opcode) {
 	switch (opcode) {
 		case Pm4::IT_SET_SH_REG:
-		case Pm4::IT_SET_SH_REG_INDIRECT: probe.sh++; break;
+		case Pm4::IT_SET_SH_REG_INDIRECT: return PacketClass::ShRegs;
 		case Pm4::IT_SET_CONTEXT_REG:
 		case Pm4::IT_SET_CONTEXT_REG_INDIRECT:
 		case Pm4::IT_SET_UCONFIG_REG:
 		case Pm4::IT_SET_UCONFIG_REG_INDEX:
 		case Pm4::IT_SET_UCONFIG_REG_INDIRECT:
-		case Pm4::IT_CLEAR_STATE: probe.ctx++; break;
+		case Pm4::IT_CLEAR_STATE: return PacketClass::CtxRegs;
 		case Pm4::IT_DRAW_INDIRECT:
 		case Pm4::IT_DRAW_INDEX_INDIRECT:
 		case Pm4::IT_DRAW_INDIRECT_MULTI:
@@ -1166,8 +1171,8 @@ void CommandProcessor::NoteMergeOpcode(uint32_t opcode) {
 		case Pm4::IT_DRAW_INDEX_AUTO:
 		case Pm4::IT_DISPATCH_DIRECT:
 		case Pm4::IT_DISPATCH_INDIRECT:
-		case Pm4::IT_DISPATCH_DRAW_PREAMBLE: probe.draw++; break;
-		// No side effect on a merged dispatch: per-packet state the records carry, or CE/DE sync.
+		case Pm4::IT_DISPATCH_DRAW_PREAMBLE: return PacketClass::Work;
+		// No GPU work, no side effect: per-packet state the records carry, control flow, CE/DE sync.
 		case Pm4::IT_NOP:
 		case Pm4::IT_INDIRECT_BUFFER: // control flow only; its packets are classified one by one
 		case Pm4::IT_SET_BASE:
@@ -1180,9 +1185,53 @@ void CommandProcessor::NoteMergeOpcode(uint32_t opcode) {
 		case Pm4::IT_INCREMENT_CE_COUNTER:
 		case Pm4::IT_WAIT_ON_CE_COUNTER:
 		case Pm4::IT_WAIT_ON_DE_COUNTER_DIFF:
-		case Pm4::IT_WRITE_CONST_RAM: break;
-		default: probe.other++; break;
+		case Pm4::IT_WRITE_CONST_RAM: return PacketClass::Benign;
+		default: return PacketClass::Other;
 	}
+}
+
+// (b1) diagnostics: classify every PM4 packet so consecutive GPU mesh packets can be compared.
+void CommandProcessor::NoteMergeOpcode(uint32_t opcode) {
+	auto& probe = m_merge_probe;
+	switch (ClassifyPacket(opcode)) {
+		case PacketClass::ShRegs: probe.sh++; break;
+		case PacketClass::CtxRegs: probe.ctx++; break;
+		case PacketClass::Work: probe.draw++; break;
+		case PacketClass::Benign: break;
+		case PacketClass::Other: probe.other++; break;
+	}
+}
+
+// KYTY_SUBMIT_AHEAD (submitAhead.h): before a work or side-effect packet, submit the open command
+// buffer when a learned producer was recorded into it, or when it has been recording longer than
+// the timer. Same operation as BufferFlush (submit, no wait).
+void CommandProcessor::SubmitAheadBeforePacket(uint32_t opcode) {
+	auto& scheduler = GetScheduler();
+	if (!scheduler.Active() || CurrentBuffer().IsInvalid()) {
+		return;
+	}
+	uint64_t producer_tick = 0;
+	if (const auto producer = m_renderer.GetRenderExecutor().ConsumeSubmitAheadProducer(producer_tick);
+	    producer != 0) {
+		m_submit_ahead.ProducerRecorded(producer_tick, producer);
+	}
+	const auto kind = ClassifyPacket(opcode);
+	using Packet    = SubmitAheadTrigger::Packet;
+	const auto packet = kind == PacketClass::ShRegs || kind == PacketClass::CtxRegs ? Packet::Register
+	                    : kind == PacketClass::Benign                               ? Packet::Benign
+	                                                                                : Packet::Work;
+	const auto reason = m_submit_ahead.Before(packet, scheduler.CurrentTick(),
+	                                          packet == Packet::Work ? scheduler.OpenCommandAgeNs() : 0,
+	                                          CurrentBuffer().IsRendering(), SubmitAheadConfig::Get());
+	if (reason == SubmitAheadTrigger::Reason::None) {
+		return;
+	}
+	BufferFlush();
+	if (const auto producer = m_submit_ahead.Submitted(reason, scheduler.CurrentTick()); producer != 0) {
+		m_renderer.GetBufferCache().NoteSubmitAhead(producer);
+	}
+	SubmitAheadProbe::Count(reason == SubmitAheadTrigger::Reason::Producer ? SubmitAheadProbe::ProducerSubmits
+	                                                                       : SubmitAheadProbe::TimerSubmits);
 }
 
 // Called for each GPU mesh packet after it was recorded (the packet itself is one probe.draw).

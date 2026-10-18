@@ -312,6 +312,13 @@ struct FaultSampler {
 					                    wr.reasons[r].first);
 				}
 			}
+			if (SubmitAheadConfig::Get().Enabled()) {
+				const auto sa = SubmitAheadProbe::Take();
+				line += fmt::format(" | submit-ahead producer {} timer {} learned {} forgotten {} producers {}",
+				                    sa[SubmitAheadProbe::ProducerSubmits], sa[SubmitAheadProbe::TimerSubmits],
+				                    sa[SubmitAheadProbe::Learned], sa[SubmitAheadProbe::Forgotten],
+				                    SubmitAheadProbe::s_producers.load(std::memory_order_relaxed));
+			}
 			const auto rb = ReadbackProbe::Take();
 			line += " | readbacks bar/copy:";
 			for (uint32_t r = 0; r < WaitReasonProbe::ReasonCount; ++r) {

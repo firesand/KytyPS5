@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/cache/hostResidentMemory.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/submitAhead.h"
 
 #include <array>
 #include <map>
@@ -176,6 +177,13 @@ public:
 	// drawn with GPU-resident arguments; ReadMemory counts and logs readbacks that touch their pages
 	// (does a host reader still consume GPU-built arguments?).
 	void NoteGpuIndirectArgs(uint64_t vaddr, uint64_t size);
+	// KYTY_SUBMIT_AHEAD producers (GPU thread): the dispatch whose bindings are being written
+	// (0 = none); NoteGpuWrite attributes written pages to it, waited readbacks learn producers.
+	void SetWriterTag(uint64_t writer) noexcept { m_writer_tag = writer; }
+	[[nodiscard]] bool IsSubmitAheadProducer(uint64_t writer) const {
+		return m_submit_ahead.IsProducer(writer);
+	}
+	void NoteSubmitAhead(uint64_t writer);
 	void MarkPageWritten(uint64_t vaddr);      // any thread (fault-processing operation)
 	void MarkWriteFaultOverflow();             // any thread
 	// Safe point between PM4 packets / at garbage collection: records the pending write-fault
@@ -338,6 +346,8 @@ private:
 	SyncStats                                         m_sync_stats;
 	GpuWriteTicks<CACHING_PAGEBITS>                    m_gpu_write_ticks;
 	uint64_t                                          m_bar_block_tick = 0;
+	uint64_t                                          m_writer_tag = 0;
+	SubmitAheadLearner                                m_submit_ahead;
 	static constexpr size_t                           kGpuIndirectArgsRing = 64;
 	std::array<std::pair<uint64_t, uint64_t>, kGpuIndirectArgsRing> m_gpu_indirect_args {}; // page range [first, last)
 	size_t                                            m_gpu_indirect_args_next = 0;

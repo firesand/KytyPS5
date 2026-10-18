@@ -5,6 +5,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/submitAhead.h"
 
 #include <array>
 #include <cstdint>
@@ -233,6 +234,9 @@ private:
 	MergeProbe m_merge_probe;
 	void NoteMergeOpcode(uint32_t opcode);
 	void CountMergeRun(uint64_t mesh_hash);
+	// KYTY_SUBMIT_AHEAD (submitAhead.h).
+	SubmitAheadTrigger m_submit_ahead;
+	void SubmitAheadBeforePacket(uint32_t opcode);
 	void CountStaleDrawState(bool instances_from_state, const GpuIndirectDraw* gpu_indirect);
 
 	uint32_t m_de_count    = 0;

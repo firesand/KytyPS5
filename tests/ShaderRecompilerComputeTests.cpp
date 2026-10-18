@@ -25,6 +25,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/gpuIndirectFilter.h"
 #include "graphics/host_gpu/renderer/meshTaskIndirect.h"
+#include "graphics/host_gpu/renderer/submitAhead.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -4073,6 +4074,73 @@ public:
                                   vk::ImageCreateFlagBits::e2DArrayCompatible),
             "2D slice views of a compatible 3D backing were rejected");
     std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // KYTY_SUBMIT_AHEAD producer learning through the real buffer cache (--submit-ahead-only sets
+  // KYTY_SUBMIT_AHEAD=1): a write recorded under a writer tag in the open command buffer, then a
+  // readback that has to copy (the tick is not submitted, so no BAR read), makes the tag a producer;
+  // an untagged write teaches nothing.
+  void CheckSubmitAheadLearning() {
+    constexpr const char *name = "SubmitAheadLearning";
+    if (!SubmitAheadConfig::Get().producers) {
+      std::printf("[gpu]     %-32s SKIP KYTY_SUBMIT_AHEAD producers off\n", name);
+      return;
+    }
+    constexpr uintptr_t base = 0x0000000209800000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t untagged_offset = 0x100;
+    constexpr uint64_t tagged_offset = 0x8100; // another 16 KiB tracking page
+    constexpr uint64_t writer = 0x5ab0c0de00000001ull;
+
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "submit-ahead direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "submit-ahead fixed direct-memory mapping failed");
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      (void)cache.ObtainBuffer(base + untagged_offset, 0x100, true, false);
+      cache.ReadMemory(base + untagged_offset, sizeof(uint32_t));
+      Require(name, "untagged write", !cache.IsSubmitAheadProducer(writer),
+              "a readback of an untagged write learned a producer");
+      cache.SetWriterTag(writer);
+      (void)cache.ObtainBuffer(base + tagged_offset, 0x100, true, false);
+      cache.SetWriterTag(0);
+      Require(name, "not yet learned", !cache.IsSubmitAheadProducer(writer),
+              "a tagged write alone made its writer a producer");
+      cache.ReadMemory(base + tagged_offset, sizeof(uint32_t));
+      Require(name, "learned from a waited readback", cache.IsSubmitAheadProducer(writer),
+              "a copy readback of a tagged write in the open command buffer learned nothing");
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "submit-ahead direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "submit-ahead direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
   }
 
   void CheckBufferCacheDirtyGarbageCollection() {
@@ -44736,8 +44804,90 @@ static void CheckWaitReasonAttribution() {
   std::printf("[host]    %-32s ok (%u)\n", name, static_cast<uint32_t>(Probe::ReasonCount));
 }
 
+// KYTY_SUBMIT_AHEAD decision logic (submitAhead.h), host only.
+static void CheckSubmitAheadLogic() {
+  const char *name = "SubmitAheadLogic";
+  using Config = Libs::Graphics::SubmitAheadConfig;
+  Require(name, "config off", !Config::Parse(nullptr, nullptr).Enabled() &&
+                                  !Config::Parse("0", "2").Enabled() && !Config::Parse("x", nullptr).Enabled(),
+          "submit-ahead enabled without KYTY_SUBMIT_AHEAD=1|p|t");
+  const auto both = Config::Parse("1", nullptr);
+  const auto producers = Config::Parse("p", "2");
+  const auto timer = Config::Parse("t", "2.5");
+  const auto bad_ms = Config::Parse("t", "abc");
+  Require(name, "config modes",
+          both.producers && both.timer_ns == 4000000u && producers.producers && producers.timer_ns == 0 &&
+              !timer.producers && timer.timer_ns == 2500000u && bad_ms.timer_ns == 4000000u,
+          "KYTY_SUBMIT_AHEAD / _MS parsed wrongly");
+
+  Libs::Graphics::SubmitAheadLearner learner;
+  learner.NoteWrite(10, 12, 0xaa);
+  learner.NoteWrite(100, 100 + Libs::Graphics::SubmitAheadLearner::kMaxWritePages + 1, 0xbb);
+  uint64_t learned = 0;
+  Require(name, "BAR readback teaches nothing", learner.NoteReadback(11, 12, false) == 0 &&
+                                                    !learner.IsProducer(0xaa),
+          "a readback served over BAR learned a producer");
+  Require(name, "waited readback learns", learner.NoteReadback(11, 12, true, &learned) == 1 &&
+                                              learned == 0xaa && learner.IsProducer(0xaa),
+          "a waited readback of a written page did not learn its writer");
+  Require(name, "heap writes ignored", learner.NoteReadback(100, 101, true) == 0 && !learner.IsProducer(0xbb),
+          "a write larger than kMaxWritePages was attributed");
+  for (uint32_t i = 0; i < Libs::Graphics::SubmitAheadLearner::kIdleLimit; ++i) {
+    learner.NoteSubmitAhead(0xaa);
+  }
+  (void)learner.NoteReadback(10, 11, false); // BAR read of its page: alive again
+  learner.NoteSubmitAhead(0xaa);
+  Require(name, "readback keeps a producer", learner.IsProducer(0xaa),
+          "a producer whose pages were read back was forgotten");
+  for (uint32_t i = 0; i <= Libs::Graphics::SubmitAheadLearner::kIdleLimit; ++i) {
+    learner.NoteSubmitAhead(0xaa);
+  }
+  Require(name, "idle producer forgotten", !learner.IsProducer(0xaa) && learner.ProducerCount() == 0,
+          "a producer without readbacks survived kIdleLimit submit-aheads");
+
+  using Trigger = Libs::Graphics::SubmitAheadTrigger;
+  Trigger trigger;
+  const auto work = Trigger::Packet::Work;
+  Require(name, "first work packet never submits",
+          trigger.Before(work, 5, 100000000u, false, both) == Trigger::Reason::None,
+          "submitted before anything was recorded into the command buffer");
+  Require(name, "registers never submit",
+          trigger.Before(Trigger::Packet::Register, 5, 100000000u, false, both) == Trigger::Reason::None &&
+              trigger.Before(Trigger::Packet::Benign, 5, 100000000u, false, both) == Trigger::Reason::None,
+          "submitted before a register write or a benign packet");
+  trigger.ProducerRecorded(5, 0xcc);
+  const auto producer_reason = trigger.Before(work, 5, 0, true, both);
+  Require(name, "producer submits even in a render pass",
+          producer_reason == Trigger::Reason::Producer && trigger.Submitted(producer_reason, 6) == 0xcc,
+          "a recorded producer did not trigger a submit at the next work packet");
+  trigger.ProducerRecorded(6, 0xdd);
+  (void)trigger.Before(work, 7, 0, false, both); // another path submitted: the producer is gone
+  Require(name, "stale producer ignored", trigger.Before(work, 7, 0, false, both) == Trigger::Reason::None,
+          "a producer recorded into an already submitted command buffer triggered a submit");
+  Require(name, "timer below threshold", trigger.Before(work, 7, 3999999u, false, both) == Trigger::Reason::None,
+          "the timer fired early");
+  Require(name, "timer waits for the render pass",
+          trigger.Before(work, 7, 5000000u, true, both) == Trigger::Reason::None &&
+              trigger.Before(work, 7, 12000000u, true, both) == Trigger::Reason::Timer,
+          "the timer split an open render pass before 3x its threshold");
+  const auto timer_reason = trigger.Before(work, 7, 4000000u, false, timer);
+  Require(name, "timer outside a render pass",
+          timer_reason == Trigger::Reason::Timer && trigger.Submitted(timer_reason, 8) == 0,
+          "the timer did not fire outside a render pass");
+  Require(name, "producers off",
+          [&] {
+            Trigger off;
+            (void)off.Before(work, 1, 0, false, timer);
+            off.ProducerRecorded(1, 0xee);
+            return off.Before(work, 1, 0, false, timer) == Trigger::Reason::None;
+          }(),
+          "a producer triggered a submit with KYTY_SUBMIT_AHEAD=t");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckMeshTaskIndirect() {
   CheckGpuIndirectReasonNames();
+  CheckSubmitAheadLogic();
   CheckWaitReasonAttribution();
   CheckGpuIndirectHashFilter();
   CheckMeshTaskPathEmission();
@@ -47602,6 +47752,13 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--mesh-task-indirect-only") == 0) {
     CheckMeshTaskIndirect();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--submit-ahead-only") == 0) {
+    setenv("KYTY_SUBMIT_AHEAD", "1", 0); // an explicit value from the caller wins
+    CheckSubmitAheadLogic();
+    VulkanHarness vulkan;
+    vulkan.CheckSubmitAheadLearning();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--depth-feedback-only") == 0) {
