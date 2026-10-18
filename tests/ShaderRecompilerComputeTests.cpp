@@ -9954,6 +9954,7 @@ public:
           std::memcpy(memory + sync_a_offset + offset, &sync_initial, sizeof(sync_initial));
           std::memcpy(memory + sync_b_offset + offset, &sync_initial, sizeof(sync_initial));
         }
+        ApplyCpuStores(resources);
         const auto sync_a = sync_cache.ObtainBuffer(base + sync_a_offset, sync_owner_size, false);
         const auto sync_b = sync_cache.ObtainBuffer(base + sync_b_offset, sync_owner_size, false);
         Require(name, "page-driven sync owners",
@@ -10049,6 +10050,7 @@ public:
             std::memcpy(memory + p_offset + offset, &initial, sizeof(initial));
             std::memcpy(memory + q_offset + offset, &initial, sizeof(initial));
           }
+          ApplyCpuStores(resources);
           const auto first_owner = cache.ObtainBuffer(base + p_offset, owner_size, false);
           const auto second_owner = scenario == 2 ? first_owner
                                                   : cache.ObtainBuffer(base + q_offset, owner_size, false);
@@ -10162,6 +10164,7 @@ public:
         for (uint64_t offset = 0; offset < 0x8000; offset += sizeof(initial)) {
           std::memcpy(memory + x_offset + offset, &initial, sizeof(initial));
         }
+        ApplyCpuStores(resources);
         const uint64_t x_address = base + x_offset + 0x1000;
         const auto x_owner = cache.ObtainBuffer(base + x_offset, 0x8000, false);
         Require(name, "wait-pass owner", x_owner.first != nullptr, "the consumer buffer was not created");
@@ -12288,6 +12291,23 @@ public:
                 std::to_string(window.emitted[Probe::FlushSubmit]));
       };
 
+      // KYTY_TEST_TRACE_LAZY=1: tracker state of the four buffers at the pass boundaries (stderr).
+      const bool trace = std::getenv("KYTY_TEST_TRACE_LAZY") != nullptr;
+      const auto dump = [&](u32 pass, const char *where) {
+        if (!trace) {
+          return;
+        }
+        const auto state = [&](const char *label, uint64_t address, uint64_t size) {
+          std::fprintf(stderr, "lazy-trace pass %u %s %s cpu=%d gpu=%d gpu-bytes=%d\n", pass, where,
+                       label, cache.IsRegionCpuModified(address, size) ? 1 : 0,
+                       cache.IsRegionGpuModified(address, size) ? 1 : 0,
+                       cache.HasGpuDirtyBytes(address, size) ? 1 : 0);
+        };
+        state("x", x_address, 4);
+        state("y", y_address, 4);
+        state("output", output_address, 16u * sizeof(u32));
+        state("args", args_address, 12);
+      };
       // Pass 0 warms pipelines and buffer owners; pass 1 is measured on a fresh command buffer.
       for (u32 pass = 0; pass < 2; pass++) {
         const bool measure = pass == 1 && counted;
@@ -12317,6 +12337,9 @@ public:
         }
 
         // Indirect arguments written by a dispatch, then read-only indirect dispatches.
+        if (pass != 0) { // pass 0 has no region over the output yet; a query would create one
+          dump(pass, "before-E");
+        }
         write_args(2);                        // E: WAW against D
         indirect(consumer, 4, true);          // F: args written by E (merged barrier)
         indirect(read_only, 1, false);        // G: RAW on F's output
@@ -12330,6 +12353,7 @@ public:
                   "the sequence submitted work, so the counts are not comparable");
         }
 
+        dump(pass, "before-readback");
         cache.ReadMemory(x_address, 4);
         cache.ReadMemory(y_address, 4);
         cache.ReadMemory(output_address, 16u * sizeof(u32));
