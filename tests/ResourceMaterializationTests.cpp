@@ -503,11 +503,11 @@ void TestWrittenDescriptorPredicateReads(bool memory_condition) {
   ResourceSpecialization specialization;
   for (const bool clean : {false, true}) {
     reads = {.clean = clean};
-    // A failed predicate explores both edges and the writable descriptor retries its clean read.
+    // A failed predicate explores both edges; its dirty read also rejects the writable descriptor.
     const bool expected = !memory_condition || clean;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) == expected &&
               reads.ordinary == (memory_condition ? 0u : 1u) &&
-              reads.strict == (memory_condition ? (clean ? 1u : 2u) : 0u),
+              reads.strict == (memory_condition ? 1u : 0u),
           "writable descriptor changed reader policy or bypassed a dirty memory predicate");
     if (!expected) continue;
     Check(snapshot.buffers[0].dwords[0] == 0x8000u &&
