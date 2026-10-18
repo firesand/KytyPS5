@@ -873,6 +873,17 @@ uint8_t* GetBackingHostView(uint64_t* size) {
 	return reinterpret_cast<uint8_t*>(g_guest_address_space->GetBackingBase());
 }
 
+// GPU thread: TryReadBufferBacking calls that had to download GPU-dirty bytes (diagnostics).
+static thread_local uint64_t g_backing_downloads    = 0;
+static thread_local uint64_t g_backing_last_address = 0;
+
+uint64_t BufferBackingDownloads(uint64_t* last_address) {
+	if (last_address != nullptr) {
+		*last_address = g_backing_last_address;
+	}
+	return g_backing_downloads;
+}
+
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsGpuThread()) {
@@ -881,6 +892,8 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 		auto& buffers = GetGpuResources().GetBufferCache();
 		Graphics::WaitReasonScope reason(Graphics::WaitReasonProbe::BackingRead);
 		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
+			g_backing_downloads++;
+			g_backing_last_address = vaddr;
 			buffers.ReadMemory(vaddr, size);
 		}
 	}

@@ -187,7 +187,11 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	}
 	m_last_download_bar = false;
 	if constexpr (!async) {
-		if (TryBarReadback(buffer, copies)) {
+		const bool bar = TryBarReadback(buffer, copies);
+		if (ProbeEnabled::Get()) {
+			ReadbackProbe::Count(WaitReasonProbe::s_current, bar);
+		}
+		if (bar) {
 			return true;
 		}
 	}

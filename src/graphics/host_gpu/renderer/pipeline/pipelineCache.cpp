@@ -36,6 +36,7 @@
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -110,6 +111,51 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	message += '\n';
 	Log::WriteToConsoleAndLog(message);
 }
+
+// Diagnostics (wait reason backing-read): a program lookup whose specialization or resource walk
+// read GPU-dirty guest memory had to download it first, i.e. drain the open command buffer. Logs
+// the first 32 distinct (stage, hash) and, every 512 such lookups, the most frequent hashes.
+class BackingReadAttribution {
+public:
+	BackingReadAttribution(ShaderType stage, uint64_t hash) noexcept
+	    : m_stage(stage), m_hash(hash), m_before(LibKernel::Memory::BufferBackingDownloads(nullptr)) {}
+	~BackingReadAttribution() {
+		uint64_t   last  = 0;
+		const auto after = LibKernel::Memory::BufferBackingDownloads(&last);
+		if (after == m_before) {
+			return;
+		}
+		// GPU thread only (program cache).
+		static std::vector<std::pair<uint32_t, uint64_t>> seen;
+		static std::unordered_map<uint64_t, uint64_t>     counts;
+		static uint64_t                                   events = 0;
+		const std::pair<uint32_t, uint64_t> key {static_cast<uint32_t>(m_stage), m_hash};
+		if (seen.size() < 32 && std::find(seen.begin(), seen.end(), key) == seen.end()) {
+			seen.push_back(key);
+			LOGF("SrtGpuRead: stage=%u hash=0x%016" PRIx64 " downloads=%" PRIu64 " last=0x%016" PRIx64
+			     " (program lookup read GPU-written memory)\n",
+			     key.first, m_hash, after - m_before, last);
+		}
+		counts[m_hash] += after - m_before;
+		if (++events % 512 == 0) {
+			std::vector<std::pair<uint64_t, uint64_t>> top(counts.begin(), counts.end());
+			std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+			std::string line;
+			for (size_t i = 0; i < top.size() && i < 8; ++i) {
+				line += fmt::format(" 0x{:016x}:{}", top[i].first, top[i].second);
+			}
+			LOGF("SrtGpuRead: top downloads by program after %" PRIu64 " lookups:%s\n", events,
+			     line.c_str());
+		}
+	}
+	BackingReadAttribution(const BackingReadAttribution&)            = delete;
+	BackingReadAttribution& operator=(const BackingReadAttribution&) = delete;
+
+private:
+	ShaderType m_stage;
+	uint64_t   m_hash;
+	uint64_t   m_before;
+};
 
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
 	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
@@ -572,6 +618,7 @@ struct PipelineCache::ProgramCache {
 			static_assert(std::is_same_v<InputInfo, ShaderComputeInputInfo>);
 			stage = ShaderType::Compute;
 		}
+		const BackingReadAttribution backing_reads(stage, params.hash);
 
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
 		lookup_key.stage           = stage;

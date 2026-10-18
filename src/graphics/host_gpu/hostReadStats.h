@@ -193,6 +193,26 @@ struct WaitReasonProbe {
 	}
 };
 
+// KYTY_PROBE_FAULT_HISTOGRAM: synchronous readbacks (BufferCache::DownloadBufferMemory<false>) by the
+// wait reason in force, served over BAR (completed GPU data, no drain) or through a copy (submit and
+// wait). The measure for KYTY_SUBMIT_AHEAD: waited readbacks should move from copy to bar.
+struct ReadbackProbe {
+	inline static std::array<std::array<std::atomic<uint64_t>, 2>, WaitReasonProbe::ReasonCount> s_counts {};
+	static void Count(uint32_t reason, bool bar) noexcept {
+		s_counts[reason][bar ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
+	}
+	using Snapshot = std::array<std::array<uint64_t, 2>, WaitReasonProbe::ReasonCount>;
+	static Snapshot Take() noexcept {
+		Snapshot snapshot {};
+		for (uint32_t r = 0; r < WaitReasonProbe::ReasonCount; ++r) {
+			for (uint32_t k = 0; k < 2; ++k) {
+				snapshot[r][k] = s_counts[r][k].exchange(0, std::memory_order_relaxed);
+			}
+		}
+		return snapshot;
+	}
+};
+
 // Declares why waits below this point happen; an enclosing scope's reason wins. Cheap enough for any path (one
 // thread-local read and write), independent of the probe switch.
 class WaitReasonScope {

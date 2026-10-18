@@ -312,6 +312,13 @@ struct FaultSampler {
 					                    wr.reasons[r].first);
 				}
 			}
+			const auto rb = ReadbackProbe::Take();
+			line += " | readbacks bar/copy:";
+			for (uint32_t r = 0; r < WaitReasonProbe::ReasonCount; ++r) {
+				if (rb[r][0] + rb[r][1] != 0) {
+					line += fmt::format(" {} {}/{}", WaitReasonProbe::Name(r), rb[r][0], rb[r][1]);
+				}
+			}
 		}
 		LOGF("%s\n", line.c_str());
 		last_total = now;
