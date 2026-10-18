@@ -850,6 +850,13 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	       g_guest_address_space->TryReadBacking(vaddr, data, size);
 }
 
+const void* TryGetBackingPointer(uint64_t vaddr, uint64_t size) {
+	if (g_guest_address_space == nullptr) {
+		return nullptr;
+	}
+	return g_guest_address_space->TryGetBackingPointer(vaddr, size);
+}
+
 bool QueryBackingOffset(uint64_t vaddr, uint64_t size, uint64_t* backing_offset) {
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->ResolveBackingOffset(vaddr, size, backing_offset);

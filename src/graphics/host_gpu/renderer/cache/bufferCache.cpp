@@ -700,9 +700,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 				std::memcpy(mapped + copy.srcOffset, sources[i], copy.size);
 			} else {
 				const auto address = buffer.CpuAddress() + copy.dstOffset;
-				if (!LibKernel::Memory::CopySparseMemory(address, mapped + copy.srcOffset, copy.size)) {
-					EXIT("BufferCache: failed to read sparse guest buffer memory\n");
-				}
+				std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
 			}
 			copy.srcOffset += base_offset;
 		}
@@ -724,9 +722,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
 		if (mapped != nullptr) {
-			if (!LibKernel::Memory::CopySparseMemory(vaddr, mapped, size)) {
-				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
-			}
+			std::memcpy(mapped, reinterpret_cast<const void*>(vaddr), size);
 			m_stream_buffer.Commit();
 			return {&m_stream_buffer, offset};
 		}
@@ -1116,6 +1112,10 @@ void BufferCache::EndUploadBatch() {
 }
 
 void BufferCache::PrepareHostRead(uint64_t vaddr, uint64_t size) {
+	if (!m_has_pending_gpu_modified.load(std::memory_order_acquire) &&
+	    !m_write_faults_dirty && m_write_fault_tick == 0) {
+		return;
+	}
 	if ((m_write_faults_dirty || m_write_fault_tick != 0) &&
 	    m_write_fault_ranges.Intersects(vaddr, size)) {
 		FlushWriteFaults(true);

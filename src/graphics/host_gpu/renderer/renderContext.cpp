@@ -376,14 +376,14 @@ void RenderContext::PrepareBda() {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
 	}
-	SyncCpuWrites();
+	SyncCpuWrites(std::exchange(m_sync_hot_regions_pending, false));
 	m_fault_process_pending = true;
 }
 
 static std::atomic<int>& SyncOnWaitPassMode() {
 	static std::atomic<int> mode = [] {
 		const char* value = std::getenv("KYTY_SYNC_ON_WAIT_PASS");
-		const int   on    = (value == nullptr || value[0] != '0') ? 1 : 0;
+		const int   on    = (value != nullptr && value[0] == '1') ? 1 : 0;
 		LOGF("RenderContext: sync on wait-pass %s\n", on != 0 ? "on" : "off (measure only)");
 		return on;
 	}();
@@ -409,7 +409,7 @@ void RenderContext::NoteGuestAcquire() {
 	}
 }
 
-void RenderContext::SyncCpuWrites() {
+void RenderContext::SyncCpuWrites(bool include_hot) {
 	// Once per command stream (KYTY_BDA_SYNC_PER_DRAW=1 restores the per-draw sync): every sync
 	// re-protects the pages it uploads, so the game's next CPU write to them faults again.
 	static const bool per_draw = [] {
@@ -449,7 +449,7 @@ void RenderContext::SyncCpuWrites() {
 	} else {
 		// Only regions with new CPU-dirty pages (and regions holding hot pages), clipped to mapped
 		// memory: cached buffers can extend past the mapping and unmapped pages must not be read.
-		m_buffer_cache.ForEachBdaSyncPendingRegion([this](uint64_t vaddr, uint64_t size) {
+		m_buffer_cache.ForEachBdaSyncPendingRegion(include_hot, [this](uint64_t vaddr, uint64_t size) {
 			SyncProbe::NoteRegion();
 			m_mapped_ranges.ForEachInRange(vaddr, size, [this](uint64_t start, uint64_t end) {
 				m_buffer_cache.SynchronizeBuffersInRange(start, end - start);

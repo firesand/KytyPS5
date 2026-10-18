@@ -59,6 +59,13 @@ static void CopySparseRange(const Regions& regions, uint64_t vaddr, void* data, 
 
 class GuestBackingStore {
 public:
+	struct TlsBackingEntry {
+		uint64_t epoch       = 0;
+		uint64_t vaddr_begin = 0;
+		uint64_t vaddr_end   = 0;
+		uint64_t host_addr   = 0;
+	};
+public:
 	enum class FailureReason {
 		None,
 		BackingUnavailable,
@@ -133,6 +140,7 @@ public:
 			UnmapViewPreservePlaceholder(reinterpret_cast<void*>(entry.vaddr), entry.size);
 		}
 		m_maps.clear();
+		BumpMapsEpoch();
 		if (m_backing_base != nullptr) {
 			UnmapViewOfFile(m_backing_base);
 		}
@@ -145,6 +153,7 @@ public:
 			    !UnmapViewPreservePlaceholder(reinterpret_cast<void*>(entry.vaddr), entry.size));
 		}
 		m_maps.clear();
+		BumpMapsEpoch();
 		if (m_backing_base != nullptr) {
 			munmap(m_backing_base, m_size);
 		}
@@ -238,6 +247,16 @@ public:
 			return false;
 		}
 
+		if (const void* ptr = TryGetBackingPointer(vaddr, size)) {
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+			if (g_test_backing_read != nullptr) {
+				g_test_backing_read(vaddr, size);
+			}
+#endif
+			std::memcpy(data, ptr, size);
+			return true;
+		}
+
 		std::shared_lock lock(m_mutex);
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 		if (g_test_backing_read != nullptr) {
@@ -274,6 +293,43 @@ public:
 			current += bytes;
 		}
 		return true;
+	}
+
+	const void* TryGetBackingPointer(uint64_t vaddr, uint64_t size) {
+		if (!IsAvailable() || size == 0 || UINT64_MAX - vaddr < size) {
+			return nullptr;
+		}
+		static thread_local TlsBackingEntry s_tls_cache[4] {};
+		const uint64_t                      epoch = m_maps_epoch.load(std::memory_order_relaxed);
+		const size_t                        slot  = ((vaddr >> 16u) ^ (vaddr >> 24u)) & 3u;
+		const auto&                         cached = s_tls_cache[slot];
+		const uint64_t                      end    = vaddr + size;
+		if (cached.epoch == epoch && vaddr >= cached.vaddr_begin && end <= cached.vaddr_end) {
+			return reinterpret_cast<const void*>(cached.host_addr + (vaddr - cached.vaddr_begin));
+		}
+		for (size_t i = 0; i < 4; ++i) {
+			if (i == slot) continue;
+			const auto& entry = s_tls_cache[i];
+			if (entry.epoch == epoch && vaddr >= entry.vaddr_begin && end <= entry.vaddr_end) {
+				return reinterpret_cast<const void*>(entry.host_addr + (vaddr - entry.vaddr_begin));
+			}
+		}
+		std::shared_lock lock(m_mutex);
+		auto it = m_maps.upper_bound(vaddr);
+		if (it == m_maps.begin()) {
+			return nullptr;
+		}
+		--it;
+		const auto& entry = it->second;
+		if (vaddr >= entry.vaddr && end <= entry.vaddr + entry.size) {
+			if (!RangeOk(entry.backing_offset + (vaddr - entry.vaddr), size)) {
+				return nullptr;
+			}
+			const uint64_t host_base = reinterpret_cast<uint64_t>(m_backing_base) + entry.backing_offset;
+			s_tls_cache[slot] = {epoch, entry.vaddr, entry.vaddr + entry.size, host_base};
+			return reinterpret_cast<const void*>(host_base + (vaddr - entry.vaddr));
+		}
+		return nullptr;
 	}
 
 	// Host-resident prototype: the direct-memory offset of [vaddr, vaddr + size) when the whole range
@@ -355,6 +411,7 @@ public:
 		{
 			std::lock_guard lock(m_mutex);
 			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
+			BumpMapsEpoch();
 		}
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
@@ -366,6 +423,7 @@ public:
 		}
 		RemoveMappingsUnlocked(vaddr, size);
 		EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
+		BumpMapsEpoch();
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
 #endif
@@ -527,6 +585,7 @@ public:
 
 		std::lock_guard lock(m_mutex);
 		RemoveMappingsUnlocked(vaddr, size);
+		BumpMapsEpoch();
 
 		if (placeholder_preserved != nullptr) {
 			*placeholder_preserved = true;
@@ -582,13 +641,16 @@ private:
 				continue;
 			}
 			it = m_maps.erase(it);
+			BumpMapsEpoch();
 			if (old.vaddr < vaddr) {
 				m_maps.emplace(old.vaddr,
 				               MapEntry {old.vaddr, vaddr - old.vaddr, old.backing_offset, old.mode});
+				BumpMapsEpoch();
 			}
 			if (end < old_end) {
 				m_maps.emplace(end, MapEntry {end, old_end - end,
 				                             old.backing_offset + end - old.vaddr, old.mode});
+				BumpMapsEpoch();
 			}
 		}
 	}
@@ -724,9 +786,12 @@ private:
 	int m_fd = -1;
 #endif
 
+	void BumpMapsEpoch() { m_maps_epoch.fetch_add(1, std::memory_order_release); }
+
 	uint8_t*                     m_backing_base = nullptr;
 	uint64_t                     m_size         = 0;
 	std::shared_mutex            m_mutex;
+	std::atomic<uint64_t>        m_maps_epoch{1};
 	std::map<uint64_t, MapEntry> m_maps;
 };
 
@@ -819,6 +884,9 @@ public:
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBacking(vaddr, data, size);
+	}
+	const void* TryGetBackingPointer(uint64_t vaddr, uint64_t size) {
+		return m_backing->TryGetBackingPointer(vaddr, size);
 	}
 	bool ResolveBackingOffset(uint64_t vaddr, uint64_t size, uint64_t* backing_offset) {
 		return m_backing->ResolveBackingOffset(vaddr, size, backing_offset);

@@ -1136,6 +1136,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			plan.user_data_mask |= bit < 64u ? uint64_t {1} << bit : ~uint64_t {0};
 		}
 	}
+	CompileSrtWalker(plan);
 	return plan;
 }
 

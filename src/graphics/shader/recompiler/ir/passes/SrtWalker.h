@@ -50,6 +50,7 @@ enum class RuntimeValueType { Any, Integer, ImmutableInteger };
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);
+void CompileSrtWalker(ResourcePlan& program);
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
 
@@ -57,7 +58,7 @@ SrtRuntime CleanRuntime(SrtRuntime runtime);
 class SrtWalker {
 public:
 	SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
-	          SrtWalker* clean_evaluator = nullptr, Value active_mask = {});
+	          SrtWalker* clean_evaluator = nullptr);
 	~SrtWalker();
 	SrtWalker(const SrtWalker&)            = delete;
 	SrtWalker& operator=(const SrtWalker&) = delete;
@@ -68,7 +69,10 @@ public:
 	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
 
 private:
-	static ResourcePlan::EvaluationContext& AcquireContext(const ResourcePlan& program);
+	SrtWalker(SrtWalker& parent, Value active_mask, bool clean = false,
+	          SrtWalker* clean_evaluator = nullptr);
+	ResourcePlan::EvaluationContext& AcquireContext();
+	void ResetUnknowns();
 	static float Float32(uint64_t bits);
 	bool EvaluateWide(Value value, uint64_t& result);
 	bool Arg(const Inst& inst, size_t index, uint64_t& result);
@@ -81,6 +85,8 @@ private:
 	SrtRuntime                      m_runtime;
 	SrtWalker*                      m_clean_evaluator = nullptr;
 	Value                           m_active_mask;
+	const SrtWalker*                m_session = nullptr;
+	uint8_t                         m_read_policy = 0;
 	ResourcePlan::EvaluationContext& m_context;
 };
 

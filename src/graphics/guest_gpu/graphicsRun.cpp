@@ -711,10 +711,12 @@ bool GuestGpu::Process(Submission& submission) {
 			break;
 		}
 		case SubmissionType::FlipPreparation:
+			m_renderer.NoteFrameBoundary();
 			m_renderer.RunGarbageCollector();
 			cp.PrepareCpuFlip(submission.flip_request_id);
 			break;
 		case SubmissionType::SuspendPoint: {
+			m_renderer.NoteFrameBoundary();
 			// AgcSuspendPoint is called once per frame by UE5's RHI submission thread and blocks
 			// until the previous point is answered. By default the answer waits for the GPU to
 			// COMPLETE everything before the point (priority operation), which serializes CPU
@@ -1177,10 +1179,7 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, IndirectDrawRegisters 
 static bool GpuIndirectEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_CP_GPU_INDIRECT");
-		if (value == nullptr) {
-			return true;
-		}
-		return value[0] != '0';
+		return value != nullptr && value[0] == '1';
 	}();
 	return enabled;
 }
@@ -1226,59 +1225,6 @@ bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_c
 	}
 	if (indexed && (m_index_base_addr == 0 || m_index_buffer_size == 0)) {
 		return fallback();
-	}
-
-	const uint64_t args_addr = m_draw_indirect_args_base_addr + data_offset;
-	const uint64_t args_bytes =
-	    static_cast<uint64_t>(max_count_or_count - 1u) * stride_in_bytes + args_size;
-	const uint64_t count_vaddr = reinterpret_cast<uint64_t>(count_addr);
-	auto&          cache       = m_renderer.GetBufferCache();
-	const bool     args_dirty  = cache.HasGpuDirtyBytes(args_addr, args_bytes);
-	const bool     count_dirty =
-	    (count_addr != nullptr) && cache.HasGpuDirtyBytes(count_vaddr, sizeof(uint32_t));
-	const bool has_pending_writes = cache.HasPendingUnboundedWrites();
-	const bool is_gpu_dirty       = args_dirty || count_dirty || has_pending_writes;
-
-	if (!is_gpu_dirty) {
-		uint32_t real_count = max_count_or_count;
-		if (count_addr != nullptr) {
-			real_count = std::min(static_cast<uint32_t>(*count_addr), max_count_or_count);
-		}
-		bool all_empty = true;
-		for (uint32_t i = 0; i < real_count; i++) {
-			const auto record_addr = args_addr + static_cast<uint64_t>(i) * stride_in_bytes;
-			if (indexed) {
-				const auto* rec = reinterpret_cast<const DrawIndexedIndirectArgs*>(record_addr);
-				if (rec->index_count_per_instance != 0 && rec->instance_count != 0) {
-					all_empty = false;
-					break;
-				}
-			} else {
-				const auto* rec = reinterpret_cast<const DrawIndirectArgs*>(record_addr);
-				if (rec->vertex_count_per_instance != 0 && rec->instance_count != 0) {
-					all_empty = false;
-					break;
-				}
-			}
-		}
-		if (all_empty) {
-			if (real_count > 0) {
-				const auto last_addr =
-				    args_addr + static_cast<uint64_t>(real_count - 1u) * stride_in_bytes;
-				if (indexed) {
-					const auto* rec = reinterpret_cast<const DrawIndexedIndirectArgs*>(last_addr);
-					PatchIndirectDrawOffsets(*this, registers, rec->base_vertex_location,
-					                         rec->start_instance_location, rec->start_index_location);
-				} else {
-					const auto* rec = reinterpret_cast<const DrawIndirectArgs*>(last_addr);
-					PatchIndirectDrawOffsets(*this, registers, rec->start_vertex_location,
-					                         rec->start_instance_location, 0);
-				}
-			}
-			HostReadProbe::CountGpuIndirect(HostReadProbe::GpuDraws);
-			return true;
-		}
-		return false;
 	}
 
 	auto& executor = m_renderer.GetRenderExecutor();

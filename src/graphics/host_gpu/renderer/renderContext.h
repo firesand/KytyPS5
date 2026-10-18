@@ -59,13 +59,18 @@ public:
 	void               PrepareBda();
 	// Uploads CPU writes (pending regions + hot pages) once per command stream; used before
 	// pointer-using draws and before whole-heap descriptor reads.
-	void               SyncCpuWrites();
+	void               SyncCpuWrites(bool include_hot = true);
 	// Called when the command processor starts (or resumes) a guest command stream.
 	void               BeginCommandStream() {
 		++m_bda_sync_epoch;
 		m_wait_pass_pending = false;
 	}
 	[[nodiscard]] uint64_t BdaSyncEpoch() const noexcept { return m_bda_sync_epoch; }
+	// Signals the start of a new frame / boundary (FlipPreparation, SuspendPoint).
+	// Throttles unflagged hot-region scanning in SyncCpuWrites to once per frame.
+	void               NoteFrameBoundary() noexcept {
+		m_sync_hot_regions_pending = true;
+	}
 	// The command processor observed guest memory without suspending (a WAIT_REG_MEM that passed,
 	// a conditional-IB compare, COND_EXEC, SET_PREDICATION): CPU writes made before the value it
 	// saw must be visible to later BDA / unbounded consumers in this stream. Starts a new sync
@@ -99,6 +104,7 @@ private:
 	uint64_t                  m_bda_sync_epoch    = 1;
 	uint64_t                  m_bda_synced_epoch  = 0;
 	bool                      m_wait_pass_pending = false; // a passing wait bumped a consumed epoch
+	bool                      m_sync_hot_regions_pending = true;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	std::unique_ptr<GuestGpu> m_gpu;

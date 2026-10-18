@@ -49,9 +49,9 @@ public:
 	// Regions whose CPU-dirty state changed since the last call (or that were flagged through
 	// MarkBdaSyncPending): func(region_address, region_size). GPU thread.
 	template <typename Func>
-	void ForEachBdaSyncPendingRegion(Func&& func) {
+	void ForEachBdaSyncPendingRegion(bool include_hot, Func&& func) {
 		if (m_bda_pending_count.load(std::memory_order_acquire) == 0 &&
-		    m_hot_region_count.load(std::memory_order_acquire) == 0) {
+		    (!include_hot || m_hot_region_count.load(std::memory_order_acquire) == 0)) {
 			return;
 		}
 		std::vector<RegionManager*> pending;
@@ -59,7 +59,7 @@ public:
 			std::lock_guard lock(m_region_mutex);
 			for (const auto& manager: m_region_storage) {
 				const bool flagged = manager->TakeBdaSyncPending();
-				if (flagged || manager->HasHotPages()) {
+				if (flagged || (include_hot && manager->HasHotPages())) {
 					pending.push_back(manager.get());
 				}
 			}
@@ -67,6 +67,10 @@ public:
 		for (auto* manager: pending) {
 			func(manager->GetCpuAddr(), TRACKER_REGION_SIZE);
 		}
+	}
+	template <typename Func>
+	void ForEachBdaSyncPendingRegion(Func&& func) {
+		ForEachBdaSyncPendingRegion(true, std::forward<Func>(func));
 	}
 	void MarkBdaSyncPending(uint64_t vaddr, uint64_t size);
 	// KYTY_FAULT_AHEAD_PAGES (default 0 = off): pages a CPU write fault unprotects ahead. The
@@ -84,6 +88,11 @@ public:
 	template <typename Flush>
 	void InvalidateWriteFault(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
 		static_assert(std::is_invocable_v<Flush&>);
+		const auto ahead = FaultAheadPages();
+		if (ahead <= 1) {
+			InvalidateRegion(vaddr, size, std::forward<Flush>(on_flush));
+			return;
+		}
 		CheckNotInUploadCallback();
 		NoteCpuWriteFault();
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
@@ -92,12 +101,14 @@ public:
 				if (manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
 					return true;
 				}
-				const auto address = manager->GetCpuAddr() + offset;
-				manager->ApplyWriteFault(address, bytes);
+				const auto address  = manager->GetCpuAddr() + offset;
+				const auto extended = manager->ExtendWriteFault(address, bytes, ahead);
+				manager->ChangeState<DirtySource::Cpu, true>(address, extended);
 				return false;
 			}();
 			if (should_flush) {
 				on_flush();
+				InvalidateRegion(vaddr, size, std::forward<Flush>(on_flush));
 			}
 		});
 	}

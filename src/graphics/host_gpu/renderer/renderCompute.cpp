@@ -281,10 +281,8 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 	if (indirect_args != 0) {
 		// GPU-built dispatch arguments: publish pending unbounded writes, then download tracked
 		// GPU data, before sizing the LDS buffer from them (host-read audit 2026-10-12).
-		if (cache.HasGpuDirtyBytes(indirect_args, sizeof(vk::DispatchIndirectCommand))) {
-			cache.PrepareHostRead(indirect_args, sizeof(vk::DispatchIndirectCommand));
-			cache.ReadMemory(indirect_args, sizeof(vk::DispatchIndirectCommand));
-		}
+		cache.PrepareHostRead(indirect_args, sizeof(vk::DispatchIndirectCommand));
+		cache.ReadMemory(indirect_args, sizeof(vk::DispatchIndirectCommand));
 		std::memcpy(input.workgroup_counts, reinterpret_cast<const void*>(indirect_args),
 		            sizeof(input.workgroup_counts));
 	}
@@ -701,7 +699,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
 	Common::LockGuard lock(m_context.GetMutex());
 	vk::DispatchIndirectCommand args {};
-	if (!m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args)) &&
+	if (m_context.GetBufferCache().IsCpuCleanForFastRead(args_addr, sizeof(args)) &&
 	    LibKernel::Memory::TryReadBacking(args_addr, &args, sizeof(args)) &&
 	    (args.x == 0 || args.y == 0 || args.z == 0)) {
 		return;

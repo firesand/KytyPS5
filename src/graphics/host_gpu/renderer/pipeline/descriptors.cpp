@@ -552,18 +552,70 @@ static bool ResolveTextureMipView(const TileSurfaceDescription& description, boo
 // NullStorageImage report.
 static thread_local uint64_t s_resolving_shader = 0;
 
+struct TextureMemoEntry {
+	uint64_t                              shader_hash            = 0;
+	uint32_t                              descriptor_index       = 0;
+	bool                                  is_storage             = false;
+	bool                                  resource_written       = false;
+	bool                                  resource_read          = false;
+	bool                                  resource_r128          = false;
+	uint8_t                               resource_mip_mode      = 0;
+	bool                                  resource_depth_compare = false;
+	ShaderRecompiler::IR::DescriptorValue raw_tsharp             {};
+	TextureCache::ImageDesc               desc                   {};
+	bool                                  shader_conversion      = false;
+	ImageId                               image_id               {};
+	bool                                  valid                  = false;
+};
+
+static thread_local TextureMemoEntry s_texture_memo_cache[1024];
+
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
 		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
 	}
-	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+
 	const bool storage = resource.written;
+	auto& texture_cache = m_context.GetTextureCache();
+
+	const size_t memo_slot =
+	    (s_resolving_shader ^ (static_cast<uint64_t>(resource.descriptor_index) * 0x9e3779b9ull)) & 1023u;
+	auto& cached = s_texture_memo_cache[memo_slot];
+	if (cached.valid &&
+	    cached.shader_hash == s_resolving_shader &&
+	    cached.descriptor_index == resource.descriptor_index &&
+	    cached.is_storage == storage &&
+	    cached.resource_written == resource.written &&
+	    cached.resource_read == resource.read &&
+	    cached.resource_r128 == resource.r128 &&
+	    cached.resource_mip_mode == static_cast<uint8_t>(resource.mip_mode) &&
+	    cached.resource_depth_compare == resource.depth_compare &&
+	    cached.raw_tsharp == value) {
+		if (cached.desc.info.metadata.kind == ImageMetadataKind::None && !cached.desc.info.data.Empty()) {
+			std::scoped_lock lock {texture_cache.m_lock};
+			auto* image = texture_cache.m_slot_images.try_get(cached.image_id);
+			if (image != nullptr && image->registered && !image->depth_id &&
+			    !image->binding.needs_rebind && !(image->info.resources < cached.desc.info.resources)) {
+				image->tick_accessed_last = texture_cache.m_scheduler.CurrentTick();
+				texture_cache.TouchImage(*image);
+				return {cached.image_id, nullptr, cached.desc};
+			}
+		}
+		auto desc = cached.desc;
+		auto id = texture_cache.FindImage(desc, cached.shader_conversion);
+		auto* image = &texture_cache.GetImage(id);
+		if (image->depth_id) {
+			id = image->depth_id;
+		}
+		cached.image_id = id;
+		return {id, nullptr, std::move(desc)};
+	}
+
+	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
 	if (storage) {
 		ValidateStorageImageResource(resource);
 	}
-
-	auto& texture_cache = m_context.GetTextureCache();
 	if (descriptor.IsNull()) {
 		if (storage) {
 			// A storage image bound through a null T# swallows the shader's writes (1x1 null
@@ -741,7 +793,23 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());
 	}
-	return {id, nullptr, std::move(desc)};
+	TextureBinding result {id, nullptr, desc};
+	cached = TextureMemoEntry {
+	    .shader_hash            = s_resolving_shader,
+	    .descriptor_index       = resource.descriptor_index,
+	    .is_storage             = storage,
+	    .resource_written       = resource.written,
+	    .resource_read          = resource.read,
+	    .resource_r128          = resource.r128,
+	    .resource_mip_mode      = static_cast<uint8_t>(resource.mip_mode),
+	    .resource_depth_compare = resource.depth_compare,
+	    .raw_tsharp             = value,
+	    .desc                   = desc,
+	    .shader_conversion      = shader_conversion,
+	    .image_id               = id,
+	    .valid                  = true,
+	};
+	return result;
 }
 
 static vk::Sampler NativeSampler(RenderContext&                       context,

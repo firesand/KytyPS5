@@ -21,7 +21,13 @@
 #include <string_view>
 #include <vector>
 
+namespace Xbyak {
+class CodeGenerator;
+}
+
 namespace Libs::Graphics::ShaderRecompiler::IR {
+
+class SrtWalker;
 
 enum class ResourceKind {
 	None,
@@ -589,14 +595,17 @@ struct ResourcePlan {
 
 		std::vector<Entry> values;
 		uint64_t           generation = 0;
+		const SrtWalker*   session = nullptr;
+		Value              active_mask;
+		uint8_t            read_policy = 0;
 	};
 
-	ResourcePlan() = default;
+	ResourcePlan();
 	~ResourcePlan();
 
 	ResourcePlan(const ResourcePlan&)            = delete;
 	ResourcePlan& operator=(const ResourcePlan&) = delete;
-	ResourcePlan(ResourcePlan&&) noexcept         = default;
+	ResourcePlan(ResourcePlan&&) noexcept;
 	ResourcePlan& operator=(ResourcePlan&& other) noexcept;
 
 	ShaderType                    stage           = ShaderType::Unknown;
@@ -619,10 +628,10 @@ struct ResourcePlan {
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
+	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
 	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
 	mutable std::deque<EvaluationContext> evaluation_contexts;
 	mutable uint32_t                       evaluation_value_count = 0;
-	mutable uint32_t                       evaluation_depth       = 0;
 	mutable std::vector<uint8_t>            active_sources;
 	mutable std::vector<uint8_t>            visited_blocks;
 	mutable std::vector<uint32_t>           pending_blocks;

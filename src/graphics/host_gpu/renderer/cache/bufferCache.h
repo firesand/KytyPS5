@@ -141,6 +141,17 @@ public:
 	[[nodiscard]] bool HasPendingUnboundedWrites() const noexcept {
 		return m_write_faults_dirty || m_write_fault_tick != 0;
 	}
+	// Pure non-blocking query for CPU fast path reads (e.g. DispatchIndirect culling)
+	// that must never trigger FlushWriteFaults / PrepareHostRead or stall the GPU.
+	[[nodiscard]] bool IsCpuCleanForFastRead(uint64_t vaddr, uint64_t size) const {
+		if (HasPendingUnboundedWrites() && InUnboundedWriteRange(vaddr, size)) {
+			return false;
+		}
+		if (m_has_pending_gpu_modified.load(std::memory_order_acquire)) {
+			return false;
+		}
+		return !m_gpu_modified_ranges.Intersects(vaddr, size);
+	}
 	void FlushWriteFaults(bool wait);
 	// Before the host reads guest memory that unbounded writes may have touched.
 	void PrepareHostRead(uint64_t vaddr, uint64_t size);
@@ -185,8 +196,12 @@ public:
 	// Tracker regions whose CPU-dirty state changed since the last call: func(address, size).
 	// Callers clip them to mapped guest memory before synchronizing (buffers may extend past it).
 	template <typename Func>
+	void ForEachBdaSyncPendingRegion(bool include_hot, Func&& func) {
+		m_memory_tracker.ForEachBdaSyncPendingRegion(include_hot, std::forward<Func>(func));
+	}
+	template <typename Func>
 	void ForEachBdaSyncPendingRegion(Func&& func) {
-		m_memory_tracker.ForEachBdaSyncPendingRegion(std::forward<Func>(func));
+		m_memory_tracker.ForEachBdaSyncPendingRegion(true, std::forward<Func>(func));
 	}
 	void               RunGarbageCollector();
 

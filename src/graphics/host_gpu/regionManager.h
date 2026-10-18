@@ -105,7 +105,6 @@ public:
 			EXIT("invalid region tracking manager construction\n");
 		}
 		m_cpu_dirty.Fill();
-		m_maybe.Clear();
 		m_writable.Fill();
 		m_readable.Fill();
 	}
@@ -140,7 +139,7 @@ public:
 		RegionBits candidates;
 		{
 			std::scoped_lock guard(lock);
-			candidates = RegionBits(m_cpu_dirty | m_maybe, start, end);
+			candidates = RegionBits(m_cpu_dirty, start, end);
 			if (HasHotPages()) {
 				for (const auto [first, last]: RegionBits(m_hot, start, end)) {
 					candidates.SetRange(first, last);
@@ -152,46 +151,17 @@ public:
 		}
 	}
 
-	static size_t FaultAheadCap() {
-		static const size_t cap = [] {
-			const char* value = std::getenv("KYTY_FAULT_AHEAD_PAGES");
-			return value != nullptr ? static_cast<size_t>(std::atoi(value)) : size_t {256};
-		}();
-		return cap;
-	}
-
-	[[nodiscard]] std::pair<size_t, size_t> ExtendWriteFaultMaybe(size_t start, size_t end) {
-		const auto cap = FaultAheadCap();
-		if (cap <= 1) {
-			m_last_fault_end = end;
-			return {end, end};
-		}
-		if (start == m_last_fault_end) {
-			m_current_ahead = (m_current_ahead == 0) ? 4 : std::min(cap, m_current_ahead * 2);
-		} else {
-			m_current_ahead = 0;
-		}
-		if (m_current_ahead == 0) {
-			m_last_fault_end = end;
-			return {end, end};
-		}
-		auto limit = std::min<size_t>(TRACKER_REGION_PAGES, end + m_current_ahead);
+	// Write-fault window: extends [vaddr, vaddr + size) forward over pages that are neither
+	// CPU- nor GPU-dirty, up to `ahead` pages from the faulting page, so one fault unprotects the
+	// run a sequential CPU fill is about to touch (Zero Company fills 16 MiB buffers page by page:
+	// 4096 faults, locks and mprotects each). Returns the extended size. Caller holds the lock.
+	[[nodiscard]] uint64_t ExtendWriteFault(uint64_t vaddr, uint64_t size, size_t ahead) const {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		auto limit = std::min<size_t>(TRACKER_REGION_PAGES, start + ahead);
 		limit      = std::min<size_t>(limit, m_cpu_dirty.FirstRangeFrom(end).first);
 		limit      = std::min<size_t>(limit, m_gpu_dirty.FirstRangeFrom(end).first);
-		limit      = std::min<size_t>(limit, m_maybe.FirstRangeFrom(end).first);
-		const auto maybe_end = std::max(end, limit);
-		m_last_fault_end     = maybe_end;
-		return {end, maybe_end};
-	}
-
-	void ApplyWriteFault(uint64_t vaddr, uint64_t size) {
-		const auto [start, end] = GetPageRange(vaddr, size);
-		ChangeState<DirtySource::Cpu, true>(vaddr, size);
-		const auto [maybe_start, maybe_end] = ExtendWriteFaultMaybe(start, end);
-		if (maybe_start < maybe_end) {
-			m_maybe.SetRange(maybe_start, maybe_end);
-			UpdateProtection<false, false>();
-		}
+		const auto new_end = std::max(end, limit);
+		return new_end * TRACKER_PAGE_SIZE - (vaddr - m_cpu_addr);
 	}
 
 	template <DirtySource source, bool enable>
@@ -201,7 +171,6 @@ public:
 			if (RegionBits(m_gpu_dirty, start, end).Any()) {
 				EXIT("CPU dirty state conflicts with GPU dirty state\n");
 			}
-			m_maybe.UnsetRange(start, end);
 			if (const auto threshold = HotPageFaultThreshold(); threshold != 0 && end - start <= 16) {
 				for (auto page = start; page < end; ++page) {
 					if (m_fault_counts[page] < 255 && ++m_fault_counts[page] == threshold) {
@@ -218,7 +187,6 @@ public:
 			if (RegionBits(m_cpu_dirty, start, end).Any()) {
 				EXIT("GPU dirty state conflicts with CPU dirty state\n");
 			}
-			m_maybe.UnsetRange(start, end);
 			m_hash_valid.UnsetRange(start, end); // the GPU copy no longer matches any CPU hash
 		}
 		auto& bits = GetBits<source>();
@@ -243,19 +211,13 @@ public:
 	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func, bool keep_hot = true) {
 		const auto [start, end] = GetPageRange(vaddr, size);
 		auto&      bits         = GetBits<source>();
-		RegionBits mask;
-		if constexpr (source == DirtySource::Cpu) {
-			mask = RegionBits(m_cpu_dirty | m_maybe, start, end);
-		} else {
-			mask = RegionBits(m_gpu_dirty, start, end);
-		}
-		if (mask.None()) {
+		if (bits.FirstRangeFrom(start).first >= end) {
 			return;
 		}
+		RegionBits mask(bits, start, end);
 		if constexpr (clear) {
 			bits.UnsetRange(start, end);
 			if constexpr (source == DirtySource::Cpu) {
-				m_maybe.UnsetRange(start, end);
 				if (keep_hot && HasHotPages()) {
 					// Hot pages stay dirty (and writable) so the next sync uploads them again,
 					// unless their content stayed identical for HotDemoteSyncs syncs: those leave
@@ -373,21 +335,26 @@ private:
 				m_hash_valid.Unset(page); // uploaded below without a hash: the old one is stale
 				continue;
 			}
-			auto* snapshot = TakeSnapshotPage();
-			std::memcpy(snapshot, reinterpret_cast<const void*>(m_cpu_addr + page * TRACKER_PAGE_SIZE),
-			            TRACKER_PAGE_SIZE);
-			const auto hash = HashTrackerPage(snapshot);
-			s_hot_stats.hashed++;
-			if (m_hash_valid.Get(page) && m_page_hash != nullptr && (*m_page_hash)[page] == hash) {
-				if (m_unchanged[page] < 255) ++m_unchanged[page];
-				s_hot_stats.skipped++;
-				ReleaseSnapshotPage();
-				flush_run(page);
-				run_begin = page + 1;
-				continue;
+			const auto* guest_ptr = reinterpret_cast<const void*>(m_cpu_addr + page * TRACKER_PAGE_SIZE);
+			if (m_hash_valid.Get(page) && m_page_hash != nullptr) {
+				const auto live_hash = HashTrackerPage(guest_ptr);
+				s_hot_stats.hashed++;
+				if (live_hash == (*m_page_hash)[page]) {
+					if (m_unchanged[page] < 255) ++m_unchanged[page];
+					s_hot_stats.skipped++;
+					flush_run(page);
+					run_begin = page + 1;
+					continue;
+				}
 			}
-			if (m_page_hash == nullptr) {
-				m_page_hash = std::make_unique<std::array<uint64_t, TRACKER_REGION_PAGES>>();
+			auto* snapshot = TakeSnapshotPage();
+			std::memcpy(snapshot, guest_ptr, TRACKER_PAGE_SIZE);
+			const auto hash = HashTrackerPage(snapshot);
+			if (!m_hash_valid.Get(page) || m_page_hash == nullptr) {
+				s_hot_stats.hashed++;
+				if (m_page_hash == nullptr) {
+					m_page_hash = std::make_unique<std::array<uint64_t, TRACKER_REGION_PAGES>>();
+				}
 			}
 			(*m_page_hash)[page] = hash;
 			m_hash_valid.Set(page);
@@ -440,7 +407,7 @@ private:
 	inline static thread_local size_t      s_snapshot_used = 0;
 	template <bool track, bool is_read>
 	void UpdateProtection() {
-		const auto protection = is_read ? ~m_gpu_dirty : (m_cpu_dirty | m_maybe);
+		const auto protection = is_read ? ~m_gpu_dirty : m_cpu_dirty;
 		auto&      previous   = is_read ? m_readable : m_writable;
 		auto       mask       = protection ^ previous;
 		if (mask.None()) {
@@ -480,9 +447,6 @@ private:
 
 	RegionBits   m_cpu_dirty;
 	RegionBits   m_gpu_dirty;
-	RegionBits   m_maybe;
-	size_t       m_last_fault_end = SIZE_MAX;
-	size_t       m_current_ahead  = 0;
 	RegionBits   m_writable;
 	RegionBits   m_readable;
 };

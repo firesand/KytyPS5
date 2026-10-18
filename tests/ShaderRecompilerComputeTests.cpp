@@ -10098,7 +10098,7 @@ public:
         context.SyncCpuWrites();
         scheduler.FlushAndWait();
         const char *env_wait = std::getenv("KYTY_SYNC_ON_WAIT_PASS");
-        RenderContext::SetSyncOnWaitPassMode((env_wait == nullptr || env_wait[0] != '0') ? 1 : 0);
+        RenderContext::SetSyncOnWaitPassMode((env_wait != nullptr && env_wait[0] == '1') ? 1 : 0);
       }
 
       resources.UnmapMemory(base, allocation_size);
