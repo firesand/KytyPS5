@@ -1047,7 +1047,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		}
 	}
 	mrt_mask &= color_output_mask;
-	OpPhaseScope targets(OpSplitProbe::Resources); // render-target and depth resolution
+	OpPhaseScope targets(OpSplitProbe::Targets); // render-target and depth resolution
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "ResolveRenderColorTarget");
 	}
@@ -1341,6 +1341,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
 		LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
+		const OpPhaseScope buffers(OpSplitProbe::Buffers);
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 		if (gpu_indirect != nullptr && draw.IsIndexed() && index_binding.buffer != nullptr &&
@@ -1352,6 +1353,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	std::pair<Buffer*, uint64_t> indirect_count {};
 	if (gpu_indirect != nullptr) {
 		auto& cache   = m_context.GetBufferCache();
+		const OpPhaseScope buffers(OpSplitProbe::Buffers);
 		indirect_args = cache.ObtainBuffer(gpu_indirect->args_addr, indirect_args_bytes, false, false,
 		                                   {}, !args_unpublished);
 		EXIT_IF(indirect_args.first == nullptr || (indirect_args.second & 3u) != 0);
@@ -1373,7 +1375,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
 	    state.programs);
-	OpSplitProbe::Enter(OpSplitProbe::Resources);
+	OpSplitProbe::Enter(OpSplitProbe::Targets);
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,

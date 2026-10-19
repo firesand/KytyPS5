@@ -386,6 +386,12 @@ private:
 //              post-draw/dispatch tracking)
 //   record     command recording (CommitBindings, push constants, dynamic state, BeginRendering,
 //              bind, draw/dispatch)
+//   walk       inside program: the SRT walk itself (MaterializeResources); "program" keeps the key
+//              lookup, memo check and permutation match
+//   compile    inside program: translating / compiling a new permutation (hitches)
+//   textures   inside resources: texture/image resolution (ResolveTexture) and samplers
+//   buffers    inside resources: FindBuffers / RebindBuffers, vertex, index, argument and LDS buffers
+//   targets    inside resources: render-target and depth resolution and acquisition
 //   other      everything else inside the op (special-case clears/copies, diagnostics, cleanup)
 // One phase is current per GPU-thread op; OpSplitProbe::Enter switches it and OpPhaseScope switches for a
 // region and back. Each switch charges the elapsed time minus the nested budget scopes' time (sync,
@@ -394,9 +400,11 @@ private:
 // Off: one thread-local test per switch site.
 struct OpSplitProbe {
 	enum Op : uint32_t { Draw = 0, Dispatch, OpCount };
-	enum Phase : uint32_t { Other = 0, State, Program, Pipeline, Resources, Barrier, Record, PhaseCount };
+	enum Phase : uint32_t { Other = 0, State, Program, Pipeline, Resources, Barrier, Record, Walk, Compile,
+		                    Textures, Buffers, Targets, PhaseCount };
 	static constexpr auto kPhaseNames = std::to_array<const char*>(
-	    {"other", "state", "program", "pipeline", "resources", "barrier", "record"});
+	    {"other", "state", "program", "pipeline", "resources", "barrier", "record", "walk", "compile",
+	     "textures", "buffers", "targets"});
 	static_assert(kPhaseNames.size() == PhaseCount, "OpSplitProbe phase / name table mismatch");
 	struct Snapshot {
 		std::array<uint64_t, OpCount>                                calls {};

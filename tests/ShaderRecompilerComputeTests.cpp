@@ -45064,6 +45064,10 @@ static void CheckOpSplitProbe() {
     {
       Libs::Graphics::OpPhaseScope program(Probe::Program);
       spin(4000);
+      {
+        Libs::Graphics::OpPhaseScope walk(Probe::Walk); // nested sub-phase: innermost wins
+        spin(2000);
+      }
     }
     spin(1000); // back in state
     {
@@ -45083,17 +45087,19 @@ static void CheckOpSplitProbe() {
   }
   const auto exclusive = budget.categories[Budget::Draw].exclusive_ns / 1000u;
   const auto inclusive = budget.categories[Budget::Draw].inclusive_ns / 1000u;
-  std::printf("[host]    %-32s other %llu state %llu program %llu record %llu sum %llu excl %llu incl %llu us\n",
+  std::printf("[host]    %-32s other %llu state %llu program %llu walk %llu record %llu sum %llu excl %llu incl %llu us\n",
               name, static_cast<unsigned long long>(us(Probe::Other)),
               static_cast<unsigned long long>(us(Probe::State)), static_cast<unsigned long long>(us(Probe::Program)),
+              static_cast<unsigned long long>(us(Probe::Walk)),
               static_cast<unsigned long long>(us(Probe::Record)), static_cast<unsigned long long>(sum),
               static_cast<unsigned long long>(exclusive), static_cast<unsigned long long>(inclusive));
   Require(name, "one draw", split.calls[Probe::Draw] == 1 && split.calls[Probe::Dispatch] == 0,
           "the op was not counted exactly once");
   Require(name, "phases",
           us(Probe::Other) >= 2000 && us(Probe::State) >= 4000 && us(Probe::Program) >= 4000 &&
-              us(Probe::Record) >= 2000 && us(Probe::Pipeline) == 0 && us(Probe::Resources) == 0 &&
-              us(Probe::Barrier) == 0,
+              us(Probe::Record) >= 2000 && us(Probe::Walk) >= 2000 && us(Probe::Pipeline) == 0 &&
+              us(Probe::Resources) == 0 && us(Probe::Barrier) == 0 && us(Probe::Compile) == 0 &&
+              us(Probe::Textures) == 0 && us(Probe::Buffers) == 0 && us(Probe::Targets) == 0,
           "a phase lost its time or a switch inside the nested budget scope was honoured");
   // Scheduling noise only adds time; the nested 5 ms must not appear in the phases.
   Require(name, "nested budget scope excluded", sum + 4000 <= inclusive && us(Probe::Record) < 4500,

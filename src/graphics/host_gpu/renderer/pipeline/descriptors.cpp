@@ -572,6 +572,7 @@ static thread_local TextureMemoEntry s_texture_memo_cache[1024];
 
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
+	const OpPhaseScope phase(OpSplitProbe::Textures);
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
 		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
 	}
@@ -868,6 +869,7 @@ void RenderExecutor::ResetBindings() {
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
+	const OpPhaseScope phase(OpSplitProbe::Resources);
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
 	const auto& snapshot = *runtime.resources;
@@ -887,10 +889,13 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		binding.mip_views.clear();
 		prepared.images[i] = std::move(binding);
 	}
-	prepared.samplers.reserve(program.info.samplers.size());
-	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
-		prepared.samplers.push_back(NativeSampler(
-		    m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index]));
+	{
+		const OpPhaseScope samplers(OpSplitProbe::Textures);
+		prepared.samplers.reserve(program.info.samplers.size());
+		for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
+			prepared.samplers.push_back(NativeSampler(
+			    m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index]));
+		}
 	}
 	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
 	for (const auto reg: program.info.user_data_registers) {
@@ -928,6 +933,7 @@ static void LogUnboundedBuffer(const Program& program, uint32_t resource,
 }
 
 void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
+	const OpPhaseScope phase(OpSplitProbe::Buffers);
 	KYTY_PROFILER_FUNCTION();
 	auto& cache = m_context.GetBufferCache();
 	for (auto* stage: stages) {
@@ -1028,6 +1034,7 @@ void RenderExecutor::PrepareBufferImageWrites(std::span<PreparedBindings* const>
 }
 
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
+	const OpPhaseScope phase(OpSplitProbe::Buffers);
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program   = *prepared.runtime->program;
@@ -1132,6 +1139,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 		RebindImages(*stage);
 	}
 	auto& cache = m_context.GetTextureCache();
+	const OpPhaseScope targets_phase(OpSplitProbe::Targets); // to the end: colour targets, enrolment
 	for (auto& target: colors) {
 		EXIT_IF(!target.image_id);
 		const auto old_image = cache.m_slot_images.try_get(target.image_id);

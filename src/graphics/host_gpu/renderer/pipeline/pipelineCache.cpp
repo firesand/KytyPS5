@@ -158,6 +158,60 @@ private:
 	uint64_t   m_before;
 };
 
+// KYTY_PROBE_OP_SPLIT: time of each cached program lookup (call-source refresh, memo check, SRT
+// walk, permutation match) per (stage, hash); every 2^18 lookups the 8 most expensive programs are
+// logged as "SrtWalk: top programs by lookup time".
+class LookupCost {
+public:
+	LookupCost(bool enabled, ShaderType stage, uint64_t hash) noexcept
+	    : m_enabled(enabled), m_stage(stage), m_hash(hash),
+	      m_begin(enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {}) {}
+	~LookupCost() {
+		if (!m_enabled) {
+			return;
+		}
+		const auto ns = static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - m_begin).count());
+		struct Cost {
+			uint32_t stage = 0;
+			uint64_t calls = 0, ns = 0;
+		};
+		static std::unordered_map<uint64_t, Cost> costs; // GPU thread only
+		static uint64_t                           lookups = 0;
+		auto&                                     cost    = costs[m_hash];
+		cost.stage = static_cast<uint32_t>(m_stage);
+		cost.calls++;
+		cost.ns += ns;
+		if (++lookups % (1u << 18u) != 0) {
+			return;
+		}
+		std::vector<std::pair<uint64_t, Cost>> top(costs.begin(), costs.end());
+		std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+		uint64_t total = 0;
+		for (const auto& [hash, c]: costs) {
+			total += c.ns;
+		}
+		std::string line;
+		for (size_t i = 0; i < top.size() && i < 8; ++i) {
+			const auto& [hash, c] = top[i];
+			line += fmt::format(" 0x{:016x}/{} {}x{:.1f}us={:.0f}%", hash, c.stage, c.calls,
+			                    static_cast<double>(c.ns) / 1000.0 / static_cast<double>(c.calls),
+			                    100.0 * static_cast<double>(c.ns) / static_cast<double>(total));
+		}
+		LOGF("SrtWalk: top programs by lookup time after %" PRIu64 " lookups (%zu programs):%s\n", lookups,
+		     costs.size(), line.c_str());
+		costs.clear(); // per window
+	}
+	LookupCost(const LookupCost&)            = delete;
+	LookupCost& operator=(const LookupCost&) = delete;
+
+private:
+	bool                                  m_enabled;
+	ShaderType                            m_stage;
+	uint64_t                              m_hash;
+	std::chrono::steady_clock::time_point m_begin;
+};
+
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
 	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
@@ -528,8 +582,11 @@ struct PipelineCache::ProgramCache {
 				recording.used_workgroup_counts      = &memo.used_workgroup_counts;
 				memo.recorded                        = true;
 			}
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    resource_plan, recording, resources, specialization));
+			{
+				const OpPhaseScope walk(OpSplitProbe::Walk);
+				EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
+				    resource_plan, recording, resources, specialization));
+			}
 			if (memo.words.size() > MemoWordLimit) {
 				ForgetMemo();
 			}
@@ -641,6 +698,7 @@ struct PipelineCache::ProgramCache {
 		if (entry != programs.end()) {
 			auto& cached = entry->second;
 			Permutation* permutation = nullptr;
+			const LookupCost cost(OpSplitProbe::Enabled(), stage, params.hash);
 			if (cached.call_source) {
 				source_changed = cached.RefreshCallSource(runtime);
 				if (!source_changed) permutation = cached.FindPermutation<true>(runtime, push_data_cursor);
@@ -654,6 +712,8 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 
+		// New permutation (or a changed call source): translation and compilation to the end.
+		const OpPhaseScope compile_phase(OpSplitProbe::Compile);
 		ShaderStageInputInfo stage_input {};
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage_input.vertex = &input_info;
@@ -714,9 +774,12 @@ struct PipelineCache::ProgramCache {
 			auto retained = source.call ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program), std::move(retained)).first;
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
+			{
+				const OpPhaseScope walk(OpSplitProbe::Walk);
+				EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
+				    entry->second.resource_plan, runtime, entry->second.resources,
+				    entry->second.specialization));
+			}
 		} else if (source_changed) {
 			entry->second.ForgetMemo();
 			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);

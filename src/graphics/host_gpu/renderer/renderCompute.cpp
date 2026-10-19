@@ -471,7 +471,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 	PrepareBufferImageWrites(std::span {&descriptor_stage, 1u});
-	BindSharedMemory(m_context, input_info, bindings);
+	{
+		const OpPhaseScope buffers(OpSplitProbe::Buffers);
+		BindSharedMemory(m_context, input_info, bindings);
+	}
 	RebindBuffers(bindings);
 
 	if (GpuDiagnostics::Enabled() && program.shader_hash == 0x2ef44268a059254full) {
@@ -739,6 +742,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	RebindImages(bindings);
 	PrepareBufferImageWrites(std::span {&descriptor_stage, 1u});
+	OpSplitProbe::Enter(OpSplitProbe::Buffers); // LDS sizing and the argument buffer, until Record
 	BindSharedMemory(m_context, input_info, bindings, args_addr);
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
 	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
