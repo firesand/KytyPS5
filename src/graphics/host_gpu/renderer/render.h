@@ -272,15 +272,6 @@ private:
 	                                              CommandBuffer& command, uint32_t group_x,
 	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
 
-	// KYTY_SUBMIT_AHEAD: the learned producer dispatch recorded last (0 = none), taken once by the
-	// command processor, which submits before its next work packet.
-	[[nodiscard]] uint64_t ConsumeSubmitAheadProducer(uint64_t& tick) noexcept {
-		const auto producer      = m_submit_ahead_producer;
-		tick                     = m_submit_ahead_tick;
-		m_submit_ahead_producer = 0;
-		return producer;
-	}
-
 	// Device address of the task shader's MeshTaskCounters (KYTY_PROBE_FAULT_HISTOGRAM only,
 	// else 0); adds what the GPU counted since the previous call to the HostReadProbe counters.
 	[[nodiscard]] uint64_t TaskCountersAddress();
@@ -288,8 +279,6 @@ private:
 	RenderContext&                        m_context;
 	std::unique_ptr<Buffer>               m_task_counters;
 	std::array<uint32_t, 2>               m_task_counters_seen {};
-	uint64_t                              m_submit_ahead_producer = 0;
-	uint64_t                              m_submit_ahead_tick     = 0; // command buffer it was recorded in
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;

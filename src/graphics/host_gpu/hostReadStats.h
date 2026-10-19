@@ -194,18 +194,21 @@ struct WaitReasonProbe {
 };
 
 // KYTY_PROBE_FAULT_HISTOGRAM: synchronous readbacks (BufferCache::DownloadBufferMemory<false>) by the
-// wait reason in force, served over BAR (completed GPU data, no drain) or through a copy (submit and
-// wait). The measure for KYTY_SUBMIT_AHEAD: waited readbacks should move from copy to bar.
+// wait reason in force: served over BAR (completed GPU data, no drain), or by a copy that waits
+// because the data was written into the open command buffer (CopyOpen: only an earlier submit could
+// help), is in flight in a submitted one (CopyInFlight: GPU latency / backlog), or other (unmapped
+// buffer, page without a write tick).
 struct ReadbackProbe {
-	inline static std::array<std::array<std::atomic<uint64_t>, 2>, WaitReasonProbe::ReasonCount> s_counts {};
-	static void Count(uint32_t reason, bool bar) noexcept {
-		s_counts[reason][bar ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
+	enum Kind : uint32_t { Bar = 0, CopyOpen, CopyInFlight, CopyOther, KindCount };
+	inline static std::array<std::array<std::atomic<uint64_t>, KindCount>, WaitReasonProbe::ReasonCount> s_counts {};
+	static void Count(uint32_t reason, Kind kind) noexcept {
+		s_counts[reason][kind].fetch_add(1, std::memory_order_relaxed);
 	}
-	using Snapshot = std::array<std::array<uint64_t, 2>, WaitReasonProbe::ReasonCount>;
+	using Snapshot = std::array<std::array<uint64_t, KindCount>, WaitReasonProbe::ReasonCount>;
 	static Snapshot Take() noexcept {
 		Snapshot snapshot {};
 		for (uint32_t r = 0; r < WaitReasonProbe::ReasonCount; ++r) {
-			for (uint32_t k = 0; k < 2; ++k) {
+			for (uint32_t k = 0; k < KindCount; ++k) {
 				snapshot[r][k] = s_counts[r][k].exchange(0, std::memory_order_relaxed);
 			}
 		}
@@ -213,12 +216,10 @@ struct ReadbackProbe {
 	}
 };
 
-// KYTY_SUBMIT_AHEAD (submitAhead.h): early submits by trigger, producers learned from waited
-// readbacks, and the current producer count.
+// KYTY_SUBMIT_AHEAD (submitAhead.h): early submits by trigger.
 struct SubmitAheadProbe {
-	enum Counter : uint32_t { ProducerSubmits = 0, TimerSubmits, Learned, Forgotten, CounterCount };
+	enum Counter : uint32_t { TimerSubmits = 0, DispatchTimerSubmits, CounterCount };
 	inline static std::array<std::atomic<uint64_t>, CounterCount> s_counts {};
-	inline static std::atomic<uint64_t>                          s_producers {0};
 	static void Count(Counter counter) noexcept { s_counts[counter].fetch_add(1, std::memory_order_relaxed); }
 	static std::array<uint64_t, CounterCount> Take() noexcept {
 		std::array<uint64_t, CounterCount> snapshot {};

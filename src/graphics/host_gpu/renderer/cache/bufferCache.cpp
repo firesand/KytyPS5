@@ -196,29 +196,11 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	if constexpr (!async) {
 		const bool bar = TryBarReadback(buffer, copies);
 		if (ProbeEnabled::Get()) {
-			ReadbackProbe::Count(WaitReasonProbe::s_current, bar);
-		}
-		if (SubmitAheadConfig::Get().producers) {
-			// A copy here drains the open command buffer: the dispatches that wrote these pages
-			// become submit-ahead producers. A BAR read keeps known producers alive.
-			for (const auto& copy: copies) {
-				const auto address = buffer_address + copy.srcOffset;
-				uint64_t   learned = 0;
-				if (m_submit_ahead.NoteReadback(address >> CACHING_PAGEBITS,
-				                                ((address + copy.size - 1u) >> CACHING_PAGEBITS) + 1u, !bar,
-				                                &learned) != 0) {
-					SubmitAheadProbe::Count(SubmitAheadProbe::Learned);
-					SubmitAheadProbe::s_producers.store(m_submit_ahead.ProducerCount(),
-					                                    std::memory_order_relaxed);
-					static std::atomic<uint32_t> logged {0};
-					if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
-						LOGF("SubmitAhead: learned producer cs=0x%016" PRIx64 " from a %s readback of "
-						     "0x%016" PRIx64 "+0x%" PRIx64 "\n",
-						     learned, WaitReasonProbe::Name(WaitReasonProbe::s_current), address,
-						     static_cast<uint64_t>(copy.size));
-					}
-				}
-			}
+			ReadbackProbe::Count(WaitReasonProbe::s_current,
+			                     bar                       ? ReadbackProbe::Bar
+			                     : m_last_bar_reason == 4 ? ReadbackProbe::CopyOpen
+			                     : m_last_bar_reason == 3 ? ReadbackProbe::CopyInFlight
+			                                              : ReadbackProbe::CopyOther);
 		}
 		if (bar) {
 			return true;
@@ -401,7 +383,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write,
 			     static_cast<unsigned long long>(index), is_write ? "write-fault" : "read",
 			     vaddr, size, gpu_thread ? "gpu-thread" : "game-thread", ms,
 			     *bar ? "bar" : (*reason == 1 ? "unmapped" : *reason == 2 ? "notick" :
-			                     *reason == 3 ? "inflight" : "copy"),
+			                     *reason == 3 ? "inflight" : *reason == 4 ? "open" : "copy"),
 			     WaitReasonProbe::Name(wait_reason));
 		}
 	} readback_report {readback_log, readback_index, vaddr, size, is_write,
@@ -994,21 +976,9 @@ void BufferCache::DrainPendingGpuModified() {
 	}
 }
 
-void BufferCache::NoteSubmitAhead(uint64_t writer) {
-	const auto before = m_submit_ahead.ProducerCount();
-	m_submit_ahead.NoteSubmitAhead(writer);
-	if (m_submit_ahead.ProducerCount() != before) {
-		SubmitAheadProbe::Count(SubmitAheadProbe::Forgotten);
-		SubmitAheadProbe::s_producers.store(m_submit_ahead.ProducerCount(), std::memory_order_relaxed);
-	}
-}
-
 void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size, uint64_t tick) {
 	const auto first = vaddr >> CACHING_PAGEBITS;
 	const auto last  = (vaddr + size - 1) >> CACHING_PAGEBITS;
-	if (m_writer_tag != 0 && tick != 0 && SubmitAheadConfig::Get().producers) {
-		m_submit_ahead.NoteWrite(first, last + 1u, m_writer_tag);
-	}
 	if (last - first >= 8192) {
 		m_bar_block_tick = std::max(m_bar_block_tick, tick); // too many pages: block until done
 		return;
@@ -1054,8 +1024,9 @@ bool BufferCache::TryBarReadback(const Buffer& buffer, std::span<const vk::Buffe
 		}
 	}
 	if (latest != 0 && !m_scheduler.IsFree(latest)) {
-		m_last_bar_reason = 3;
-		return false; // the write is still in flight (or recorded in the current tick)
+		// Still in flight, or recorded into the open command buffer (not even submitted).
+		m_last_bar_reason = latest >= m_scheduler.CurrentTick() ? 4 : 3;
+		return false;
 	}
 	for (const auto& copy: copies) {
 		if (!buffer.IsCoherent()) {

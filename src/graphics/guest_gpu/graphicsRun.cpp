@@ -1162,7 +1162,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 }
 
 
-enum class PacketClass { ShRegs, CtxRegs, Work, Benign, Other };
+enum class PacketClass { ShRegs, CtxRegs, Draw, Dispatch, Benign, Other };
 
 // Classifies PM4 packets for the (b1) merge probe and KYTY_SUBMIT_AHEAD.
 static PacketClass ClassifyPacket(uint32_t opcode) {
@@ -1182,9 +1182,9 @@ static PacketClass ClassifyPacket(uint32_t opcode) {
 		case Pm4::IT_DRAW_INDEX_2:
 		case Pm4::IT_DRAW_INDEX_OFFSET_2:
 		case Pm4::IT_DRAW_INDEX_AUTO:
+		case Pm4::IT_DISPATCH_DRAW_PREAMBLE: return PacketClass::Draw;
 		case Pm4::IT_DISPATCH_DIRECT:
-		case Pm4::IT_DISPATCH_INDIRECT:
-		case Pm4::IT_DISPATCH_DRAW_PREAMBLE: return PacketClass::Work;
+		case Pm4::IT_DISPATCH_INDIRECT: return PacketClass::Dispatch;
 		// No GPU work, no side effect: per-packet state the records carry, control flow, CE/DE sync.
 		case Pm4::IT_NOP:
 		case Pm4::IT_INDIRECT_BUFFER: // control flow only; its packets are classified one by one
@@ -1209,42 +1209,46 @@ void CommandProcessor::NoteMergeOpcode(uint32_t opcode) {
 	switch (ClassifyPacket(opcode)) {
 		case PacketClass::ShRegs: probe.sh++; break;
 		case PacketClass::CtxRegs: probe.ctx++; break;
-		case PacketClass::Work: probe.draw++; break;
+		case PacketClass::Draw:
+		case PacketClass::Dispatch: probe.draw++; break;
 		case PacketClass::Benign: break;
 		case PacketClass::Other: probe.other++; break;
 	}
 }
 
 // KYTY_SUBMIT_AHEAD (submitAhead.h): before a work or side-effect packet, submit the open command
-// buffer when a learned producer was recorded into it, or when it has been recording longer than
-// the timer. Same operation as BufferFlush (submit, no wait).
+// buffer once it has been recording longer than the threshold. Same operation as BufferFlush
+// (submit, no wait).
 void CommandProcessor::SubmitAheadBeforePacket(uint32_t opcode) {
 	auto& scheduler = GetScheduler();
 	if (!scheduler.Active() || CurrentBuffer().IsInvalid()) {
 		return;
 	}
-	uint64_t producer_tick = 0;
-	if (const auto producer = m_renderer.GetRenderExecutor().ConsumeSubmitAheadProducer(producer_tick);
-	    producer != 0) {
-		m_submit_ahead.ProducerRecorded(producer_tick, producer);
-	}
-	const auto kind = ClassifyPacket(opcode);
 	using Packet    = SubmitAheadTrigger::Packet;
+	const auto kind = ClassifyPacket(opcode);
 	const auto packet = kind == PacketClass::ShRegs || kind == PacketClass::CtxRegs ? Packet::Register
 	                    : kind == PacketClass::Benign                               ? Packet::Benign
-	                                                                                : Packet::Work;
+	                    : kind == PacketClass::Draw                                 ? Packet::Draw
+	                    : kind == PacketClass::Dispatch                             ? Packet::Dispatch
+	                                                                                : Packet::Other;
+	const bool work   = packet != Packet::Register && packet != Packet::Benign;
 	const auto reason = m_submit_ahead.Before(packet, scheduler.CurrentTick(),
-	                                          packet == Packet::Work ? scheduler.OpenCommandAgeNs() : 0,
+	                                          work ? scheduler.OpenCommandAgeNs() : 0,
 	                                          CurrentBuffer().IsRendering(), SubmitAheadConfig::Get());
 	if (reason == SubmitAheadTrigger::Reason::None) {
 		return;
 	}
+	const auto tick = scheduler.CurrentTick();
 	BufferFlush();
-	if (const auto producer = m_submit_ahead.Submitted(reason, scheduler.CurrentTick()); producer != 0) {
-		m_renderer.GetBufferCache().NoteSubmitAhead(producer);
+	m_submit_ahead.Submitted(packet, scheduler.CurrentTick());
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+		LOGF("SubmitAhead: submit tick %" PRIu64 " before opcode 0x%02x (%s)\n", tick, opcode,
+		     reason == SubmitAheadTrigger::Reason::DispatchTimer ? "dispatch-timer" : "timer");
 	}
-	SubmitAheadProbe::Count(reason == SubmitAheadTrigger::Reason::Producer ? SubmitAheadProbe::ProducerSubmits
-	                                                                       : SubmitAheadProbe::TimerSubmits);
+	SubmitAheadProbe::Count(reason == SubmitAheadTrigger::Reason::DispatchTimer
+	                            ? SubmitAheadProbe::DispatchTimerSubmits
+	                            : SubmitAheadProbe::TimerSubmits);
 }
 
 // Called for each GPU mesh packet after it was recorded (the packet itself is one probe.draw).

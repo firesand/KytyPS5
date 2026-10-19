@@ -4086,22 +4086,23 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
-  // KYTY_SUBMIT_AHEAD producer learning through the real buffer cache (--submit-ahead-only sets
-  // KYTY_SUBMIT_AHEAD=1): a write recorded under a writer tag in the open command buffer, then a
-  // readback that has to copy (the tick is not submitted, so no BAR read), makes the tag a producer;
-  // an untagged write teaches nothing.
-  void CheckSubmitAheadLearning() {
-    constexpr const char *name = "SubmitAheadLearning";
-    if (!SubmitAheadConfig::Get().producers) {
-      std::printf("[gpu]     %-32s SKIP KYTY_SUBMIT_AHEAD producers off\n", name);
+  // Readback classification (--submit-ahead-only sets KYTY_PROBE_FAULT_HISTOGRAM=1): a GPU write
+  // recorded into the open command buffer and read back at once must not count as BAR or as
+  // in flight: it waits because nothing was submitted (open; "other" when the cache buffer is not
+  // host-visible). After a submit and a finish the same kind of read is served over BAR (or other).
+  void CheckReadbackClassification() {
+    constexpr const char *name = "ReadbackClassification";
+    using Probe = Libs::Graphics::ReadbackProbe;
+    using Wait = Libs::Graphics::WaitReasonProbe;
+    if (!Libs::Graphics::ProbeEnabled::Get()) {
+      std::printf("[gpu]     %-32s SKIP KYTY_PROBE_FAULT_HISTOGRAM off\n", name);
       return;
     }
     constexpr uintptr_t base = 0x0000000209800000ull;
     constexpr uint64_t allocation_size = 0x100000;
     constexpr uint64_t allocation_alignment = 0x10000;
-    constexpr uint64_t untagged_offset = 0x100;
-    constexpr uint64_t tagged_offset = 0x8100; // another 16 KiB tracking page
-    constexpr uint64_t writer = 0x5ab0c0de00000001ull;
+    constexpr uint64_t open_offset = 0x100;
+    constexpr uint64_t finished_offset = 0x8100; // another 16 KiB tracking page
 
     EnsureRuntimeContext();
     RenderContext context(m_runtime_context);
@@ -4117,40 +4118,54 @@ public:
             Libs::LibKernel::Memory::KernelAllocateDirectMemory(
                 0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
                 allocation_size, allocation_alignment, 0, &direct_offset) == 0,
-            "submit-ahead direct-memory allocation failed");
+            "readback-classification direct-memory allocation failed");
     void *mapped = reinterpret_cast<void *>(base);
     Require(name, "direct mapping",
             Libs::LibKernel::Memory::KernelMapDirectMemory(
                 &mapped, allocation_size, 0x3, 0x10, direct_offset,
                 allocation_alignment) == 0 &&
                 mapped == reinterpret_cast<void *>(base),
-            "submit-ahead fixed direct-memory mapping failed");
+            "readback-classification fixed direct-memory mapping failed");
+    const char *open_kind = "?";
+    const char *finished_kind = "?";
     {
       auto &cache = context.GetBufferCache();
       context.MapMemory(base, allocation_size);
-      (void)cache.ObtainBuffer(base + untagged_offset, 0x100, true, false);
-      cache.ReadMemory(base + untagged_offset, sizeof(uint32_t));
-      Require(name, "untagged write", !cache.IsSubmitAheadProducer(writer),
-              "a readback of an untagged write learned a producer");
-      cache.SetWriterTag(writer);
-      (void)cache.ObtainBuffer(base + tagged_offset, 0x100, true, false);
-      cache.SetWriterTag(0);
-      Require(name, "not yet learned", !cache.IsSubmitAheadProducer(writer),
-              "a tagged write alone made its writer a producer");
-      cache.ReadMemory(base + tagged_offset, sizeof(uint32_t));
-      Require(name, "learned from a waited readback", cache.IsSubmitAheadProducer(writer),
-              "a copy readback of a tagged write in the open command buffer learned nothing");
+      const auto kind_name = [](const Probe::Snapshot &snapshot, uint32_t reason) {
+        const auto &k = snapshot[reason];
+        return k[Probe::Bar] ? "bar" : k[Probe::CopyOpen] ? "open"
+             : k[Probe::CopyInFlight] ? "inflight" : k[Probe::CopyOther] ? "other" : "none";
+      };
+      (void)Probe::Take();
+      (void)cache.ObtainBuffer(base + open_offset, 0x100, true, false);
+      cache.ReadMemory(base + open_offset, sizeof(uint32_t));
+      const auto open = Probe::Take();
+      const auto &o = open[Wait::Download];
+      open_kind = kind_name(open, Wait::Download);
+      Require(name, "open-buffer readback",
+              o[Probe::Bar] + o[Probe::CopyOpen] + o[Probe::CopyInFlight] + o[Probe::CopyOther] == 1 &&
+                  o[Probe::Bar] == 0 && o[Probe::CopyInFlight] == 0,
+              "a readback of a write in the unsubmitted command buffer was not classified as open/other");
+      (void)cache.ObtainBuffer(base + finished_offset, 0x100, true, false);
+      scheduler.Finish();
+      cache.ReadMemory(base + finished_offset, sizeof(uint32_t));
+      const auto finished = Probe::Take();
+      const auto &f = finished[Wait::Download];
+      finished_kind = kind_name(finished, Wait::Download);
+      Require(name, "finished readback",
+              f[Probe::Bar] + f[Probe::CopyOther] == 1 && f[Probe::CopyOpen] == 0 && f[Probe::CopyInFlight] == 0,
+              "a readback of a finished write was classified as waiting for the GPU");
       context.UnmapMemory(base, allocation_size);
       scheduler.Finish();
     }
     context.ShutdownGpu();
     Require(name, "unmap direct backing",
             Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
-            "submit-ahead direct-memory mapping release failed");
+            "readback-classification direct-memory mapping release failed");
     Require(name, "release direct backing",
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
-            "submit-ahead direct-memory allocation release failed");
-    std::printf("[gpu]     %-32s ok\n", name);
+            "readback-classification direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok (open read: %s, finished read: %s)\n", name, open_kind, finished_kind);
   }
 
   void CheckBufferCacheDirtyGarbageCollection() {
@@ -44858,80 +44873,62 @@ static void CheckWaitReasonAttribution() {
 static void CheckSubmitAheadLogic() {
   const char *name = "SubmitAheadLogic";
   using Config = Libs::Graphics::SubmitAheadConfig;
-  Require(name, "config off", !Config::Parse(nullptr, nullptr).Enabled() &&
-                                  !Config::Parse("0", "2").Enabled() && !Config::Parse("x", nullptr).Enabled(),
-          "submit-ahead enabled without KYTY_SUBMIT_AHEAD=1|p|t");
-  const auto both = Config::Parse("1", nullptr);
-  const auto producers = Config::Parse("p", "2");
-  const auto timer = Config::Parse("t", "2.5");
-  const auto bad_ms = Config::Parse("t", "abc");
+  Require(name, "config off",
+          !Config::Parse(nullptr, nullptr).Enabled() && !Config::Parse("0", "2").Enabled() &&
+              !Config::Parse("p", "2").Enabled() && !Config::Parse("12", nullptr).Enabled(),
+          "submit-ahead enabled without KYTY_SUBMIT_AHEAD=1|t");
+  const auto one = Config::Parse("1", nullptr);
+  const auto timer = Config::Parse("t", "2.5", "0.5");
+  const auto bad = Config::Parse("t", "abc", "-1");
   Require(name, "config modes",
-          both.producers && both.timer_ns == 4000000u && producers.producers && producers.timer_ns == 0 &&
-              !timer.producers && timer.timer_ns == 2500000u && bad_ms.timer_ns == 4000000u,
-          "KYTY_SUBMIT_AHEAD / _MS parsed wrongly");
-
-  Libs::Graphics::SubmitAheadLearner learner;
-  learner.NoteWrite(10, 12, 0xaa);
-  learner.NoteWrite(100, 100 + Libs::Graphics::SubmitAheadLearner::kMaxWritePages + 1, 0xbb);
-  uint64_t learned = 0;
-  Require(name, "BAR readback teaches nothing", learner.NoteReadback(11, 12, false) == 0 &&
-                                                    !learner.IsProducer(0xaa),
-          "a readback served over BAR learned a producer");
-  Require(name, "waited readback learns", learner.NoteReadback(11, 12, true, &learned) == 1 &&
-                                              learned == 0xaa && learner.IsProducer(0xaa),
-          "a waited readback of a written page did not learn its writer");
-  Require(name, "heap writes ignored", learner.NoteReadback(100, 101, true) == 0 && !learner.IsProducer(0xbb),
-          "a write larger than kMaxWritePages was attributed");
-  for (uint32_t i = 0; i < Libs::Graphics::SubmitAheadLearner::kIdleLimit; ++i) {
-    learner.NoteSubmitAhead(0xaa);
-  }
-  (void)learner.NoteReadback(10, 11, false); // BAR read of its page: alive again
-  learner.NoteSubmitAhead(0xaa);
-  Require(name, "readback keeps a producer", learner.IsProducer(0xaa),
-          "a producer whose pages were read back was forgotten");
-  for (uint32_t i = 0; i <= Libs::Graphics::SubmitAheadLearner::kIdleLimit; ++i) {
-    learner.NoteSubmitAhead(0xaa);
-  }
-  Require(name, "idle producer forgotten", !learner.IsProducer(0xaa) && learner.ProducerCount() == 0,
-          "a producer without readbacks survived kIdleLimit submit-aheads");
+          one.timer_ns == 4000000u && one.dispatch_timer_ns == 0 && timer.timer_ns == 2500000u &&
+              timer.dispatch_timer_ns == 500000u && bad.timer_ns == 4000000u && bad.dispatch_timer_ns == 0,
+          "KYTY_SUBMIT_AHEAD / _MS / _DISPATCH_MS parsed wrongly");
 
   using Trigger = Libs::Graphics::SubmitAheadTrigger;
+  using Packet = Trigger::Packet;
+  using Reason = Trigger::Reason;
   Trigger trigger;
-  const auto work = Trigger::Packet::Work;
   Require(name, "first work packet never submits",
-          trigger.Before(work, 5, 100000000u, false, both) == Trigger::Reason::None,
+          trigger.Before(Packet::Draw, 5, 100000000u, false, one) == Reason::None,
           "submitted before anything was recorded into the command buffer");
   Require(name, "registers never submit",
-          trigger.Before(Trigger::Packet::Register, 5, 100000000u, false, both) == Trigger::Reason::None &&
-              trigger.Before(Trigger::Packet::Benign, 5, 100000000u, false, both) == Trigger::Reason::None,
+          trigger.Before(Packet::Register, 5, 100000000u, false, one) == Reason::None &&
+              trigger.Before(Packet::Benign, 5, 100000000u, false, one) == Reason::None,
           "submitted before a register write or a benign packet");
-  trigger.ProducerRecorded(5, 0xcc);
-  const auto producer_reason = trigger.Before(work, 5, 0, true, both);
-  Require(name, "producer submits even in a render pass",
-          producer_reason == Trigger::Reason::Producer && trigger.Submitted(producer_reason, 6) == 0xcc,
-          "a recorded producer did not trigger a submit at the next work packet");
-  trigger.ProducerRecorded(6, 0xdd);
-  (void)trigger.Before(work, 7, 0, false, both); // another path submitted: the producer is gone
-  Require(name, "stale producer ignored", trigger.Before(work, 7, 0, false, both) == Trigger::Reason::None,
-          "a producer recorded into an already submitted command buffer triggered a submit");
-  Require(name, "timer below threshold", trigger.Before(work, 7, 3999999u, false, both) == Trigger::Reason::None,
+  Require(name, "timer below threshold", trigger.Before(Packet::Draw, 5, 3999999u, false, one) == Reason::None,
           "the timer fired early");
   Require(name, "timer waits for the render pass",
-          trigger.Before(work, 7, 5000000u, true, both) == Trigger::Reason::None &&
-              trigger.Before(work, 7, 12000000u, true, both) == Trigger::Reason::Timer,
+          trigger.Before(Packet::Draw, 5, 5000000u, true, one) == Reason::None &&
+              trigger.Before(Packet::Draw, 5, 12000000u, true, one) == Reason::Timer,
           "the timer split an open render pass before 3x its threshold");
-  const auto timer_reason = trigger.Before(work, 7, 4000000u, false, timer);
-  Require(name, "timer outside a render pass",
-          timer_reason == Trigger::Reason::Timer && trigger.Submitted(timer_reason, 8) == 0,
-          "the timer did not fire outside a render pass");
-  Require(name, "producers off",
-          [&] {
-            Trigger off;
-            (void)off.Before(work, 1, 0, false, timer);
-            off.ProducerRecorded(1, 0xee);
-            return off.Before(work, 1, 0, false, timer) == Trigger::Reason::None;
-          }(),
-          "a producer triggered a submit with KYTY_SUBMIT_AHEAD=t");
+  Require(name, "side-effect packets count as work",
+          trigger.Before(Packet::Other, 5, 4000000u, false, one) == Reason::Timer,
+          "the timer did not fire before a side-effect packet");
+  trigger.Submitted(Packet::Draw, 6);
+  Require(name, "new buffer starts young", trigger.Before(Packet::Draw, 6, 0, false, one) == Reason::None,
+          "the timer fired right after a submit");
+  Require(name, "tick change resets", trigger.Before(Packet::Draw, 7, 100000000u, false, one) == Reason::None,
+          "a command buffer submitted by another path kept its recorded work");
+
+  // Dispatch threshold: shorter once the open buffer holds a dispatch.
+  Trigger dispatch;
+  (void)dispatch.Before(Packet::Draw, 1, 0, false, timer);
+  Require(name, "no dispatch: plain threshold",
+          dispatch.Before(Packet::Draw, 1, 600000u, false, timer) == Reason::None,
+          "the dispatch threshold applied without a dispatch");
+  (void)dispatch.Before(Packet::Dispatch, 1, 600000u, false, timer);
+  Require(name, "after a dispatch: shorter threshold",
+          dispatch.Before(Packet::Draw, 1, 600000u, false, timer) == Reason::DispatchTimer,
+          "the dispatch threshold did not fire after a dispatch");
+  dispatch.Submitted(Packet::Draw, 2);
+  Require(name, "dispatch flag cleared by the submit",
+          dispatch.Before(Packet::Draw, 2, 600000u, false, timer) == Reason::None,
+          "the dispatch flag survived the submit");
+  dispatch.Submitted(Packet::Dispatch, 3);
+  Require(name, "a submitted dispatch packet counts in the new buffer",
+          dispatch.Before(Packet::Draw, 3, 600000u, false, timer) == Reason::DispatchTimer,
+          "the dispatch the submit was made for was not recorded in the new buffer");
   std::printf("[host]    %-32s ok\n", name);
 }
 
@@ -46553,6 +46550,47 @@ void CheckPm4ContextStateOperations(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4ContextState");
 }
 
+// KYTY_SUBMIT_AHEAD through CommandProcessor::ProcessPm4 (--submit-ahead-only sets a 1 us timer):
+// a stream of side-effect packets (WRITE_DATA) must be submitted ahead at least once, with every
+// write landing. The stress pass reruns it under KYTY_LAZY_BARRIERS=0/1 and KYTY_SYNC_PAGE_DRIVEN=0/1.
+void CheckPm4SubmitAhead(RenderContext &renderer) {
+  constexpr const char *name = "Pm4SubmitAhead";
+  const auto &config = Libs::Graphics::SubmitAheadConfig::Get();
+  if (config.timer_ns == 0 || config.timer_ns > 100000u) {
+    std::printf("[host]    %-32s SKIP needs KYTY_SUBMIT_AHEAD=t with KYTY_SUBMIT_AHEAD_MS <= 0.1\n", name);
+    return;
+  }
+  GraphicsInitJmpTables();
+  CommandProcessor processor(renderer, 0);
+  std::array<uint32_t, 6> values{};
+  std::vector<uint32_t> commands;
+  for (uint32_t i = 0; i < values.size(); ++i) {
+    const auto address = reinterpret_cast<uint64_t>(&values[i]);
+    commands.insert(commands.end(), {KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0), 0, static_cast<uint32_t>(address),
+                                     static_cast<uint32_t>(address >> 32u), 0x100u + i});
+  }
+  using Probe = Libs::Graphics::SubmitAheadProbe;
+  auto &scheduler = renderer.GetCommandScheduler();
+  processor.BufferInit(); // the GPU thread binds the scheduler before each submission
+  (void)Probe::Take();
+  const auto tick_before = scheduler.CurrentTick();
+  Pm4Execution execution;
+  Require(name, "stream completes",
+          processor.Process(execution, {commands.data(), commands.size()}) == Pm4ProcessResult::Complete,
+          "the WRITE_DATA stream did not complete");
+  const auto submits = Probe::Take();
+  const auto ticks = scheduler.CurrentTick() - tick_before;
+  for (uint32_t i = 0; i < values.size(); ++i) {
+    Require(name, "writes landed", values[i] == 0x100u + i, "a WRITE_DATA around a submit-ahead was lost");
+  }
+  Require(name, "submitted ahead", submits[Probe::TimerSubmits] >= 1 && ticks >= submits[Probe::TimerSubmits],
+          "no submit-ahead happened in ProcessPm4 (or the scheduler tick did not advance)");
+  scheduler.Finish();
+  std::printf("[host]    %-32s ok (%llu timer submits, %llu ticks)\n", name,
+              static_cast<unsigned long long>(submits[Probe::TimerSubmits]),
+              static_cast<unsigned long long>(ticks));
+}
+
 void CheckPm4IndirectControlFlow(RenderContext &renderer) {
   constexpr const char *name = "Pm4IndirectControlFlow";
   GraphicsInitJmpTables();
@@ -47805,10 +47843,14 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--submit-ahead-only") == 0) {
-    setenv("KYTY_SUBMIT_AHEAD", "1", 0); // an explicit value from the caller wins
+    // Explicit values from the caller win.
+    setenv("KYTY_PROBE_FAULT_HISTOGRAM", "1", 0);
+    setenv("KYTY_SUBMIT_AHEAD", "t", 0);
+    setenv("KYTY_SUBMIT_AHEAD_MS", "0.001", 0);
     CheckSubmitAheadLogic();
     VulkanHarness vulkan;
-    vulkan.CheckSubmitAheadLearning();
+    vulkan.CheckReadbackClassification();
+    CheckPm4SubmitAhead(vulkan.RuntimeRenderer());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--depth-feedback-only") == 0) {
