@@ -1435,6 +1435,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		// Protected by m_lock acquired at line 1411 (held across image lookup, resolve, and commit).
 		// Do NOT add an inner scoped_lock here: TrackingSpinLock is non-recursive and will abort.
 		m_resolved_dcc_meta[meta_address] = {meta_size, m_dcc_meta_epoch};
+		m_resolved_dcc_meta_max_size       = std::max(m_resolved_dcc_meta_max_size, meta_size);
 		ZeroCompanyImageLifecycle::Record(m_scheduler, "materialize-color-clear-gpu", id, image,
 		    {.request = &desc.info, .address = meta_address, .size = meta_size});
 		if (clear_log) {
@@ -2543,15 +2544,21 @@ void TextureCache::InvalidateDccMetadata(uint64_t address, uint64_t size) {
 	if (m_resolved_dcc_meta.empty()) {
 		return;
 	}
-	const uint64_t end = address + size;
-	for (auto it = m_resolved_dcc_meta.begin(); it != m_resolved_dcc_meta.end(); ) {
-		const uint64_t meta_start = it->first;
-		const uint64_t meta_end   = meta_start + it->second.first;
-		if (address < meta_end && end > meta_start) {
+	// An entry starting before address - max size ends before address: walk only the starts in
+	// [address - max size, end), not every entry (ng-181: 5.5 % of the GPU thread with write-watch,
+	// whose collections call this once per written run).
+	const uint64_t end  = address + size;
+	const uint64_t from = address > m_resolved_dcc_meta_max_size ? address - m_resolved_dcc_meta_max_size : 0;
+	for (auto it = m_resolved_dcc_meta.lower_bound(from); it != m_resolved_dcc_meta.end() && it->first < end;) {
+		const uint64_t meta_end = it->first + it->second.first;
+		if (address < meta_end) {
 			it = m_resolved_dcc_meta.erase(it);
 		} else {
 			++it;
 		}
+	}
+	if (m_resolved_dcc_meta.empty()) {
+		m_resolved_dcc_meta_max_size = 0;
 	}
 }
 
