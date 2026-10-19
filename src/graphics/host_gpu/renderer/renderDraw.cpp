@@ -1047,6 +1047,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		}
 	}
 	mrt_mask &= color_output_mask;
+	OpPhaseScope targets(OpSplitProbe::Resources); // render-target and depth resolution
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "ResolveRenderColorTarget");
 	}
@@ -1209,6 +1210,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto& ucfg = buffer.GetUserConfig();
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
+	// KYTY_PROBE_OP_SPLIT phases below; the caller's phase is restored on return.
+	OpPhaseScope op_phase(OpSplitProbe::Other);
 	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
 	uint32_t   mesh_groups = 0;
 	if (mesh_active) {
@@ -1245,6 +1248,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// memory), then decide whether the argument read needs a shaderWrite -> indirectCommandRead
 	// barrier. Marks are made at record time for bound shader writes; unbounded (fault-tracked)
 	// writes in flight are covered by HasPendingUnboundedWrites.
+	OpSplitProbe::Enter(OpSplitProbe::Barrier);
 	uint64_t indirect_args_bytes = 0;
 	bool     indirect_barrier    = false;
 	bool     args_unpublished    = false; // unpublished unbounded GPU writes may cover the args
@@ -1310,6 +1314,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		        std::chrono::steady_clock::now() - wait_begin).count()));
 	}
 
+	OpSplitProbe::Enter(OpSplitProbe::Resources);
 	if (mesh_active && draw.IsIndexed()) {
 		// Register the original guest indices for shader reads; PrepareGraphicsBindings
 		// synchronizes registered BDA ranges before any draw commands are committed.
@@ -1363,14 +1368,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
+	OpSplitProbe::Enter(OpSplitProbe::Pipeline);
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
 	    state.programs);
+	OpSplitProbe::Enter(OpSplitProbe::Resources);
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
 	                         feedback_aspects, stages);
+	OpSplitProbe::Enter(OpSplitProbe::Other);
 	const uint32_t draw_data[] {
 	    draw.index_count,
 	    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
@@ -1391,6 +1399,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// memory.
 	// Resolves tracked shader writes (dispatches, earlier draws) before this draw consumes them:
 	// closes the pass when something is pending. No-op unless KYTY_LAZY_BARRIERS is on. An earlier
+	OpSplitProbe::Enter(OpSplitProbe::Barrier);
 	bool has_storage_reads = false;
 	for (const auto& stage: vertex_stages) {
 		if (HasShaderBufferReads(stage.stage) || stage.stage.program->info.uses_dma) {
@@ -1441,6 +1450,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			hazards.transfer_wrote        = false;
 		}
 	}
+	OpSplitProbe::Enter(OpSplitProbe::Record);
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
@@ -1642,6 +1652,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);
 	}
+	OpSplitProbe::Enter(OpSplitProbe::Barrier);
 	vk::PipelineStageFlags shader_write_stages = {};
 	for (const auto& stage: vertex_stages) {
 		if (HasShaderBufferWrites(stage.stage)) {
@@ -1687,6 +1698,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			BarrierProbe::NoteEmitted(BarrierProbe::DrawPost); // strict bisection barrier
 		}
 	}
+	OpSplitProbe::Enter(OpSplitProbe::Other);
 	LogDrawPhase(draw.Name(), "DrawComplete");
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x700u);
@@ -1856,6 +1868,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
 	BudgetScope budget(BudgetProbe::Draw, true);
+	OpSplitScope op_split(OpSplitProbe::Draw);
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -1927,6 +1940,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	index_source.size = static_cast<uint64_t>(args.index_count) * index_source.guest_element_size;
 	// The host-side reads below (restart-marker scan, 8-bit widening) see GPU-built index data
 	// only once pending unbounded writes are published (host-read audit 2026-10-12).
+	OpSplitProbe::Enter(OpSplitProbe::Resources);
 	if (args.index_addr != nullptr && index_source.size != 0) {
 		// GPU-indirect draws keep this too: ObtainBuffer must not upload stale CPU bytes over
 		// GPU-built indices whose write-fault records are still unpublished.
@@ -1953,6 +1967,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		index_source.size      = expanded_indices.size() * sizeof(uint16_t);
 	}
 
+	OpSplitProbe::Enter(OpSplitProbe::State);
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
 	                        args.instance_count, args.first_instance, args.offset_source};
 	DrawRenderState state {};
@@ -1979,6 +1994,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
 	                    primitive_restart, args.gpu_indirect);
+	OpSplitProbe::Enter(OpSplitProbe::Other);
 	ResetBindings();
 }
 
@@ -1986,6 +2002,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
 	BudgetScope budget(BudgetProbe::Draw, true);
+	OpSplitScope op_split(OpSplitProbe::Draw);
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -2029,6 +2046,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 
 	hw_check(buffer);
 
+	OpSplitProbe::Enter(OpSplitProbe::State);
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndexAuto,
 	                         args.vertex_count, args.instance_count, args.first_instance,
 	                         args.offset_source};
@@ -2075,6 +2093,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	DrawIndexBufferSource index_source {};
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false,
 	                    args.gpu_indirect);
+	OpSplitProbe::Enter(OpSplitProbe::Other);
 	ResetBindings();
 }
 

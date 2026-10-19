@@ -318,6 +318,7 @@ struct BudgetProbe {
 	// thread (Codex review 2026-10-15: waits reach MasterSemaphore::Wait from inside sync/draw/
 	// dispatch; inclusive numbers alone do not partition the thread's time).
 	inline static thread_local uint64_t s_nested_ns = 0; // child time to subtract, per open scope
+	inline static thread_local uint32_t s_depth     = 0; // enabled scopes open on this thread
 	static void Add(Category category, uint64_t inclusive_ns, uint64_t exclusive_ns) noexcept {
 		s_categories[category].calls.fetch_add(1, std::memory_order_relaxed);
 		s_categories[category].inclusive_ns.fetch_add(inclusive_ns, std::memory_order_relaxed);
@@ -346,12 +347,14 @@ public:
 			// Save the enclosing scope's child accumulator and start a fresh one for this scope.
 			m_outer_nested_ns       = BudgetProbe::s_nested_ns;
 			BudgetProbe::s_nested_ns = 0;
+			BudgetProbe::s_depth++;
 		}
 	}
 	~BudgetScope() {
 		if (!m_enabled) {
 			return;
 		}
+		BudgetProbe::s_depth--;
 		const auto elapsed = std::chrono::steady_clock::now() - m_begin;
 		const auto inclusive = static_cast<uint64_t>(
 		    std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
@@ -369,6 +372,131 @@ private:
 	bool                                  m_enabled;
 	std::chrono::steady_clock::time_point m_begin;
 	uint64_t                              m_outer_nested_ns = 0;
+};
+
+// KYTY_PROBE_OP_SPLIT=1 (with KYTY_PROBE_FAULT_HISTOGRAM=1): splits the draw and dispatch budget
+// scopes' exclusive time into phases, printed as "| op-split ms (us/call)" on the FaultHistogram line.
+//   state      register/state snapshot: render-state and stage input info, shader parameters
+//   program    shader program lookup and SRT walk (ProgramCache::Get: permutation match, resource
+//              materialization, specialization reads)
+//   pipeline   Vulkan pipeline lookup / creation (GetGraphicsPipeline / GetComputePipeline)
+//   resources  buffer/texture obtain and binding preparation (PrepareBindings, vertex/index/argument
+//              buffers, render targets, LDS buffer)
+//   barrier    hazard tracking and barriers (PrepareForDraw, indirect-argument and lazy barriers,
+//              post-draw/dispatch tracking)
+//   record     command recording (CommitBindings, push constants, dynamic state, BeginRendering,
+//              bind, draw/dispatch)
+//   other      everything else inside the op (special-case clears/copies, diagnostics, cleanup)
+// One phase is current per GPU-thread op; OpSplitProbe::Enter switches it and OpPhaseScope switches for a
+// region and back. Each switch charges the elapsed time minus the nested budget scopes' time (sync,
+// wait, protect, submit: BudgetProbe::s_nested_ns) to the phase it leaves, so the phases partition the
+// op's exclusive time. Switches inside a nested budget scope are ignored (their time is excluded).
+// Off: one thread-local test per switch site.
+struct OpSplitProbe {
+	enum Op : uint32_t { Draw = 0, Dispatch, OpCount };
+	enum Phase : uint32_t { Other = 0, State, Program, Pipeline, Resources, Barrier, Record, PhaseCount };
+	static constexpr auto kPhaseNames = std::to_array<const char*>(
+	    {"other", "state", "program", "pipeline", "resources", "barrier", "record"});
+	static_assert(kPhaseNames.size() == PhaseCount, "OpSplitProbe phase / name table mismatch");
+	struct Snapshot {
+		std::array<uint64_t, OpCount>                                calls {};
+		std::array<std::array<uint64_t, PhaseCount>, OpCount>       ns {};
+	};
+	inline static std::array<std::atomic<uint64_t>, OpCount>                          s_calls {};
+	inline static std::array<std::array<std::atomic<uint64_t>, PhaseCount>, OpCount> s_ns {};
+
+	// The open op on this thread (one at a time; ops do not nest).
+	inline static thread_local bool                                  t_active      = false;
+	inline static thread_local uint32_t                              t_op          = 0;
+	inline static thread_local uint32_t                              t_phase       = 0;
+	inline static thread_local uint32_t                              t_depth       = 0;
+	inline static thread_local uint64_t                              t_last_nested = 0;
+	inline static thread_local std::chrono::steady_clock::time_point t_last {};
+
+	static bool Enabled() noexcept {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_PROBE_OP_SPLIT");
+			return value != nullptr && value[0] == '1' && ProbeEnabled::Get();
+		}();
+		return enabled;
+	}
+	// True when a switch here belongs to the open op (not inside a nested budget scope).
+	static bool Here() noexcept { return t_active && BudgetProbe::s_depth == t_depth; }
+	static void Charge() noexcept {
+		const auto now     = std::chrono::steady_clock::now();
+		const auto elapsed = static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(now - t_last).count());
+		const auto nested = BudgetProbe::s_nested_ns - t_last_nested;
+		s_ns[t_op][t_phase].fetch_add(elapsed > nested ? elapsed - nested : 0, std::memory_order_relaxed);
+		t_last        = now;
+		t_last_nested = BudgetProbe::s_nested_ns;
+	}
+	static void Enter(Phase phase) noexcept {
+		if (Here() && t_phase != phase) {
+			Charge();
+			t_phase = phase;
+		}
+	}
+	static Snapshot Take() noexcept {
+		Snapshot snapshot;
+		for (uint32_t op = 0; op < OpCount; ++op) {
+			snapshot.calls[op] = s_calls[op].exchange(0, std::memory_order_relaxed);
+			for (uint32_t phase = 0; phase < PhaseCount; ++phase) {
+				snapshot.ns[op][phase] = s_ns[op][phase].exchange(0, std::memory_order_relaxed);
+			}
+		}
+		return snapshot;
+	}
+};
+
+// Opens a draw or dispatch for OpSplitProbe; declare it right after the op's BudgetScope.
+class OpSplitScope {
+public:
+	explicit OpSplitScope(OpSplitProbe::Op op) noexcept
+	    : m_enabled(OpSplitProbe::Enabled() && !OpSplitProbe::t_active && BudgetProbe::s_depth != 0) {
+		if (m_enabled) {
+			OpSplitProbe::t_active      = true;
+			OpSplitProbe::t_op          = op;
+			OpSplitProbe::t_phase       = OpSplitProbe::Other;
+			OpSplitProbe::t_depth       = BudgetProbe::s_depth;
+			OpSplitProbe::t_last_nested = BudgetProbe::s_nested_ns;
+			OpSplitProbe::t_last        = std::chrono::steady_clock::now();
+		}
+	}
+	~OpSplitScope() {
+		if (m_enabled) {
+			OpSplitProbe::Charge();
+			OpSplitProbe::s_calls[OpSplitProbe::t_op].fetch_add(1, std::memory_order_relaxed);
+			OpSplitProbe::t_active = false;
+		}
+	}
+	OpSplitScope(const OpSplitScope&)            = delete;
+	OpSplitScope& operator=(const OpSplitScope&) = delete;
+
+private:
+	bool m_enabled;
+};
+
+// Charges a region of an open op to `phase`, then returns to the phase current before it.
+class OpPhaseScope {
+public:
+	explicit OpPhaseScope(OpSplitProbe::Phase phase) noexcept: m_switched(OpSplitProbe::Here()) {
+		if (m_switched) {
+			m_previous = static_cast<OpSplitProbe::Phase>(OpSplitProbe::t_phase);
+			OpSplitProbe::Enter(phase);
+		}
+	}
+	~OpPhaseScope() {
+		if (m_switched) {
+			OpSplitProbe::Enter(m_previous);
+		}
+	}
+	OpPhaseScope(const OpPhaseScope&)            = delete;
+	OpPhaseScope& operator=(const OpPhaseScope&) = delete;
+
+private:
+	bool                m_switched;
+	OpSplitProbe::Phase m_previous = OpSplitProbe::Other;
 };
 
 // CPU time (user, system) of the calling thread and of the whole process, in milliseconds, read

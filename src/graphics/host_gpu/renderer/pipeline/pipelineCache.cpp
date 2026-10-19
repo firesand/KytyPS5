@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/shaderCompiler.h"
+#include "graphics/host_gpu/hostReadStats.h"
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
 #include "loader/systemContent.h"
@@ -619,6 +620,7 @@ struct PipelineCache::ProgramCache {
 			stage = ShaderType::Compute;
 		}
 		const BackingReadAttribution backing_reads(stage, params.hash);
+		const OpPhaseScope           program_phase(OpSplitProbe::Program); // KYTY_PROBE_OP_SPLIT
 
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
 		lookup_key.stage           = stage;

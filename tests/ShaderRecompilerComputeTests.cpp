@@ -44932,6 +44932,97 @@ static void CheckSubmitAheadLogic() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// KYTY_PROBE_OP_SPLIT (hostReadStats.h OpSplitProbe), host only; --op-split-only enables the probe.
+// A busy-wait timeline inside a draw budget scope: the phases must partition the op's exclusive
+// time, exclude a nested budget scope (and ignore a switch made inside it), and OpPhaseScope must
+// return to the enclosing phase.
+static void CheckOpSplitProbe() {
+  const char *name = "OpSplitProbe";
+  using Probe = Libs::Graphics::OpSplitProbe;
+  using Budget = Libs::Graphics::BudgetProbe;
+  if (!Probe::Enabled()) {
+    std::printf("[host]    %-32s SKIP KYTY_PROBE_OP_SPLIT / KYTY_PROBE_FAULT_HISTOGRAM off\n", name);
+    return;
+  }
+  const auto spin = [](uint32_t microseconds) {
+    const auto end = std::chrono::steady_clock::now() + std::chrono::microseconds(microseconds);
+    while (std::chrono::steady_clock::now() < end) {
+    }
+  };
+  (void)Probe::Take();
+  (void)Budget::Take();
+  Require(name, "no op outside a budget scope",
+          [] {
+            Libs::Graphics::OpSplitScope stray(Probe::Draw);
+            return !Probe::t_active;
+          }(),
+          "an op opened without its budget scope");
+  {
+    Libs::Graphics::BudgetScope budget(Budget::Draw, true);
+    Libs::Graphics::OpSplitScope op(Probe::Draw);
+    spin(2000); // other
+    Probe::Enter(Probe::State);
+    spin(3000);
+    {
+      Libs::Graphics::OpPhaseScope program(Probe::Program);
+      spin(4000);
+    }
+    spin(1000); // back in state
+    {
+      Libs::Graphics::BudgetScope sync(Budget::Sync, true);
+      Probe::Enter(Probe::Record); // ignored: inside a nested budget scope
+      spin(5000);
+    }
+    Probe::Enter(Probe::Record);
+    spin(2000);
+  }
+  const auto split = Probe::Take();
+  const auto budget = Budget::Take();
+  const auto us = [&](Probe::Phase phase) { return split.ns[Probe::Draw][phase] / 1000u; };
+  uint64_t sum = 0;
+  for (const auto ns : split.ns[Probe::Draw]) {
+    sum += ns / 1000u;
+  }
+  const auto exclusive = budget.categories[Budget::Draw].exclusive_ns / 1000u;
+  const auto inclusive = budget.categories[Budget::Draw].inclusive_ns / 1000u;
+  std::printf("[host]    %-32s other %llu state %llu program %llu record %llu sum %llu excl %llu incl %llu us\n",
+              name, static_cast<unsigned long long>(us(Probe::Other)),
+              static_cast<unsigned long long>(us(Probe::State)), static_cast<unsigned long long>(us(Probe::Program)),
+              static_cast<unsigned long long>(us(Probe::Record)), static_cast<unsigned long long>(sum),
+              static_cast<unsigned long long>(exclusive), static_cast<unsigned long long>(inclusive));
+  Require(name, "one draw", split.calls[Probe::Draw] == 1 && split.calls[Probe::Dispatch] == 0,
+          "the op was not counted exactly once");
+  Require(name, "phases",
+          us(Probe::Other) >= 2000 && us(Probe::State) >= 4000 && us(Probe::Program) >= 4000 &&
+              us(Probe::Record) >= 2000 && us(Probe::Pipeline) == 0 && us(Probe::Resources) == 0 &&
+              us(Probe::Barrier) == 0,
+          "a phase lost its time or a switch inside the nested budget scope was honoured");
+  // Scheduling noise only adds time; the nested 5 ms must not appear in the phases.
+  Require(name, "nested budget scope excluded", sum + 4000 <= inclusive && us(Probe::Record) < 4500,
+          "the nested sync scope's time was charged to a phase");
+  Require(name, "phases partition the exclusive time", sum <= exclusive + 50 && sum + 200 >= exclusive,
+          "the phase sum differs from the draw scope's exclusive time");
+  // Cost of one phase switch while on (a draw makes ~10, a dispatch ~8).
+  constexpr uint32_t switches = 200000;
+  std::chrono::steady_clock::duration elapsed{};
+  {
+    Libs::Graphics::BudgetScope cost_budget(Budget::Dispatch, true);
+    Libs::Graphics::OpSplitScope cost_op(Probe::Dispatch);
+    const auto begin = std::chrono::steady_clock::now();
+    for (uint32_t i = 0; i < switches / 2; ++i) {
+      Probe::Enter(Probe::Resources);
+      Probe::Enter(Probe::Record);
+    }
+    elapsed = std::chrono::steady_clock::now() - begin;
+  }
+  (void)Probe::Take();
+  (void)Budget::Take();
+  const auto per_switch =
+      static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()) / switches;
+  Require(name, "switch cost", per_switch < 200.0, "one phase switch costs over 200 ns");
+  std::printf("[host]    %-32s ok (%.1f ns per phase switch)\n", name, per_switch);
+}
+
 void CheckMeshTaskIndirect() {
   CheckGpuIndirectReasonNames();
   CheckSubmitAheadLogic();
@@ -47836,6 +47927,13 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--indirect-mesh-only") == 0) {
     CheckIndirectMeshDraws();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--op-split-only") == 0) {
+    // Explicit values from the caller win.
+    setenv("KYTY_PROBE_FAULT_HISTOGRAM", "1", 0);
+    setenv("KYTY_PROBE_OP_SPLIT", "1", 0);
+    CheckOpSplitProbe();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--mesh-task-indirect-only") == 0) {

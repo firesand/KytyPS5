@@ -321,6 +321,29 @@ struct FaultSampler {
 		                    cpu_delta.process_user_ms, cpu_delta.process_sys_ms, cat(BudgetProbe::Wait),
 		                    cat(BudgetProbe::Sync), cat(BudgetProbe::Draw), cat(BudgetProbe::Dispatch),
 		                    cat(BudgetProbe::Protect), cat(BudgetProbe::Submit));
+		// KYTY_PROBE_OP_SPLIT: the draw / dispatch exclusive time above split into phases
+		// (hostReadStats.h OpSplitProbe); "sum" should match the budget's exclusive column.
+		if (OpSplitProbe::Enabled()) {
+			const auto split = OpSplitProbe::Take();
+			line += " | op-split ms (us/call):";
+			for (uint32_t op = 0; op < OpSplitProbe::OpCount; ++op) {
+				const auto calls = split.calls[op];
+				uint64_t   sum   = 0;
+				for (const auto ns: split.ns[op]) {
+					sum += ns;
+				}
+				const auto per_call = [calls](uint64_t ns) {
+					return calls == 0 ? 0.0 : static_cast<double>(ns) / 1000.0 / static_cast<double>(calls);
+				};
+				line += fmt::format(" {} {}: sum {} ({:.1f})", op == OpSplitProbe::Draw ? "draw" : "dispatch",
+				                    calls, ms(sum), per_call(sum));
+				for (uint32_t phase = 0; phase < OpSplitProbe::PhaseCount; ++phase) {
+					line += fmt::format(" {} {} ({:.1f})", OpSplitProbe::kPhaseNames[phase],
+					                    ms(split.ns[op][phase]), per_call(split.ns[op][phase]));
+				}
+				line += op + 1 < OpSplitProbe::OpCount ? ";" : "";
+			}
+		}
 		// The budget's wait split by the outermost declared reason (WaitReasonProbe); taken here, like the
 		// barrier counters, so it covers the same interval.
 		{

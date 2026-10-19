@@ -328,6 +328,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode, bool async_compute) {
 	BudgetScope budget(BudgetProbe::Dispatch, true);
+	OpSplitScope op_split(OpSplitProbe::Dispatch);
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
@@ -381,6 +382,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto& cs_regs = sh_ctx.GetCs();
 	const auto& sh_regs = ctx.GetShaderRegisters();
 
+	OpSplitProbe::Enter(OpSplitProbe::State);
 	ShaderComputeInputInfo input_info {};
 	input_info.async_compute = async_compute;
 	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
@@ -407,6 +409,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
+	OpSplitProbe::Enter(OpSplitProbe::Other); // special-case clears, thread-dimension rescale
 	if (resources.specialization_reads.empty() &&
 	    (TryConsumeComputeMetaClear(input_info, buffer) ||
 	     TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
@@ -434,9 +437,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
+	OpSplitProbe::Enter(OpSplitProbe::Pipeline);
 	buffer.EndRendering();
 	auto& pipeline =
 	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	OpSplitProbe::Enter(OpSplitProbe::Resources);
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
@@ -529,10 +534,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
+	OpSplitProbe::Enter(OpSplitProbe::Record);
 	// RawHandle: commands recorded below are tracked by the hazard state, not foreign.
 	auto              vk_buffer        = buffer.RawHandle();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
+	OpSplitProbe::Enter(OpSplitProbe::Barrier);
 	bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
 	    HasShaderBufferWrites(input_info.stage);
 	has_storage_writes =
@@ -616,6 +623,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
+	OpSplitProbe::Enter(OpSplitProbe::Record);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	if (program.info.uses_write_faults) {
 		m_context.GetBufferCache().MarkWriteFaultsDirty();
@@ -678,6 +686,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
+	OpSplitProbe::Enter(OpSplitProbe::Barrier);
 	if (LazyBarriersActive()) {
 		NoteDispatchHazards(buffer.Hazards(), tracked_writes);
 	}
@@ -685,6 +694,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		// The removed host fence also ordered read-only dispatches before later writers.
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
+	OpSplitProbe::Enter(OpSplitProbe::Other);
 	ResetBindings();
 	m_context.GetCommandScheduler().DiagnosticOperationComplete();
 }
@@ -692,6 +702,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
                                       uint64_t args_addr, uint32_t mode, bool async_compute) {
 	BudgetScope budget(BudgetProbe::Dispatch, true);
+	OpSplitScope op_split(OpSplitProbe::Dispatch);
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
 	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
@@ -709,12 +720,15 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (cs_regs.cs_regs.data_addr == 0) {
 		return;
 	}
+	OpSplitProbe::Enter(OpSplitProbe::State);
 	ShaderComputeInputInfo input_info {};
 	input_info.async_compute = async_compute;
 	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	OpSplitProbe::Enter(OpSplitProbe::Pipeline);
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	OpSplitProbe::Enter(OpSplitProbe::Resources);
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	PreparedBindings* descriptor_stage = &bindings;
@@ -731,9 +745,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	RebindBuffers(bindings);
+	OpSplitProbe::Enter(OpSplitProbe::Record);
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	const auto vk_buffer = buffer.RawHandle();
+	OpSplitProbe::Enter(OpSplitProbe::Barrier);
 	const bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
 	    HasShaderBufferWrites(input_info.stage) ||
 	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& image) {
@@ -761,6 +777,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		                          vk::PipelineStageFlagBits::eDrawIndirect, {},
 		                          1, &barrier, 0, nullptr, 0, nullptr); }
 	}
+	OpSplitProbe::Enter(OpSplitProbe::Record);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	if (program.info.uses_write_faults) {
 		m_context.GetBufferCache().MarkWriteFaultsDirty();
@@ -784,12 +801,14 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		                           GpuTimestamps::Kind::DispatchIndirect, program.shader_hash);
 		vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	}
+	OpSplitProbe::Enter(OpSplitProbe::Barrier);
 	if (LazyBarriersActive()) {
 		NoteDispatchHazards(buffer.Hazards(), tracked_writes);
 	}
 	if (LazyBarriersKeepOld()) {
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
+	OpSplitProbe::Enter(OpSplitProbe::Other);
 	ResetBindings();
 	m_context.GetCommandScheduler().DiagnosticOperationComplete();
 }
