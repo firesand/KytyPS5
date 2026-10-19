@@ -10233,6 +10233,88 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // FindImage view offsets (vis-06, 2026-10-20): a request that resolves to layer k of a larger cached image
+  // (overlap-use-mip) keeps that layer only if no later overlap candidate hands back the chosen image. Every later
+  // candidate returned {merged_id} without offsets, and the loop reset the offsets per candidate, so the page target
+  // bound layer 0 of the array: in vis-06 a 2-layer page request at layer 2 of a 7-layer array was followed by two
+  // unrelated overlapping images (seq 223456-223460). Here: a 4-layer Srgb array, an unrelated R32Uint image over
+  // its layer 2 (a later candidate in registration order), then a render target exactly at layer 2.
+  void CheckFindViewLayer() {
+    constexpr const char *name = "FindViewLayer";
+    constexpr uintptr_t base = 0x0000000208000000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x200000;
+    constexpr uint32_t width = 64, height = 64, layers = 4;
+    constexpr uint64_t layer_size = uint64_t {width} * height * 4;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10, direct_offset,
+                                                           allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+    ImageId array_id{};
+    ImageId target_id{};
+    uint32_t bound_layer = ~0u;
+    {
+      auto &resources = context;
+      LibKernel::Memory::InstallGpuResources(&resources);
+      auto &texture_cache = resources.GetTextureCache();
+      resources.MapMemory(base, allocation_size);
+      auto array = MakeLinearDesc(base, layer_size * layers, vk::Format::eB8G8R8A8Srgb,
+                                  Prospero::BufferFormat::k8_8_8_8Srgb, Prospero::ImageType::kColor2D,
+                                  {width, height, 1}, layers, 4, 1);
+      array_id = texture_cache.FindImage(array);
+      (void)texture_cache.FindTexture(array_id, array);
+      auto other = MakeLinearDesc(base + 2 * layer_size + 0x1000, 16 * 16 * 4, vk::Format::eR32Uint,
+                                  Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D, {16, 16, 1}, 1, 4,
+                                  1);
+      const auto other_id = texture_cache.FindImage(other);
+      (void)texture_cache.FindTexture(other_id, other);
+      auto target = MakeLinearDesc(base + 2 * layer_size, layer_size, vk::Format::eB8G8R8A8Srgb,
+                                   Prospero::BufferFormat::k8_8_8_8Srgb, Prospero::ImageType::kColor2D,
+                                   {width, height, 1}, 1, 4, 1);
+      target.type = BindingType::RenderTarget;
+      target.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
+      target_id = texture_cache.FindImage(target);
+      bound_layer = target.view_info.base_layer;
+      std::printf("[host]    %s: array=%u:%u other=%u:%u target=%u:%u base_layer=%u\n", name, array_id.index,
+                  array_id.generation, other_id.index, other_id.generation, target_id.index, target_id.generation,
+                  bound_layer);
+      if (target_id == array_id && bound_layer == 2) {
+        (void)texture_cache.FindRenderTarget(target_id, target);
+      }
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "direct-memory allocation release failed");
+    Require(name, "target resolves into the array", target_id == array_id,
+            "the layer-2 render target did not resolve to the array (overlap-use-mip)");
+    Require(name, "target keeps its layer", bound_layer == 2,
+            "a later overlap candidate erased the use-mip layer: the target binds layer " +
+                std::to_string(bound_layer) + " instead of 2");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   // Independent selectors keep a retirement failure from hiding a stale native-owner failure.
   void CheckImageReadbackOwnership(uint32_t scenario) {
     const bool pending_join = scenario == 0;
@@ -47810,6 +47892,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--rewind-only") == 0) {
     VulkanHarness vulkan;
     CheckPm4RewindResume(vulkan.RuntimeRenderer());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--find-view-layer-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckFindViewLayer();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-overlap-only") == 0) {

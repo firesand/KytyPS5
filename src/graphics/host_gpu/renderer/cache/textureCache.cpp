@@ -1592,15 +1592,23 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		int32_t view_layer = -1;
 		if (!result) {
 			for (const auto candidate: candidates) {
-				view_mip                = -1;
-				view_layer              = -1;
 				const auto& merged_info = result ? m_slot_images[result].info : desc.info;
 				const auto  overlap     = ResolveOverlap(merged_info, desc.type, candidate, result);
-				if (overlap.image) {
-					result     = overlap.image;
-					view_mip   = overlap.mip;
-					view_layer = overlap.layer;
+				if (!overlap.image) {
+					continue;
 				}
+				// The view offsets locate the request inside `result`. A later candidate that hands back an image with
+				// merged_info's layout (the same image as {merged_id}, or one expanded or folded from merged_info)
+				// carries no offsets and must not erase them: resetting them here made a page target that resolved to
+				// layer k of an array (overlap-use-mip) bind layer 0 whenever another image overlapped the same memory
+				// (vis-06 seq 223456-223460: a 2-layer Unorm page request at layer 2 of a 7-layer array). Offsets
+				// returned for merged_info inside a larger image compose with the ones already found.
+				if (overlap.mip >= 0 || overlap.layer >= 0) {
+					const bool nested = result && (view_mip >= 0 || view_layer >= 0);
+					view_mip   = nested ? std::max(view_mip, 0) + std::max(overlap.mip, 0) : overlap.mip;
+					view_layer = nested ? std::max(view_layer, 0) + std::max(overlap.layer, 0) : overlap.layer;
+				}
+				result = overlap.image;
 			}
 		}
 
@@ -1615,6 +1623,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				    resolved, {.request = &desc.info});
 				FreeImage(result);
 				result = {};
+			}
+			if (!result) {
+				view_mip   = -1; // the image created below is the request itself
+				view_layer = -1;
 			}
 		}
 		if (!result) {
