@@ -1149,7 +1149,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 }
 
 
-enum class PacketClass { ShRegs, CtxRegs, Work, Benign, Other };
+enum class PacketClass { ShRegs, CtxRegs, Draw, Dispatch, Benign, Other };
 
 // Classifies PM4 packets for the (b1) merge probe and KYTY_SUBMIT_AHEAD.
 static PacketClass ClassifyPacket(uint32_t opcode) {
@@ -1169,9 +1169,9 @@ static PacketClass ClassifyPacket(uint32_t opcode) {
 		case Pm4::IT_DRAW_INDEX_2:
 		case Pm4::IT_DRAW_INDEX_OFFSET_2:
 		case Pm4::IT_DRAW_INDEX_AUTO:
+		case Pm4::IT_DISPATCH_DRAW_PREAMBLE: return PacketClass::Draw;
 		case Pm4::IT_DISPATCH_DIRECT:
-		case Pm4::IT_DISPATCH_INDIRECT:
-		case Pm4::IT_DISPATCH_DRAW_PREAMBLE: return PacketClass::Work;
+		case Pm4::IT_DISPATCH_INDIRECT: return PacketClass::Dispatch;
 		// No GPU work, no side effect: per-packet state the records carry, control flow, CE/DE sync.
 		case Pm4::IT_NOP:
 		case Pm4::IT_INDIRECT_BUFFER: // control flow only; its packets are classified one by one
@@ -1196,81 +1196,40 @@ void CommandProcessor::NoteMergeOpcode(uint32_t opcode) {
 	switch (ClassifyPacket(opcode)) {
 		case PacketClass::ShRegs: probe.sh++; break;
 		case PacketClass::CtxRegs: probe.ctx++; break;
-		case PacketClass::Work: probe.draw++; break;
+		case PacketClass::Draw:
+		case PacketClass::Dispatch: probe.draw++; break;
 		case PacketClass::Benign: break;
 		case PacketClass::Other: probe.other++; break;
 	}
 }
 
 // KYTY_SUBMIT_AHEAD (submitAhead.h): before a work or side-effect packet, submit the open command
-// buffer when a learned producer was recorded into it, or when it has been recording longer than
-// the timer. Same operation as BufferFlush (submit, no wait).
+// buffer once it has been recording longer than the threshold. Same operation as BufferFlush
+// (submit, no wait).
 void CommandProcessor::SubmitAheadBeforePacket(uint32_t opcode) {
 	auto& scheduler = GetScheduler();
 	if (!scheduler.Active() || CurrentBuffer().IsInvalid()) {
 		return;
 	}
-	uint64_t producer_tick = 0;
-	if (const auto producer = m_renderer.GetRenderExecutor().ConsumeSubmitAheadProducer(producer_tick);
-	    producer != 0) {
-		m_submit_ahead.ProducerRecorded(producer_tick, producer);
-	}
-	const auto kind = ClassifyPacket(opcode);
 	using Packet    = SubmitAheadTrigger::Packet;
+	const auto kind = ClassifyPacket(opcode);
 	const auto packet = kind == PacketClass::ShRegs || kind == PacketClass::CtxRegs ? Packet::Register
 	                    : kind == PacketClass::Benign                               ? Packet::Benign
-	                                                                                : Packet::Work;
+	                    : kind == PacketClass::Draw                                 ? Packet::Draw
+	                    : kind == PacketClass::Dispatch                             ? Packet::Dispatch
+	                                                                                : Packet::Other;
+	const bool work   = packet != Packet::Register && packet != Packet::Benign;
 	const auto reason = m_submit_ahead.Before(packet, scheduler.CurrentTick(),
-	                                          packet == Packet::Work ? scheduler.OpenCommandAgeNs() : 0,
+	                                          work ? scheduler.OpenCommandAgeNs() : 0,
 	                                          CurrentBuffer().IsRendering(), SubmitAheadConfig::Get());
 	if (reason == SubmitAheadTrigger::Reason::None) {
 		return;
 	}
 	BufferFlush();
-	if (const auto producer = m_submit_ahead.Submitted(reason, scheduler.CurrentTick()); producer != 0) {
-		m_renderer.GetBufferCache().NoteSubmitAhead(producer);
-	}
-	SubmitAheadProbe::Count(reason == SubmitAheadTrigger::Reason::Producer ? SubmitAheadProbe::ProducerSubmits
-	                                                                       : SubmitAheadProbe::TimerSubmits);
-}
-
-// Called for each GPU mesh packet after it was recorded (the packet itself is one probe.draw).
-void CommandProcessor::CountMergeRun(uint64_t mesh_hash) {
-	auto&       probe = m_merge_probe;
-	const auto& vs    = m_sh_ctx.GetVs();
-	const auto& ps    = m_sh_ctx.GetPs();
-	uint64_t    user_data = 0xcbf29ce484222325ull; // FNV-1a over the GS and PS user SGPR values
-	const auto  mix = [&](uint64_t value) {
-		 user_data = (user_data ^ value) * 0x100000001b3ull;
-	};
-	for (uint32_t i = 0; i < vs.gs_user_sgpr.count && i < HW::UserSgprInfo::SGPRS_MAX; ++i) {
-		mix(vs.gs_user_sgpr.value[i]);
-	}
-	mix(UINT64_MAX);
-	for (uint32_t i = 0; i < ps.ps_user_sgpr.count && i < HW::UserSgprInfo::SGPRS_MAX; ++i) {
-		mix(ps.ps_user_sgpr.value[i]);
-	}
-	const uint64_t ps_addr = ps.ps_regs.data_addr;
-	if (probe.valid) {
-		if (probe.other != probe.at_other || probe.draw != probe.at_draw + 1u) {
-			HostReadProbe::CountGpuIndirect(HostReadProbe::MergeBreakOp);
-		} else if (mesh_hash != probe.mesh_hash || ps_addr != probe.ps_addr) {
-			HostReadProbe::CountGpuIndirect(HostReadProbe::MergeBreakShader);
-		} else if (probe.ctx != probe.at_ctx) {
-			HostReadProbe::CountGpuIndirect(HostReadProbe::MergeBreakCtx);
-		} else if (user_data != probe.user_data) {
-			HostReadProbe::CountGpuIndirect(HostReadProbe::MergeUserData);
-		} else {
-			HostReadProbe::CountGpuIndirect(HostReadProbe::MergeSame);
-		}
-	}
-	probe.valid     = true;
-	probe.mesh_hash = mesh_hash;
-	probe.ps_addr   = ps_addr;
-	probe.user_data = user_data;
-	probe.at_ctx    = probe.ctx;
-	probe.at_draw   = probe.draw;
-	probe.at_other  = probe.other;
+	m_submit_ahead.Submitted(packet, scheduler.CurrentTick());
+	SubmitAheadProbe::Count(reason == SubmitAheadTrigger::Reason::DispatchTimer
+	                            ? SubmitAheadProbe::DispatchTimerSubmits
+	                            : SubmitAheadProbe::TimerSubmits);
 }
 
 void CommandProcessor::PoisonGpuIndirectSlots(const ShaderDrawParameters& parameters,

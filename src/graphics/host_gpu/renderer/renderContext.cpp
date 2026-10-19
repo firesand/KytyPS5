@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "graphics/host_gpu/hostReadStats.h"
+#include "graphics/host_gpu/renderer/submitAhead.h"
 #include "graphics/host_gpu/renderer/hazardState.h"
 
 #include <cstdio>
@@ -314,16 +315,15 @@ struct FaultSampler {
 			}
 			if (SubmitAheadConfig::Get().Enabled()) {
 				const auto sa = SubmitAheadProbe::Take();
-				line += fmt::format(" | submit-ahead producer {} timer {} learned {} forgotten {} producers {}",
-				                    sa[SubmitAheadProbe::ProducerSubmits], sa[SubmitAheadProbe::TimerSubmits],
-				                    sa[SubmitAheadProbe::Learned], sa[SubmitAheadProbe::Forgotten],
-				                    SubmitAheadProbe::s_producers.load(std::memory_order_relaxed));
+				line += fmt::format(" | submit-ahead timer {} dispatch-timer {}",
+				                    sa[SubmitAheadProbe::TimerSubmits], sa[SubmitAheadProbe::DispatchTimerSubmits]);
 			}
 			const auto rb = ReadbackProbe::Take();
-			line += " | readbacks bar/copy:";
+			line += " | readbacks bar/open/inflight/other:";
 			for (uint32_t r = 0; r < WaitReasonProbe::ReasonCount; ++r) {
-				if (rb[r][0] + rb[r][1] != 0) {
-					line += fmt::format(" {} {}/{}", WaitReasonProbe::Name(r), rb[r][0], rb[r][1]);
+				const auto& k = rb[r];
+				if (k[0] + k[1] + k[2] + k[3] != 0) {
+					line += fmt::format(" {} {}/{}/{}/{}", WaitReasonProbe::Name(r), k[0], k[1], k[2], k[3]);
 				}
 			}
 		}
