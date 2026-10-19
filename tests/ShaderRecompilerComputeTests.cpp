@@ -46521,6 +46521,7 @@ void CheckPm4SubmitAhead(RenderContext &renderer) {
   }
   using Probe = Libs::Graphics::SubmitAheadProbe;
   auto &scheduler = renderer.GetCommandScheduler();
+  processor.BufferInit(); // the GPU thread binds the scheduler before each submission
   (void)Probe::Take();
   const auto tick_before = scheduler.CurrentTick();
   Pm4Execution execution;
@@ -46534,6 +46535,7 @@ void CheckPm4SubmitAhead(RenderContext &renderer) {
   }
   Require(name, "submitted ahead", submits[Probe::TimerSubmits] >= 1 && ticks >= submits[Probe::TimerSubmits],
           "no submit-ahead happened in ProcessPm4 (or the scheduler tick did not advance)");
+  scheduler.Finish();
   std::printf("[host]    %-32s ok (%llu timer submits, %llu ticks)\n", name,
               static_cast<unsigned long long>(submits[Probe::TimerSubmits]),
               static_cast<unsigned long long>(ticks));
