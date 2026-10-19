@@ -46500,6 +46500,45 @@ void CheckPm4ContextStateOperations(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4ContextState");
 }
 
+// KYTY_SUBMIT_AHEAD through CommandProcessor::ProcessPm4 (--submit-ahead-only sets a 1 us timer):
+// a stream of side-effect packets (WRITE_DATA) must be submitted ahead at least once, with every
+// write landing. The stress pass reruns it under KYTY_LAZY_BARRIERS=0/1 and KYTY_SYNC_PAGE_DRIVEN=0/1.
+void CheckPm4SubmitAhead(RenderContext &renderer) {
+  constexpr const char *name = "Pm4SubmitAhead";
+  const auto &config = Libs::Graphics::SubmitAheadConfig::Get();
+  if (config.timer_ns == 0 || config.timer_ns > 100000u) {
+    std::printf("[host]    %-32s SKIP needs KYTY_SUBMIT_AHEAD=t with KYTY_SUBMIT_AHEAD_MS <= 0.1\n", name);
+    return;
+  }
+  GraphicsInitJmpTables();
+  CommandProcessor processor(renderer, 0);
+  std::array<uint32_t, 6> values{};
+  std::vector<uint32_t> commands;
+  for (uint32_t i = 0; i < values.size(); ++i) {
+    const auto address = reinterpret_cast<uint64_t>(&values[i]);
+    commands.insert(commands.end(), {KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0), 0, static_cast<uint32_t>(address),
+                                     static_cast<uint32_t>(address >> 32u), 0x100u + i});
+  }
+  using Probe = Libs::Graphics::SubmitAheadProbe;
+  auto &scheduler = renderer.GetCommandScheduler();
+  (void)Probe::Take();
+  const auto tick_before = scheduler.CurrentTick();
+  Pm4Execution execution;
+  Require(name, "stream completes",
+          processor.Process(execution, {commands.data(), commands.size()}) == Pm4ProcessResult::Complete,
+          "the WRITE_DATA stream did not complete");
+  const auto submits = Probe::Take();
+  const auto ticks = scheduler.CurrentTick() - tick_before;
+  for (uint32_t i = 0; i < values.size(); ++i) {
+    Require(name, "writes landed", values[i] == 0x100u + i, "a WRITE_DATA around a submit-ahead was lost");
+  }
+  Require(name, "submitted ahead", submits[Probe::TimerSubmits] >= 1 && ticks >= submits[Probe::TimerSubmits],
+          "no submit-ahead happened in ProcessPm4 (or the scheduler tick did not advance)");
+  std::printf("[host]    %-32s ok (%llu timer submits, %llu ticks)\n", name,
+              static_cast<unsigned long long>(submits[Probe::TimerSubmits]),
+              static_cast<unsigned long long>(ticks));
+}
+
 void CheckPm4IndirectControlFlow(RenderContext &renderer) {
   constexpr const char *name = "Pm4IndirectControlFlow";
   GraphicsInitJmpTables();
@@ -47752,10 +47791,14 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--submit-ahead-only") == 0) {
-    setenv("KYTY_PROBE_FAULT_HISTOGRAM", "1", 0); // an explicit value from the caller wins
+    // Explicit values from the caller win.
+    setenv("KYTY_PROBE_FAULT_HISTOGRAM", "1", 0);
+    setenv("KYTY_SUBMIT_AHEAD", "t", 0);
+    setenv("KYTY_SUBMIT_AHEAD_MS", "0.001", 0);
     CheckSubmitAheadLogic();
     VulkanHarness vulkan;
     vulkan.CheckReadbackClassification();
+    CheckPm4SubmitAhead(vulkan.RuntimeRenderer());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--depth-feedback-only") == 0) {
