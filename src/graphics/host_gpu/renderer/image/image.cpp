@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <fmt/format.h>
 #include <xxhash.h>
+#include <xxh_x86dispatch.h> // XXH3_64bits -> runtime-dispatched AVX2/AVX512 variant
 
 namespace Libs::Graphics {
 

@@ -135,6 +135,10 @@ add_subdirectory(SPIRV-Tools)
 add_library(spirv-tools ALIAS SPIRV-Tools-static)
 add_library(spirv-tools-opt ALIAS SPIRV-Tools-opt)
 
+# Runtime CPU dispatch for XXH3 (xxh_x86dispatch.c): the library is otherwise built for baseline x86-64, so long inputs
+# take the SSE2 path. XXH3 hashing of 4 KiB tracker pages in SyncCpuWrites was 16 % of the GPU thread in ng-173 (SSE2).
+# Hash values are identical on every path (XXH3 is defined independent of the vector unit).
+set(DISPATCH ON)
 add_subdirectory(xxHash/build/cmake)
 
 set(FMT_DOC OFF CACHE BOOL "" FORCE)
