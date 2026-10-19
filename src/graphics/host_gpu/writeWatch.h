@@ -49,6 +49,7 @@ public:
 		uint64_t walked = 0; // bytes handed to PAGEMAP_SCAN (a re-walk after a full vector counts again)
 		uint64_t ranges = 0; // merged ranges scanned (CollectRanges, CollectLabels)
 		uint64_t pages  = 0; // written pages reported
+		uint64_t requested = 0; // CollectRanges: bytes of the ranges asked for, before merging
 	};
 
 	struct Stats {
@@ -71,6 +72,10 @@ public:
 		uint64_t label_scanned   = 0; // the report-only scan found the page written
 		uint64_t label_raced     = 0; // a label scan overlapped the check
 		uint64_t label_set       = 0; // label pages known (gauge, bounded)
+		uint64_t label_evicted   = 0; // "consumed" mode: least recently checked labels dropped
+		uint64_t apply_waits     = 0; // WaitForOtherApplies calls that had to wait
+		uint64_t apply_timeouts  = 0; // ... that gave up after 50 ms
+		bool     label_consumed  = false; // the label mode (KYTY_WRITE_WATCH_LABELS)
 	};
 
 	// The process-wide instance, or nullptr when write-watch is off: KYTY_WRITE_WATCH unset, a
@@ -116,18 +121,49 @@ public:
 	// watcher would have applied). Label pages it re-protects are still flagged. Any thread.
 	void Rearm(uint64_t vaddr, uint64_t size) noexcept;
 
-	// Acquire points (WAIT_REG_MEM, COND_EXEC, ...). A label page is re-protected by every Collect
-	// that covers it and by CollectLabels; WasLabelWritten(page) is then true iff the page was
-	// written after that collection, or the page is unknown or uncovered (conservative). Pages
-	// seen for the first time join the label set (bounded). Any thread.
+	// Acquire points (WAIT_REG_MEM, COND_EXEC, ...): true when the label page may have been written
+	// after the last full collection began (CollectLabels, then the span pass), so the data it
+	// releases may be uncollected. Any thread. Two modes (KYTY_WRITE_WATCH_LABELS):
+	// - "consumed" (default): every scan records the pages it reported (re-protected) in a set,
+	//   cleared after the label pass of each full collection. The answer is "written" when the page
+	//   is in that set, its kernel bit is set, or it is outside every registered view. Any page can
+	//   be checked; the label set (bounded, least recently checked evicted) only picks the pages the
+	//   label pass re-protects first, so a written label costs one full collection, not two.
+	// - "set": only pages in the label set (first come, at most 4096, never evicted) are tracked;
+	//   any other page always counts as written. ng-180: the set was full and all 210 acquire
+	//   collections per 3.5 s came from such "unknown" pages. (Since the consumed mode, a view
+	//   registration also flags set labels inside the view in this mode.)
 	[[nodiscard]] bool WasLabelWritten(uint64_t vaddr, uint64_t size) noexcept;
-	// Collects every known label page (call first in a full collection; same result contract).
-	// Label pages closer than 8 MiB are scanned as one range, so the pass may also report other
-	// written pages; the caller applies them like any collected run.
+	// Collects every label-set page (call first in a full collection; same result contract) and
+	// starts a new label epoch. Label pages closer than 8 MiB are scanned as one range, so the pass
+	// may also report other written pages; the caller applies them like any collected run.
 	void CollectLabels(const RunFunc& func) noexcept;
 
 	// PageManager: pages that gained their first write watcher inside a PrearmScope, not re-armed.
 	static void NoteRearmSkipped(uint64_t pages) noexcept;
+
+	// Keeps a collection "in flight" from its start until its writes are applied: a scan can
+	// consume kernel bits of writes its caller applies later. Collect, CollectRanges and
+	// CollectLabels hold one around their func calls; a caller that applies after Collect returns
+	// (BufferCache's marking-window check) holds its own around both. No-op for a null WriteWatch.
+	class ApplyScope final {
+	public:
+		explicit ApplyScope(WriteWatch* write_watch) noexcept;
+		~ApplyScope();
+		KYTY_CLASS_NO_COPY(ApplyScope);
+
+	private:
+		WriteWatch* m_write_watch = nullptr;
+		uint32_t    m_bucket      = 0;
+	};
+
+	// Another thread holds an ApplyScope. Any thread.
+	[[nodiscard]] bool OtherAppliesInFlight() const noexcept;
+	// Waits (at most 50 ms) for the ApplyScopes other threads opened before this call; scopes opened
+	// later go to the other of two counters, so back-to-back collections cannot starve the wait.
+	// False on a timeout (logged), or when called inside a scope of this thread with others in
+	// flight. One waiter at a time (the GPU thread: full collections at acquires and stream starts).
+	bool WaitForOtherApplies() noexcept;
 
 	static Stats TakeStats() noexcept;
 
@@ -159,15 +195,22 @@ private:
 
 	struct Label {
 		uint64_t page    = 0;
-		bool     written = false; // a Collect re-protected the page after a write to it
+		bool     written = false; // "set" mode: a Collect re-protected the page after a write to it
+		uint64_t seen    = 0;     // last check (m_label_clock), for eviction in "consumed" mode
 	};
 	std::mutex         m_labels_mutex;
 	std::vector<Label> m_labels; // sorted by page
 	std::atomic<bool>  m_has_labels {false};
+	uint64_t           m_label_clock = 0;
+	// "consumed" mode: pages any scan reported since the last label pass (m_labels_mutex).
+	RangeSet m_consumed;
 	// Seqlock between scans that re-protect label pages and WasLabelWritten: a scan re-protects a
 	// label page before it can flag it, so a check overlapping such a scan answers "written".
 	std::atomic<uint32_t> m_label_scans_active {0};
 	std::atomic<uint64_t> m_label_scan_seq {0};
+	// Open ApplyScopes, all threads, in two counters chosen by m_apply_epoch's low bit at opening.
+	std::atomic<uint32_t>                m_apply_epoch {0};
+	std::array<std::atomic<uint32_t>, 2> m_applies_in_flight {};
 };
 
 } // namespace Libs::Graphics

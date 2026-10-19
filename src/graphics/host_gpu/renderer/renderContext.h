@@ -131,6 +131,9 @@ private:
 	void                      NoteWaitPass();
 	std::atomic<uint64_t>     m_guest_submits {1};
 	uint64_t                  m_collected_submits = 0;
+	// Kernel write-watch: a wait for other threads' collections timed out; the next acquire
+	// collects and starts a BDA epoch anyway (NoteGuestAcquire).
+	bool                      m_apply_wait_timed_out = false;
 	uint64_t                  m_bda_sync_epoch    = 1;
 	uint64_t                  m_bda_synced_epoch  = 0;
 	bool                      m_wait_pass_pending = false; // a passing wait bumped a consumed epoch

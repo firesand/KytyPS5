@@ -1105,7 +1105,9 @@ void BufferCache::MarkPagesWritten(const uint64_t* encoded, uint32_t count) {
 		}
 		return;
 	}
-	RangeSet pages;
+	// The verify step below collects and applies after the Collect returns: in flight until then.
+	WriteWatch::ApplyScope applying(WriteWatch::Get());
+	RangeSet               pages;
 	for (uint32_t index = 0; index < count; ++index) {
 		pages.Add(GuestAddress(encoded[index]), WRITE_FAULT_PAGESIZE);
 	}
@@ -1186,6 +1188,8 @@ std::vector<BufferCache::PendingCpuWrite> BufferCache::TakePendingCpuWrites() {
 }
 
 void BufferCache::MarkPageWritten(uint64_t vaddr) {
+	// The verify step collects and applies after the Collect returns: in flight until then.
+	WriteWatch::ApplyScope applying(WriteWatch::Get());
 	// A CPU write the kernel recorded but nobody collected yet must win, as a faulted one does.
 	CollectCpuWritesInline(vaddr, WRITE_FAULT_PAGESIZE);
 	if (m_memory_tracker.TryMarkRegionAsGpuModified(vaddr, WRITE_FAULT_PAGESIZE)) {

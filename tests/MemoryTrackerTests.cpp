@@ -1943,6 +1943,81 @@ void TestWriteWatchLabelPassMergesRanges() {
   UnmapWriteWatchView(view);
 }
 
+// "consumed" label mode (the default): any page can be checked, in the bounded label set or not.
+// ng-180: the set was full and every page outside it counted as written (210 full collections per
+// 3.5 s). A page no scan re-protected since the last label pass, with its kernel bit clear, was not
+// written since; a label write a scan consumed keeps counting until the next label pass.
+void TestWriteWatchLabelsWithoutSet() {
+  auto *write_watch = WriteWatch::Get();
+  constexpr uint64_t page = TRACKER_PAGE_SIZE;
+  auto view = MapWriteWatchView(8);
+  const auto label = view.Address() + 5 * page + 16;
+  Check(write_watch->WasLabelWritten(label, 8), "a label in a freshly armed view must count as written");
+  write_watch->CollectLabels([](uint64_t, uint64_t) {});
+  // Fill the label set past its bound with pages outside every view (they count as written).
+  for (uint64_t i = 0; i < 4200; i++) {
+    (void)write_watch->WasLabelWritten(0x7f0000000000ull + i * page, 8);
+  }
+  (void)WriteWatch::TakeStats();
+  Check(!write_watch->WasLabelWritten(label, 8),
+        "an unwritten page counted as written because the label set was full");
+  *reinterpret_cast<volatile uint64_t *>(label) = 1;
+  Check(write_watch->WasLabelWritten(label, 8), "a label write was missed");
+  write_watch->Collect(view.Address(), view.size, [](uint64_t, uint64_t) {}); // consumes the write
+  Check(write_watch->WasLabelWritten(label, 8), "a label write consumed by a scan was missed");
+  write_watch->CollectLabels([](uint64_t, uint64_t) {});
+  Check(!write_watch->WasLabelWritten(label, 8), "the label pass did not start a new label epoch");
+  // label_evicted counts from the TakeStats above: re-inserting the label evicted one entry.
+  const auto stats = WriteWatch::TakeStats();
+  Check(stats.label_consumed && stats.label_set == 4096 && stats.label_evicted >= 1 &&
+            stats.label_unknown == 0,
+        "the label set did not stay bounded by eviction, or a page counted as unknown");
+  UnmapWriteWatchView(view);
+  Check(write_watch->WasLabelWritten(label, 8), "a label in an unregistered range must count as written");
+}
+
+// A collection on another thread counts as in flight until its results are applied; acquire points
+// wait for it (the kernel bits it consumed are only in its pending applies). A thread's own
+// collection does not count.
+void TestWriteWatchOtherAppliesInFlight() {
+  auto *write_watch = WriteWatch::Get();
+  constexpr uint64_t page = TRACKER_PAGE_SIZE;
+  auto view = MapWriteWatchView(4);
+  view.memory[page] = 1;
+  std::atomic<bool> in_func{false};
+  std::atomic<bool> release{false};
+  bool own_in_flight = true;
+  std::thread worker([&] {
+    write_watch->Collect(view.Address(), view.size, [&](uint64_t, uint64_t) {
+      own_in_flight = write_watch->OtherAppliesInFlight();
+      in_func = true;
+      while (!release) {
+        std::this_thread::yield();
+      }
+    });
+  });
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!in_func) {
+    if (std::chrono::steady_clock::now() > deadline) {
+      release = true;
+      worker.join();
+      Check(false, "the other thread's collection reported no write");
+    }
+    std::this_thread::yield();
+  }
+  Check(!own_in_flight, "a thread's own collection counted as another thread's");
+  Check(write_watch->OtherAppliesInFlight(), "a collection still applying was not in flight");
+  std::thread releaser([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    release = true;
+  });
+  Check(write_watch->WaitForOtherApplies() && !write_watch->OtherAppliesInFlight(),
+        "waiting did not see the other thread's apply finish");
+  worker.join();
+  releaser.join();
+  UnmapWriteWatchView(view);
+}
+
 // A BDA sync's batch: one pass over the regions it is about to upload (PrearmWrittenPages), then
 // uploads inside a PrearmScope re-arm nothing of their own. A CPU-dirty page's write before the
 // pass is the upload's to copy, a watched page's write is collected by the pass, and a write after
@@ -2003,6 +2078,7 @@ void TestWriteWatchPrearmedUpload() {
 
 void RunWriteWatchCases() {
   setenv("KYTY_WRITE_WATCH", "1", 1);
+  setenv("KYTY_WRITE_WATCH_LABELS", "consumed", 1); // the cases below expect the default mode
   if (WriteWatch::Get() == nullptr) {
     std::puts("MemoryTrackerTests: write-watch cases skipped (no userfaultfd WP_ASYNC / PAGEMAP_SCAN)");
     std::exit(0);
@@ -2016,6 +2092,8 @@ void RunWriteWatchCases() {
   TestWriteWatchFullCollectionCrossesPlaceholders();
   TestWriteWatchLabels();
   TestWriteWatchLabelPassMergesRanges();
+  TestWriteWatchLabelsWithoutSet();
+  TestWriteWatchOtherAppliesInFlight();
   TestWriteWatchPrearmedUpload();
   std::puts("MemoryTrackerTests: write-watch cases passed");
   std::exit(0);
