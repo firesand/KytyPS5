@@ -1238,6 +1238,45 @@ void CommandProcessor::SubmitAheadBeforePacket(uint32_t opcode) {
 	                            : SubmitAheadProbe::TimerSubmits);
 }
 
+// Called for each GPU mesh packet after it was recorded (the packet itself is one probe.draw).
+void CommandProcessor::CountMergeRun(uint64_t mesh_hash) {
+	auto&       probe = m_merge_probe;
+	const auto& vs    = m_sh_ctx.GetVs();
+	const auto& ps    = m_sh_ctx.GetPs();
+	uint64_t    user_data = 0xcbf29ce484222325ull; // FNV-1a over the GS and PS user SGPR values
+	const auto  mix = [&](uint64_t value) {
+		 user_data = (user_data ^ value) * 0x100000001b3ull;
+	};
+	for (uint32_t i = 0; i < vs.gs_user_sgpr.count && i < HW::UserSgprInfo::SGPRS_MAX; ++i) {
+		mix(vs.gs_user_sgpr.value[i]);
+	}
+	mix(UINT64_MAX);
+	for (uint32_t i = 0; i < ps.ps_user_sgpr.count && i < HW::UserSgprInfo::SGPRS_MAX; ++i) {
+		mix(ps.ps_user_sgpr.value[i]);
+	}
+	const uint64_t ps_addr = ps.ps_regs.data_addr;
+	if (probe.valid) {
+		if (probe.other != probe.at_other || probe.draw != probe.at_draw + 1u) {
+			HostReadProbe::CountGpuIndirect(HostReadProbe::MergeBreakOp);
+		} else if (mesh_hash != probe.mesh_hash || ps_addr != probe.ps_addr) {
+			HostReadProbe::CountGpuIndirect(HostReadProbe::MergeBreakShader);
+		} else if (probe.ctx != probe.at_ctx) {
+			HostReadProbe::CountGpuIndirect(HostReadProbe::MergeBreakCtx);
+		} else if (user_data != probe.user_data) {
+			HostReadProbe::CountGpuIndirect(HostReadProbe::MergeUserData);
+		} else {
+			HostReadProbe::CountGpuIndirect(HostReadProbe::MergeSame);
+		}
+	}
+	probe.valid     = true;
+	probe.mesh_hash = mesh_hash;
+	probe.ps_addr   = ps_addr;
+	probe.user_data = user_data;
+	probe.at_ctx    = probe.ctx;
+	probe.at_draw   = probe.draw;
+	probe.at_other  = probe.other;
+}
+
 void CommandProcessor::PoisonGpuIndirectSlots(const ShaderDrawParameters& parameters,
                                               uint64_t last_record_addr, bool indexed) {
 	const auto poison = [&](uint32_t slot, uint32_t field) {
