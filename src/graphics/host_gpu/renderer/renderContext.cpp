@@ -12,6 +12,7 @@
 #include <vector>
 #include <string>
 #include <atomic>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 
@@ -576,7 +577,10 @@ void RenderContext::NoteGuestAcquire(uint64_t label_vaddr, uint64_t label_size) 
 		// and every CPU write made before it, preceded that collection.
 		if (write_watch->WasLabelWritten(label_vaddr, label_size)) {
 			g_ww_acquire_collects.fetch_add(1, std::memory_order_relaxed);
-			new_cpu_data = CollectCpuWrites() != 0;
+			// Also data collected earlier that no BDA sync took yet: a sync's pre-arm pass, an
+			// inline collection on another thread or a replayed GPU-dirty part may have consumed
+			// the kernel bits of writes this label releases.
+			new_cpu_data = CollectCpuWrites() != 0 || m_buffer_cache.HasBdaSyncPending();
 		}
 	}
 	NoteWaitPass();
@@ -644,12 +648,34 @@ void RenderContext::SyncCpuWrites() {
 		// Only regions with new CPU-dirty pages (and regions holding hot pages), clipped to mapped
 		// memory: cached buffers can extend past the mapping and unmapped pages must not be read.
 		const bool include_hot = std::exchange(m_sync_hot_regions_pending, false);
-		m_buffer_cache.ForEachBdaSyncPendingRegion(include_hot, [this](uint64_t vaddr, uint64_t size) {
-			SyncProbe::NoteRegion();
-			m_mapped_ranges.ForEachInRange(vaddr, size, [this](uint64_t start, uint64_t end) {
-				m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-			});
+		std::vector<std::pair<uint64_t, uint64_t>> regions;
+		m_buffer_cache.ForEachBdaSyncPendingRegion(include_hot, [&regions](uint64_t vaddr, uint64_t size) {
+			regions.emplace_back(vaddr, vaddr + size);
 		});
+		// Kernel write-watch: one pass re-protects the regions before any of their pages is cleared
+		// for upload, instead of a re-arm per uploaded run (ng-168: about 2,000 per sync, 40k/s).
+		// A write after the pass comes back at the next collection, like a write after the
+		// per-run re-arm (PageManager::PrearmScope). The pass also collects the writes made since
+		// the last collection, inside these regions and in the gaps it merged across: the regions
+		// they flagged join this sync, so the pass never hides data from a later acquire's
+		// collection. GPU-dirty parts are replayed later and flag their regions then
+		// (NoteGuestAcquire).
+		std::optional<PageManager::PrearmScope> prearm;
+		if (WriteWatch::Get() != nullptr && !regions.empty()) {
+			prearm.emplace(m_buffer_cache.PrearmCpuWrites(regions));
+			m_buffer_cache.ForEachBdaSyncPendingRegion(false, [&regions](uint64_t vaddr, uint64_t size) {
+				regions.emplace_back(vaddr, vaddr + size);
+			});
+			std::sort(regions.begin(), regions.end());
+			regions.erase(std::unique(regions.begin(), regions.end()), regions.end());
+		}
+		for (const auto& [region_start, region_end]: regions) {
+			SyncProbe::NoteRegion();
+			m_mapped_ranges.ForEachInRange(region_start, region_end - region_start,
+			                               [this](uint64_t start, uint64_t end) {
+				                               m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+			                               });
+		}
 	}
 	m_buffer_cache.EndUploadBatch();
 	if (wait_pass) {

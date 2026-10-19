@@ -1157,6 +1157,15 @@ void BufferCache::CollectCpuWritesInline(uint64_t vaddr, uint64_t size) {
 	    vaddr, size, [this](uint64_t start, uint64_t bytes) { CollectCpuWritesApply(start, bytes); });
 }
 
+std::vector<std::pair<uint64_t, uint64_t>> BufferCache::PrearmCpuWrites(
+    std::vector<std::pair<uint64_t, uint64_t>> ranges) {
+	std::vector<std::pair<uint64_t, uint64_t>> scanned;
+	m_memory_tracker.PrearmWrittenPages(
+	    std::move(ranges), [this](uint64_t start, uint64_t bytes) { CollectCpuWritesApply(start, bytes); },
+	    &scanned);
+	return scanned;
+}
+
 void BufferCache::CollectCpuWritesApply(uint64_t vaddr, uint64_t size) {
 	const auto queue = [this](uint64_t address, uint64_t length, bool texture_only) {
 		std::lock_guard lock(m_pending_cpu_writes_mutex);

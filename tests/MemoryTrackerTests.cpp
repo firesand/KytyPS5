@@ -1943,6 +1943,64 @@ void TestWriteWatchLabelPassMergesRanges() {
   UnmapWriteWatchView(view);
 }
 
+// A BDA sync's batch: one pass over the regions it is about to upload (PrearmWrittenPages), then
+// uploads inside a PrearmScope re-arm nothing of their own. A CPU-dirty page's write before the
+// pass is the upload's to copy, a watched page's write is collected by the pass, and a write after
+// the pass comes back at the next collection.
+void TestWriteWatchPrearmedUpload() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  constexpr uint64_t page = TRACKER_PAGE_SIZE;
+  auto view = MapWriteWatchView(8);
+  const auto address = view.Address();
+  UploadAll(tracker, address, view.size);
+  view.memory[2 * page] = 1;
+  Check(CollectAndApply(tracker, address, view.size) == 1, "first write was not collected");
+  view.memory[2 * page + 8] = 2; // CPU-dirty page written again: the upload copies it
+  view.memory[5 * page] = 3;     // watched page: the pass must collect it
+  (void)WriteWatch::TakeStats();
+  std::vector<std::pair<uint64_t, uint64_t>> scanned;
+  uint64_t collected = 0;
+  tracker.PrearmWrittenPages(
+      {{address, address + view.size}},
+      [&](uint64_t start, uint64_t bytes) {
+        collected += bytes / page;
+        tracker.InvalidateWriteFault(start, bytes, [] { Check(false, "unexpected GPU download"); });
+      },
+      &scanned);
+  Check(collected == 1 && tracker.IsRegionCpuModified(address + 5 * page, page),
+        "the pre-arm pass did not collect exactly the watched page's write");
+  Check(scanned.size() == 1 && scanned[0].first <= address && address + view.size <= scanned[0].second,
+        "the pre-arm pass did not return the range it covered");
+  bool wrote = false;
+  {
+    PageManager::PrearmScope scope(std::move(scanned));
+    tracker.ForEachUploadRange(
+        address, view.size, false,
+        [&](uint64_t start, uint64_t bytes, const void *) noexcept {
+          if (start <= address + 5 * page && address + 5 * page < start + bytes) {
+            view.memory[5 * page + 8] = 4; // after the pass, while the upload runs
+            wrote = true;
+          }
+        },
+        []() noexcept {});
+  }
+  Check(wrote && !tracker.IsRegionCpuModified(address, view.size),
+        "the upload did not consume the dirty pages");
+  const auto stats = WriteWatch::TakeStats();
+  Check(stats.rearms == 0 && stats.rearm_skipped == 2,
+        "uploads inside a pre-arm scope re-armed their pages one by one");
+  Check(CollectAndApply(tracker, address, view.size) == 1 &&
+            tracker.IsRegionCpuModified(address + 5 * page, page) &&
+            !tracker.IsRegionCpuModified(address + 2 * page, page),
+        "a write before the pass came back, or the write after it was lost");
+  // Outside a scope, a page gaining its first watcher is re-armed again.
+  UploadAll(tracker, address, view.size);
+  Check(WriteWatch::TakeStats().rearms == 1, "an upload outside the scope did not re-arm");
+  tracker.UntrackMemory(address, view.size);
+  UnmapWriteWatchView(view);
+}
+
 void RunWriteWatchCases() {
   setenv("KYTY_WRITE_WATCH", "1", 1);
   if (WriteWatch::Get() == nullptr) {
@@ -1958,6 +2016,7 @@ void RunWriteWatchCases() {
   TestWriteWatchFullCollectionCrossesPlaceholders();
   TestWriteWatchLabels();
   TestWriteWatchLabelPassMergesRanges();
+  TestWriteWatchPrearmedUpload();
   std::puts("MemoryTrackerTests: write-watch cases passed");
   std::exit(0);
 }
