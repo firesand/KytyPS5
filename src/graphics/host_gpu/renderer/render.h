@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -129,6 +130,7 @@ public:
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
+	[[nodiscard]] bool IsRendering() const noexcept { return m_rendering; }
 
 	// Handle() is the funnel for every consumer that records commands the hazard tracker does not
 	// know about (uploads, copies, image transitions, readbacks): under KYTY_LAZY_BARRIERS it first
@@ -193,11 +195,25 @@ public:
 	// tessellation shaders, quad lists, 8-bit indices, custom primitive-restart values).
 	// `parameters` names the user-data slots the packet patches; a vertex shader whose resource plan
 	// evaluates one of them on the host (or one not compiled yet) keeps the host path (Srt).
-	enum class GpuIndirectBlock { None, Mesh, Srt, Other };
+	// MeshDenied / Denied: the bisection hash lists (gpuIndirectFilter.h) keep the program on the
+	// host path. MeshCountAddr: the pass-through task shader reads `draw_count` records and cannot
+	// honour a GPU count dword. MeshPrim: an input primitive type the task shader's group formula
+	// does not cover. `shader` (optional) receives the bound vertex-stage facts for the caller's log.
+	enum class GpuIndirectBlock { None, Mesh, MeshDenied, MeshCountAddr, MeshPrim, Denied, Srt, Other };
+	struct GpuIndirectShaderInfo {
+		bool     known       = false; // a valid vertex-stage shader is bound
+		bool     mesh        = false;
+		uint64_t hash        = 0;     // VertexShaderIsMesh's hash (ES / front half)
+		uint32_t fast_launch = 0;
+		uint32_t primitive   = 0;
+		uint32_t ge_primitive_group_size = 0;
+	};
 	[[nodiscard]] bool CanDrawIndirectOnGpu(CommandBuffer& buffer, bool indexed,
 	                                        uint32_t index_type_and_size, uint32_t draw_count,
 	                                        const ShaderDrawParameters& parameters,
-	                                        GpuIndirectBlock* block = nullptr);
+	                                        GpuIndirectBlock* block = nullptr,
+	                                        GpuIndirectShaderInfo* shader = nullptr,
+	                                        bool has_count_addr = false);
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	void                           FindBuffers(std::span<PreparedBindings* const> stages);
@@ -256,7 +272,24 @@ private:
 	                                              CommandBuffer& command, uint32_t group_x,
 	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
 
+	// KYTY_SUBMIT_AHEAD: the learned producer dispatch recorded last (0 = none), taken once by the
+	// command processor, which submits before its next work packet.
+	[[nodiscard]] uint64_t ConsumeSubmitAheadProducer(uint64_t& tick) noexcept {
+		const auto producer      = m_submit_ahead_producer;
+		tick                     = m_submit_ahead_tick;
+		m_submit_ahead_producer = 0;
+		return producer;
+	}
+
+	// Device address of the task shader's MeshTaskCounters (KYTY_PROBE_FAULT_HISTOGRAM only,
+	// else 0); adds what the GPU counted since the previous call to the HostReadProbe counters.
+	[[nodiscard]] uint64_t TaskCountersAddress();
+
 	RenderContext&                        m_context;
+	std::unique_ptr<Buffer>               m_task_counters;
+	std::array<uint32_t, 2>               m_task_counters_seen {};
+	uint64_t                              m_submit_ahead_producer = 0;
+	uint64_t                              m_submit_ahead_tick     = 0; // command buffer it was recorded in
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;

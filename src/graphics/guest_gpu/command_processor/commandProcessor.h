@@ -5,7 +5,9 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/submitAhead.h"
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <span>
@@ -205,6 +207,37 @@ private:
 	uint64_t         m_dispatch_indirect_args_base_addr = 0;
 	// Persistent draw state: indirect draws update it for subsequent draws.
 	uint32_t m_num_instances = 1;
+
+	// KYTY_CP_GPU_INDIRECT divergence tracking (counters only). The host path leaves the last
+	// record's offsets in the packet's GS user SGPRs and its instance count in m_num_instances; a
+	// GPU packet changes neither. A slot stays poisoned until the next write to that SGPR.
+	struct StaleSgprPoison {
+		bool     active      = false;
+		uint32_t writes      = 0; // HW::Shader::GsUserSgprWrites at the packet
+		uint64_t record_addr = 0; // last argument record the packet could read
+		uint32_t field       = 0; // dword of the record the host path would have written
+	};
+	std::array<StaleSgprPoison, HW::UserSgprInfo::SGPRS_MAX> m_sgpr_poison {};
+	bool m_any_sgpr_poison       = false;
+	bool m_num_instances_stale   = false; // a GPU packet ran since the last host write
+	void PoisonGpuIndirectSlots(const ShaderDrawParameters& parameters, uint64_t last_record_addr,
+	                            bool indexed);
+
+	// KYTY_CP_GPU_INDIRECT (b1) diagnostics: running packet counts by class and the state at the
+	// last GPU mesh packet (HostReadProbe Merge* counters).
+	struct MergeProbe {
+		uint64_t ctx = 0, sh = 0, draw = 0, other = 0;
+		bool     valid     = false;
+		uint64_t mesh_hash = 0, ps_addr = 0, user_data = 0;
+		uint64_t at_ctx = 0, at_draw = 0, at_other = 0;
+	};
+	MergeProbe m_merge_probe;
+	void NoteMergeOpcode(uint32_t opcode);
+	void CountMergeRun(uint64_t mesh_hash);
+	// KYTY_SUBMIT_AHEAD (submitAhead.h).
+	SubmitAheadTrigger m_submit_ahead;
+	void SubmitAheadBeforePacket(uint32_t opcode);
+	void CountStaleDrawState(bool instances_from_state, const GpuIndirectDraw* gpu_indirect);
 
 	uint32_t m_de_count    = 0;
 	uint32_t m_ce_count    = 0;

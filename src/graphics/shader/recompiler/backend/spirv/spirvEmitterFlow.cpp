@@ -684,22 +684,37 @@ uint32_t EmitLaneId(EmitterState& state) {
 	           : EmitSubgroupLocalInvocationId(state);
 }
 
+// Loads dword `field` of the pass-through task shader's payload {vertex_count, first_vertex,
+// first_instance, draw_id} (pass_through_task.task, DefineInputs).
+static uint32_t EmitTaskPayloadLoad(EmitterState& state, uint32_t field) {
+	const auto pointer = state.builder.AllocateId();
+	const auto result  = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    spv::OpAccessChain,
+	    TypePointer(state, spv::StorageClassTaskPayloadWorkgroupEXT, TypeU32(state)), pointer,
+	    state.task_payload_variable, ConstantU32(state, field));
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), result, pointer);
+	return result;
+}
+
 uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state  = ctx.state;
-	const auto result = state.builder.AllocateId();
 	const auto index  = inst.Arg(0).U32();
 	if (state.program.stage != ShaderType::Mesh || index >= IR::PushData::MeshDrawDwordCount) {
 		ctx.Fail(inst, "invalid mesh draw parameter");
 	}
-	if (state.task_payload_variable != 0 && index < 3) {
-		const auto pointer = state.builder.AllocateId();
-		state.builder.AddFunction(
-		    spv::OpAccessChain,
-		    TypePointer(state, spv::StorageClassTaskPayloadWorkgroupEXT, TypeU32(state)), pointer,
-		    state.task_payload_variable, ConstantU32(state, index));
-		state.builder.AddFunction(spv::OpLoad, TypeU32(state), result, pointer);
-		return result;
+	if (state.task_payload_variable != 0) {
+		// Pass-through task shader (GPU indirect): dword 0 is the record's vertex count. The host
+		// path draws indirect mesh records with first vertex / instance 0 in dwords 1-2 (the mesh
+		// program adds the patched offset SGPRs itself, which EmitGetUserData serves from the
+		// payload here) and never indexed, so dwords 1-5 are 0. They must not come from push
+		// constants: the task shader's push block occupies dwords 0-5.
+		if (index != 0) {
+			return ConstantU32(state, 0);
+		}
+		return EmitTaskPayloadLoad(state, 0);
 	}
+	const auto result  = state.builder.AllocateId();
 	const auto pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer,
 	                          state.push_constant_variable, ConstantU32(state, 0),
@@ -709,6 +724,25 @@ uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 uint32_t EmitGetUserData(EmitterState& state, IR::ScalarReg reg) {
+	// GPU-side indirect mesh draws: the packet's offset slots hold the record's first vertex /
+	// first instance on the host path (PatchIndirectDrawOffsets); the task shader forwards them in
+	// its payload. GS slot k is register s(kMeshUserSgprBase + k) in mesh programs (shader.h).
+	if (const auto* mesh =
+	        state.program.stage == ShaderType::Mesh ? state.input_info.vertex : nullptr;
+	    mesh != nullptr && mesh->mesh_task_indirect && mesh->draw_parameters.active &&
+	    state.task_payload_variable != 0) {
+		const auto& draw  = mesh->draw_parameters;
+		const auto  index = IR::RegIndex(reg);
+		const auto  base  = state.program.user_data_base + kMeshUserSgprBase;
+		if (draw.base_vertex_slot != ShaderDrawParameters::kNoSlot &&
+		    index == base + draw.base_vertex_slot) {
+			return EmitTaskPayloadLoad(state, 1);
+		}
+		if (draw.base_instance_slot != ShaderDrawParameters::kNoSlot &&
+		    index == base + draw.base_instance_slot) {
+			return EmitTaskPayloadLoad(state, 2);
+		}
+	}
 	// GPU-side indirect draws: the packet's vertex / instance offset SGPRs come from the draw
 	// parameters built-ins instead of the (unpatched) shader-data dword.
 	// Same stage gate as DefineInputs, which declares the built-ins only for Vertex.

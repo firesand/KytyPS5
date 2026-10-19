@@ -1437,6 +1437,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 	}
 
+	if (pipeline.task_stage) {
+		push_stages |= vk::ShaderStageFlagBits::eTaskEXT; // the layout's range includes it
+	}
 	if (has_push_data) {
 		vk_buffer.pushConstants(pipeline.pipeline_layout, push_stages, 0, sizeof(push_data),
 		                        push_data.dwords.data());

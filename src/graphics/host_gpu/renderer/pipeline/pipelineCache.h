@@ -120,6 +120,9 @@ public:
 		vk::Pipeline            pipeline              = nullptr;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		bool                    uses_push_descriptors = false;
+		// The pass-through task stage is part of the pipeline (and of its push-constant range):
+		// every vkCmdPushConstants on this layout must name eTaskEXT too.
+		bool                    task_stage            = false;
 	};
 
 	struct GraphicsPrograms {

@@ -105,6 +105,21 @@ static const char* OrderedGdsSerialRejection(const ShaderComputeInputInfo& input
 	return nullptr;
 }
 
+// KYTY_SUBMIT_AHEAD: attributes the pages a dispatch writes (BufferCache::NoteGpuWrite, from
+// PrepareBindings through CommitBindings) to its shader, for producer learning.
+class WriterTagScope {
+public:
+	WriterTagScope(BufferCache& cache, uint64_t writer) noexcept: m_cache(cache) {
+		m_cache.SetWriterTag(writer);
+	}
+	~WriterTagScope() { m_cache.SetWriterTag(0); }
+	WriterTagScope(const WriterTagScope&)            = delete;
+	WriterTagScope& operator=(const WriterTagScope&) = delete;
+
+private:
+	BufferCache& m_cache;
+};
+
 static void LogOrderedGdsApproximation(uint64_t shader_hash, const char* reason) {
 	static std::atomic<uint32_t> count {0};
 	if (count.fetch_add(1, std::memory_order_relaxed) < 16u) {
@@ -281,6 +296,7 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 	if (indirect_args != 0) {
 		// GPU-built dispatch arguments: publish pending unbounded writes, then download tracked
 		// GPU data, before sizing the LDS buffer from them (host-read audit 2026-10-12).
+		WaitReasonScope reason(WaitReasonProbe::DispatchArgsLds);
 		cache.PrepareHostRead(indirect_args, sizeof(vk::DispatchIndirectCommand));
 		cache.ReadMemory(indirect_args, sizeof(vk::DispatchIndirectCommand));
 		std::memcpy(input.workgroup_counts, reinterpret_cast<const void*>(indirect_args),
@@ -437,6 +453,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	auto& pipeline =
 	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
+	const WriterTagScope writer_tag(m_context.GetBufferCache(),
+	                                SubmitAheadConfig::Get().producers ? program.shader_hash : 0);
 	PrepareBindings(input_info.stage, bindings);
 	if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
 		std::copy(std::begin(input_info.dispatch_threads_num), std::end(input_info.dispatch_threads_num),
@@ -684,6 +702,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		// The removed host fence also ordered read-only dispatches before later writers.
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
+	if (SubmitAheadConfig::Get().producers &&
+	    m_context.GetBufferCache().IsSubmitAheadProducer(program.shader_hash)) {
+		m_submit_ahead_producer = program.shader_hash;
+		m_submit_ahead_tick     = m_context.GetCommandScheduler().CurrentTick();
+	}
 	ResetBindings();
 	m_context.GetCommandScheduler().DiagnosticOperationComplete();
 }
@@ -715,6 +738,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
+	const WriterTagScope writer_tag(
+	    m_context.GetBufferCache(),
+	    SubmitAheadConfig::Get().producers ? input_info.stage.program->shader_hash : 0);
 	PrepareBindings(input_info.stage, bindings);
 	PreparedBindings* descriptor_stage = &bindings;
 	FindBuffers(std::span {&descriptor_stage, 1u});
@@ -788,6 +814,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	if (LazyBarriersKeepOld()) {
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	}
+	if (SubmitAheadConfig::Get().producers &&
+	    m_context.GetBufferCache().IsSubmitAheadProducer(program.shader_hash)) {
+		m_submit_ahead_producer = program.shader_hash;
+		m_submit_ahead_tick     = m_context.GetCommandScheduler().CurrentTick();
 	}
 	ResetBindings();
 	m_context.GetCommandScheduler().DiagnosticOperationComplete();

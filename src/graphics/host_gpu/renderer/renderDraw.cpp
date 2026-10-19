@@ -18,7 +18,9 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/gpuIndirectFilter.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/meshTaskIndirect.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -1245,6 +1247,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// writes in flight are covered by HasPendingUnboundedWrites.
 	uint64_t indirect_args_bytes = 0;
 	bool     indirect_barrier    = false;
+	bool     args_unpublished    = false; // unpublished unbounded GPU writes may cover the args
+	bool     count_unpublished   = false;
 	if (gpu_indirect != nullptr) {
 		auto& cache = m_context.GetBufferCache();
 		const uint64_t record_size =
@@ -1254,12 +1258,36 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		indirect_args_bytes =
 		    static_cast<uint64_t>(gpu_indirect->draw_count - 1u) * gpu_indirect->stride + record_size;
 		const auto wait_begin = std::chrono::steady_clock::now();
-		// Lazy mode replaces the sticky HasPendingUnboundedWrites() (true until a host wait) with
-		// the tracker's per-command-buffer indirect_write_stages, evaluated at the barrier site.
-		indirect_barrier = cache.HasGpuDirtyBytes(gpu_indirect->args_addr, indirect_args_bytes) ||
-		                   (LazyBarriersKeepOld() && cache.HasPendingUnboundedWrites());
-		if (gpu_indirect->count_addr != 0) {
-			indirect_barrier |= cache.HasGpuDirtyBytes(gpu_indirect->count_addr, sizeof(uint32_t));
+		// Lazy mode 1 decides the barrier from the tracker's indirect_write_stages below and
+		// discards the HasGpuDirtyBytes result, whose PrepareHostRead waits for the write-fault
+		// pass when the range intersects pending unbounded writes. Without the wait the GPU
+		// writes stay unpublished for ObtainBuffer: SynchronizeBuffer only uploads CPU-dirty pages,
+		// which the CPU bytes win either way (MarkPageWritten skips them), but the stream path
+		// would memcpy the whole range from guest memory, so it is refused for such ranges
+		// (args_unpublished). KYTY_CP_GPU_INDIRECT_ARGS_WAIT=1 keeps the waiting check.
+		static const bool force_wait = [] {
+			const char* value = std::getenv("KYTY_CP_GPU_INDIRECT_ARGS_WAIT");
+			return value != nullptr && value[0] == '1';
+		}();
+		const bool keep_wait = LazyBarrierMode() != 1 || force_wait;
+		if (!keep_wait) {
+			args_unpublished =
+			    cache.PublishGpuWritesNoWait(gpu_indirect->args_addr, indirect_args_bytes);
+			count_unpublished = gpu_indirect->count_addr != 0 &&
+			                    cache.PublishGpuWritesNoWait(gpu_indirect->count_addr, sizeof(uint32_t));
+			if (args_unpublished || count_unpublished) {
+				HostReadProbe::CountGpuIndirect(HostReadProbe::ArgsWaitSkipped);
+			}
+		} else {
+			WaitReasonScope reason(WaitReasonProbe::ArgsCheck);
+			// Lazy mode replaces the sticky HasPendingUnboundedWrites() (true until a host wait)
+			// with the tracker's per-command-buffer indirect_write_stages, evaluated at the barrier
+			// site.
+			indirect_barrier = cache.HasGpuDirtyBytes(gpu_indirect->args_addr, indirect_args_bytes) ||
+			                   (LazyBarriersKeepOld() && cache.HasPendingUnboundedWrites());
+			if (gpu_indirect->count_addr != 0) {
+				indirect_barrier |= cache.HasGpuDirtyBytes(gpu_indirect->count_addr, sizeof(uint32_t));
+			}
 		}
 		if (LazyBarriersActive()) {
 			// What the pre-tracker code would have decided (sticky flag included), for the counters.
@@ -1267,7 +1295,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				BarrierProbe::NoteOld(BarrierProbe::DrawIndirectArgs);
 			}
 		}
-		HostReadProbe::AddGpuIndirectWait(static_cast<uint64_t>(
+		// Diagnostics: who wrote the argument range (both branches above published what had
+		// completed), and remember its pages for the readback attribution in ReadMemory.
+		HostReadProbe::CountGpuIndirect(
+		    args_unpublished || (cache.HasPendingUnboundedWrites() &&
+		                         cache.InUnboundedWriteRange(gpu_indirect->args_addr, indirect_args_bytes))
+		        ? HostReadProbe::ArgsUnbounded
+		    : cache.HasPublishedGpuWrites(gpu_indirect->args_addr, indirect_args_bytes)
+		        ? HostReadProbe::ArgsGpuBound
+		        : HostReadProbe::ArgsCpuOnly);
+		cache.NoteGpuIndirectArgs(gpu_indirect->args_addr, indirect_args_bytes);
+		HostReadProbe::AddGpuIndirectArgsWait(static_cast<uint64_t>(
 		    std::chrono::duration_cast<std::chrono::nanoseconds>(
 		        std::chrono::steady_clock::now() - wait_begin).count()));
 	}
@@ -1309,10 +1347,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	std::pair<Buffer*, uint64_t> indirect_count {};
 	if (gpu_indirect != nullptr) {
 		auto& cache   = m_context.GetBufferCache();
-		indirect_args = cache.ObtainBuffer(gpu_indirect->args_addr, indirect_args_bytes, false);
+		indirect_args = cache.ObtainBuffer(gpu_indirect->args_addr, indirect_args_bytes, false, false,
+		                                   {}, !args_unpublished);
 		EXIT_IF(indirect_args.first == nullptr || (indirect_args.second & 3u) != 0);
 		if (gpu_indirect->count_addr != 0) {
-			indirect_count = cache.ObtainBuffer(gpu_indirect->count_addr, sizeof(uint32_t), false);
+			indirect_count = cache.ObtainBuffer(gpu_indirect->count_addr, sizeof(uint32_t), false, false,
+			                                    {}, !count_unpublished);
 			EXIT_IF(indirect_count.first == nullptr || (indirect_count.second & 3u) != 0);
 		}
 		// Obtaining the arguments can merge cache buffers; finalize shader bindings afterward.
@@ -1411,27 +1451,22 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
 	if (mesh_active) {
 		if (gpu_indirect != nullptr) {
-			const auto& limits = m_context.GetGraphics().mesh_shader_properties;
-			struct alignas(8) TaskPushConsts {
-				uint64_t args_bda;
-				uint32_t stride;
-				uint32_t primitives_per_group;
-				uint32_t max_groups_x;
-				uint32_t max_groups_y;
-				uint32_t is_indexed;
-			} task_pc {};
-			const auto bda = indirect_args.first->BufferDeviceAddress() + indirect_args.second;
-			task_pc.args_bda              = bda;
-			task_pc.stride                = gpu_indirect->stride;
-			task_pc.primitives_per_group  = state.vertex_info[0].mesh.primitives_per_group;
-			task_pc.max_groups_x          = limits.maxMeshWorkGroupCount[0];
-			task_pc.max_groups_y          = limits.maxMeshWorkGroupCount[1];
-			task_pc.is_indexed            = draw.IsIndexed() ? 1u : 0u;
+			// After CommitBindings' full push: the task block overwrites only dwords 0-5, which the
+			// task-path mesh program does not read; its shader data starts at dword 6.
+			static_assert(kTaskPushBytes <= ShaderRecompiler::IR::PushData::MeshDrawDwordCount * 4u);
+			EXIT_IF(draw.IsIndexed() || !pipeline.task_stage);
+			const auto& mesh = state.vertex_info[0].mesh;
+			MeshTaskPushConstants task_pc {};
+			task_pc.args_bda       = indirect_args.first->BufferDeviceAddress() + indirect_args.second;
+			task_pc.stride         = gpu_indirect->stride;
+			task_pc.primitive_info = PackMeshTaskPrimitiveInfo(
+			    mesh.primitives_per_group, mesh.InputPrimitiveSize(), mesh.InputPrimitiveStep());
+			task_pc.counters_bda   = TaskCountersAddress();
 			vk_buffer.pushConstants(pipeline.pipeline_layout,
 			                        vk::ShaderStageFlagBits::eTaskEXT |
 			                            vk::ShaderStageFlagBits::eMeshEXT |
 			                            vk::ShaderStageFlagBits::eFragment,
-			                        0, sizeof(task_pc), &task_pc);
+			                        0, kTaskPushBytes, &task_pc);
 		} else {
 			vk_buffer.pushConstants(pipeline.pipeline_layout,
 			                        vk::ShaderStageFlagBits::eMeshEXT |
@@ -1659,10 +1694,39 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	m_context.GetCommandScheduler().DiagnosticOperationComplete();
 }
 
+uint64_t RenderExecutor::TaskCountersAddress() {
+	if (!ProbeEnabled::Get()) {
+		return 0;
+	}
+	if (m_task_counters == nullptr) {
+		m_task_counters = std::make_unique<Buffer>(
+		    m_context.GetGraphics(), m_context.GetCommandScheduler(), MemoryUsage::Download, 0,
+		    vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+		    sizeof(MeshTaskCounters));
+		EXIT_IF(m_task_counters->Mapped().size() < sizeof(MeshTaskCounters));
+		std::memset(m_task_counters->Mapped().data(), 0, sizeof(MeshTaskCounters));
+		m_task_counters->Flush(0, sizeof(MeshTaskCounters));
+	} else {
+		// Diagnostic read without synchronization: the GPU atomics show up here a few
+		// submissions late.
+		m_task_counters->Invalidate(0, sizeof(MeshTaskCounters));
+		MeshTaskCounters now {};
+		std::memcpy(&now, m_task_counters->Mapped().data(), sizeof(now));
+		const std::array<uint32_t, 2> values {now.clamped_records, now.empty_records};
+		HostReadProbe::CountGpuIndirect(HostReadProbe::MeshClampedRecords,
+		                                values[0] - m_task_counters_seen[0]);
+		HostReadProbe::CountGpuIndirect(HostReadProbe::MeshEmptyRecords,
+		                                values[1] - m_task_counters_seen[1]);
+		m_task_counters_seen = values;
+	}
+	return m_task_counters->BufferDeviceAddress();
+}
+
 bool RenderExecutor::CanDrawIndirectOnGpu(CommandBuffer& buffer, bool indexed,
                                           uint32_t index_type_and_size, uint32_t draw_count,
                                           const ShaderDrawParameters& parameters,
-                                          GpuIndirectBlock* block) {
+                                          GpuIndirectBlock* block, GpuIndirectShaderInfo* shader,
+                                          bool has_count_addr) {
 	if (block != nullptr) {
 		*block = GpuIndirectBlock::Other;
 	}
@@ -1688,11 +1752,48 @@ bool RenderExecutor::CanDrawIndirectOnGpu(CommandBuffer& buffer, bool indexed,
 	}
 	uint64_t shader_hash = 0;
 	const bool is_mesh = VertexShaderIsMesh(sh_ctx.GetVs(), buffer.GetRegisters(), &shader_hash);
+	const auto fast_launch = (buffer.GetRegisters().GetShaderStages() >> 19u) & 3u;
+	if (shader != nullptr) {
+		shader->known                   = true;
+		shader->mesh                    = is_mesh;
+		shader->hash                    = shader_hash;
+		shader->fast_launch             = fast_launch;
+		shader->primitive               = static_cast<uint32_t>(primitive);
+		shader->ge_primitive_group_size = static_cast<uint32_t>(ucfg.GetGeControl().primitive_group_size);
+	}
+	// Bisection lists (KYTY_CP_GPU_INDIRECT_DENY_HASH / _MESH_HASH): mesh programs need an explicit
+	// allowlist entry, so the mesh path stays off unless the variable names them.
+	if (GpuIndirectHashFilter::Deny().Contains(shader_hash) ||
+	    (is_mesh && !GpuIndirectHashFilter::MeshAllow().Contains(shader_hash))) {
+		if (block != nullptr) {
+			*block = is_mesh ? GpuIndirectBlock::MeshDenied : GpuIndirectBlock::Denied;
+		}
+		return false;
+	}
 	if (is_mesh) {
-		const auto fast_launch = (buffer.GetRegisters().GetShaderStages() >> 19u) & 3u;
-		if (!graphics.task_shader_enabled || indexed || fast_launch == 0) {
+		// Non-fast-launch programs are admitted since Stage 2: their mesh entry takes the record's
+		// vertex count from the task payload and every other draw dword is 0 there (item 5).
+		if (!graphics.task_shader_enabled || indexed) {
 			if (block != nullptr) {
 				*block = GpuIndirectBlock::Mesh;
+			}
+			return false;
+		}
+		if (has_count_addr) {
+			if (block != nullptr) {
+				*block = GpuIndirectBlock::MeshCountAddr;
+			}
+			return false;
+		}
+		// The primitive types the mesh path assembles (PrepareProgram); the task shader computes
+		// the host's group count from the input primitive size / step.
+		if (primitive != Prospero::PrimitiveType::kPointList &&
+		    primitive != Prospero::PrimitiveType::kLineList &&
+		    primitive != Prospero::PrimitiveType::kTriList &&
+		    primitive != Prospero::PrimitiveType::kTriFan &&
+		    primitive != Prospero::PrimitiveType::kTriStrip) {
+			if (block != nullptr) {
+				*block = GpuIndirectBlock::MeshPrim;
 			}
 			return false;
 		}
@@ -1701,14 +1802,16 @@ bool RenderExecutor::CanDrawIndirectOnGpu(CommandBuffer& buffer, bool indexed,
 	// the user-data snapshot. The GPU variant never patches the offset SGPRs, so a plan that reads
 	// one of them would pick resources from a stale value. Unknown shaders take the host path once,
 	// which compiles them and records their mask.
-	uint64_t plan_mask = 0;
-	const auto slot_bit = [](uint32_t slot) {
-		return slot == ShaderDrawParameters::kNoSlot ? uint64_t {0}
-		                                             : (slot < 64u ? uint64_t {1} << slot : ~uint64_t {0});
-	};
-	if (!m_context.GetPipelineCache().GetVertexUserDataMask(shader_hash, plan_mask) ||
-	    (plan_mask & (slot_bit(parameters.base_vertex_slot) |
-	                  slot_bit(parameters.base_instance_slot))) != 0) {
+	// Mesh programs keep GS slot k at mask bit kMeshUserSgprBase + k (shader.h).
+	// A packet that names no offset slot patches nothing, so no plan can read a stale value and the
+	// mask is not needed. This also matters for "compile once on the host path": that path skips
+	// empty records before preparing the draw, so a shader whose records are always empty would
+	// never be compiled and stay on the host path (ng-147: 11 packets per frame).
+	const uint64_t slot_mask = DrawParameterSlotMask(parameters, is_mesh ? kMeshUserSgprBase : 0u);
+	uint64_t       plan_mask = 0;
+	if (slot_mask != 0 &&
+	    (!m_context.GetPipelineCache().GetVertexUserDataMask(shader_hash, plan_mask) ||
+	     (plan_mask & slot_mask) != 0)) {
 		if (block != nullptr) {
 			*block = GpuIndirectBlock::Srt;
 		}
@@ -1828,6 +1931,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		// GPU-indirect draws keep this too: ObtainBuffer must not upload stale CPU bytes over
 		// GPU-built indices whose write-fault records are still unpublished.
 		const auto begin = std::chrono::steady_clock::now();
+		WaitReasonScope reason(WaitReasonProbe::IndexRange);
 		m_context.GetBufferCache().PrepareHostRead(index_source.address, index_source.size);
 		if (args.gpu_indirect != nullptr) {
 			HostReadProbe::AddGpuIndirectWait(static_cast<uint64_t>(

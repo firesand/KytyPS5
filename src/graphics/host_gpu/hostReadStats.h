@@ -43,11 +43,53 @@ struct HostReadProbe {
 	// KYTY_CP_GPU_INDIRECT accounting: draws issued with GPU-side arguments, and the indirect draws
 	// that stayed on the host path (first-index SGPR named, or any other reason; "mesh" is the
 	// subset of "other" caused by NGG/mesh vertex shaders).
-	enum GpuIndirect : uint32_t { GpuDraws = 0, FallbackIndexOffset, FallbackOther, FallbackMesh, FallbackSrt, GpuIndirectCount };
+	// Stage 2 (mesh through the pass-through task shader). FallbackMesh stays the total of mesh
+	// packets kept on the host path for a mesh reason; one reason counter each:
+	// - MeshGpuDraws: the subset of GpuDraws recorded with drawMeshTasksEXT through the task shader;
+	// - FallbackMeshDenied: the mesh hash is not in KYTY_CP_GPU_INDIRECT_MESH_HASH (unset = none) or
+	//   is in KYTY_CP_GPU_INDIRECT_DENY_HASH;
+	// - FallbackMeshCountAddr: the packet names a count dword (the task shader ignores it);
+	// - FallbackMeshPrim: the input primitive type is not supported by the task shader;
+	// - FallbackDenied: a vertex-stage hash in KYTY_CP_GPU_INDIRECT_DENY_HASH (counted in "other" too);
+	// - MeshClampedRecords / MeshEmptyRecords: argument records the task shader clamped to the
+	//   device's mesh workgroup limits / found empty (GPU atomics, read back with a delay);
+	// - ArgsWaitSkipped (lazy mode 1): GPU packets whose argument range intersected pending
+	//   unbounded writes and skipped the waiting publish (ObtainBuffer then avoids the stream path);
+	// - ArgsUnbounded / ArgsGpuBound / ArgsCpuOnly: who wrote a GPU-indirect packet's argument
+	//   range at draw time: pending fault-tracked (unbounded) writes, published bound GPU writes, or
+	//   neither (CPU data);
+	// - ArgsPageReadback: ReadMemory calls that touched a page recent GPU-indirect packets took
+	//   arguments from (first 32 logged as "GpuIndirect(args-page-readback)");
+	// - Merge*: consecutive GPU mesh packets (b1, can N packets become one task dispatch?).
+	//   MergeSame: same mesh/pixel hash, identical GS/PS user SGPR values, nothing but SH register
+	//   writes and NOPs in between. MergeUserData: same hashes, user SGPR values differ.
+	//   MergeBreakCtx: context/uconfig register writes in between. MergeBreakShader: other hashes.
+	//   MergeBreakOp: another draw, dispatch or side-effect packet (event, wait, DMA, ...) in between;
+	// - StaleInstances: a later draw that took its instance count from m_num_instances while a GPU
+	//   packet had left it at the pre-packet value (the host path stores the last record's count);
+	// - StaleSgpr: a later draw whose shader can read a GS user-data register that a GPU packet left
+	//   at its pre-packet value (the host path would have patched it with the last record's offset).
+	//   "Can read" = the slot is below the bound shader's user SGPR count (an upper bound).
+	enum GpuIndirect : uint32_t { GpuDraws = 0, FallbackIndexOffset, FallbackOther, FallbackMesh, FallbackSrt,
+	                              MeshGpuDraws, FallbackMeshDenied, FallbackMeshCountAddr, FallbackMeshPrim,
+	                              FallbackDenied, MeshClampedRecords, MeshEmptyRecords, ArgsWaitSkipped,
+	                              ArgsUnbounded, ArgsGpuBound, ArgsCpuOnly, ArgsPageReadback, MergeSame,
+	                              MergeUserData, MergeBreakCtx, MergeBreakShader, MergeBreakOp,
+	                              StaleInstances, StaleSgpr, GpuIndirectCount };
+	// Short names, one per enumerator in order; the size is deduced, so adding an enumerator without
+	// a name (or the reverse) fails to compile.
+	static constexpr auto kGpuIndirectNames = std::to_array<const char*>(
+	    {"gpu", "index_offset", "other", "mesh", "srt", "mesh-gpu", "mesh-denied", "mesh-count-addr",
+	     "mesh-prim", "denied", "mesh-clamped", "mesh-empty", "args-wait-skipped",
+	     "args-unbounded", "args-gpu-bound", "args-cpu", "args-page-readback", "merge-same", "merge-userdata",
+	     "merge-break-ctx", "merge-break-shader", "merge-break-op",
+	     "stale-instances", "stale-sgpr"});
+	static_assert(kGpuIndirectNames.size() == GpuIndirectCount, "GpuIndirect enum / name table mismatch");
 	struct Snapshot {
 		std::array<std::pair<uint64_t, uint64_t>, SiteCount> sites {}; // calls, nanoseconds
 		std::array<uint64_t, GpuIndirectCount>               gpu_indirect {};
 		uint64_t                                             gpu_indirect_wait_ns = 0;
+		uint64_t                                             gpu_indirect_args_wait_ns = 0;
 	};
 	inline static std::array<HostReadCounters, SiteCount> s_sites {};
 	inline static std::array<std::atomic<uint64_t>, GpuIndirectCount> s_gpu_indirect {};
@@ -58,9 +100,15 @@ struct HostReadProbe {
 	static void AddGpuIndirectWait(uint64_t ns) noexcept {
 		s_gpu_indirect_wait_ns.fetch_add(ns, std::memory_order_relaxed);
 	}
+	// The part of it spent at the argument-record check in ExecutePreparedDraw (also in the total).
+	inline static std::atomic<uint64_t> s_gpu_indirect_args_wait_ns {0};
+	static void AddGpuIndirectArgsWait(uint64_t ns) noexcept {
+		s_gpu_indirect_wait_ns.fetch_add(ns, std::memory_order_relaxed);
+		s_gpu_indirect_args_wait_ns.fetch_add(ns, std::memory_order_relaxed);
+	}
 
-	static void CountGpuIndirect(GpuIndirect kind) noexcept {
-		s_gpu_indirect[kind].fetch_add(1, std::memory_order_relaxed);
+	static void CountGpuIndirect(GpuIndirect kind, uint64_t count = 1) noexcept {
+		s_gpu_indirect[kind].fetch_add(count, std::memory_order_relaxed);
 	}
 
 	static void Add(Site site, uint64_t ns) noexcept {
@@ -77,6 +125,8 @@ struct HostReadProbe {
 			snapshot.gpu_indirect[i] = s_gpu_indirect[i].exchange(0, std::memory_order_relaxed);
 		}
 		snapshot.gpu_indirect_wait_ns = s_gpu_indirect_wait_ns.exchange(0, std::memory_order_relaxed);
+		snapshot.gpu_indirect_args_wait_ns =
+		    s_gpu_indirect_args_wait_ns.exchange(0, std::memory_order_relaxed);
 		return snapshot;
 	}
 	// Reads one dword per 4 KiB page of [vaddr, vaddr + size): a GPU-written range is published (and
@@ -97,10 +147,21 @@ struct HostReadProbe {
 // line): every MasterSemaphore::Wait on the GPU thread is charged to the reason the OUTERMOST enclosing
 // WaitReasonScope declared, so a download wait reached from an indirect-argument read counts as draw-args rather
 // than download. "other" = a wait below no declared reason. The budget's wait category is the total.
+// BufferCache::ReadMemory runs on the GPU thread (SendCommandSync) and carries its caller's reason
+// there: "download" is now only a ReadMemory caller that declares nothing. Readback callers:
+// read-fault-guest / read-fault-gpu (a host read of a GPU-dirty page, HandleFault, by thread),
+// write-fault-guest / write-fault-gpu (a host write into a GPU-dirty page: readback before the
+// write), invalidate-guest / invalidate-gpu (explicit range invalidation: file reads into guest
+// memory, unmap, texture slices), texture-readback (texture cache host check), backing-read
+// (TryReadBufferBacking), dispatch-args-lds (indirect dispatch sizing its LDS buffer from GPU-built
+// arguments). Flush waits: index-range (DrawIndex publishing an index range), args-check
+// (GPU-indirect argument check, lazy modes 0/2).
 struct WaitReasonProbe {
 	enum Reason : uint32_t {
 		Other = 0, DrawArgs, DrawCount, DispatchArgs, Predication, // the HostReadProbe sites, in the same order
-		Download, WriteFaults, FaultAreas, StreamWrap, Gc, Finish, DescriptorPool, ReasonCount
+		Download, WriteFaults, FaultAreas, StreamWrap, Gc, Finish, DescriptorPool,
+		ReadFaultGuest, ReadFaultGpu, WriteFaultGuest, WriteFaultGpu, InvalidateGuest, InvalidateGpu,
+		TextureReadback, BackingRead, DispatchArgsLds, IndexRange, ArgsCheck, ReasonCount
 	};
 	struct Snapshot {
 		std::array<std::pair<uint64_t, uint64_t>, ReasonCount> reasons {}; // calls, nanoseconds
@@ -119,11 +180,52 @@ struct WaitReasonProbe {
 		}
 		return snapshot;
 	}
-	static const char* Name(uint32_t reason) noexcept {
-		static constexpr const char* names[ReasonCount] = {
-		    "other", "draw-args", "draw-count", "dispatch-args", "predication", "download",
-		    "write-faults", "fault-areas", "stream-wrap", "gc", "finish", "descriptor-pool"};
-		return names[reason];
+	static constexpr auto kNames = std::to_array<const char*>(
+	    {"other", "draw-args", "draw-count", "dispatch-args", "predication", "download", "write-faults",
+	     "fault-areas", "stream-wrap", "gc", "finish", "descriptor-pool", "read-fault-guest",
+	     "read-fault-gpu", "write-fault-guest", "write-fault-gpu", "invalidate-guest", "invalidate-gpu",
+	     "texture-readback", "backing-read", "dispatch-args-lds", "index-range", "args-check"});
+	static_assert(kNames.size() == ReasonCount, "WaitReasonProbe reason / name table mismatch");
+	static const char* Name(uint32_t reason) noexcept { return kNames[reason]; }
+	// The reason a wait below this point on the calling thread would be charged to, or `fallback`.
+	static Reason CurrentOr(Reason fallback) noexcept {
+		return s_current != Other ? static_cast<Reason>(s_current) : fallback;
+	}
+};
+
+// KYTY_PROBE_FAULT_HISTOGRAM: synchronous readbacks (BufferCache::DownloadBufferMemory<false>) by the
+// wait reason in force, served over BAR (completed GPU data, no drain) or through a copy (submit and
+// wait). The measure for KYTY_SUBMIT_AHEAD: waited readbacks should move from copy to bar.
+struct ReadbackProbe {
+	inline static std::array<std::array<std::atomic<uint64_t>, 2>, WaitReasonProbe::ReasonCount> s_counts {};
+	static void Count(uint32_t reason, bool bar) noexcept {
+		s_counts[reason][bar ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
+	}
+	using Snapshot = std::array<std::array<uint64_t, 2>, WaitReasonProbe::ReasonCount>;
+	static Snapshot Take() noexcept {
+		Snapshot snapshot {};
+		for (uint32_t r = 0; r < WaitReasonProbe::ReasonCount; ++r) {
+			for (uint32_t k = 0; k < 2; ++k) {
+				snapshot[r][k] = s_counts[r][k].exchange(0, std::memory_order_relaxed);
+			}
+		}
+		return snapshot;
+	}
+};
+
+// KYTY_SUBMIT_AHEAD (submitAhead.h): early submits by trigger, producers learned from waited
+// readbacks, and the current producer count.
+struct SubmitAheadProbe {
+	enum Counter : uint32_t { ProducerSubmits = 0, TimerSubmits, Learned, Forgotten, CounterCount };
+	inline static std::array<std::atomic<uint64_t>, CounterCount> s_counts {};
+	inline static std::atomic<uint64_t>                          s_producers {0};
+	static void Count(Counter counter) noexcept { s_counts[counter].fetch_add(1, std::memory_order_relaxed); }
+	static std::array<uint64_t, CounterCount> Take() noexcept {
+		std::array<uint64_t, CounterCount> snapshot {};
+		for (uint32_t i = 0; i < CounterCount; ++i) {
+			snapshot[i] = s_counts[i].exchange(0, std::memory_order_relaxed);
+		}
+		return snapshot;
 	}
 };
 

@@ -163,6 +163,7 @@ struct FaultSampler {
 			reads_sum.gpu_indirect[i] += host_reads.gpu_indirect[i];
 		}
 		reads_sum.gpu_indirect_wait_ns += host_reads.gpu_indirect_wait_ns;
+		reads_sum.gpu_indirect_args_wait_ns += host_reads.gpu_indirect_args_wait_ns;
 		syncs_sum.calls += syncs.calls;
 		syncs_sum.regions += syncs.regions;
 		syncs_sum.wait_passes += syncs.wait_passes;
@@ -247,6 +248,12 @@ struct FaultSampler {
 		                    reads_all.gpu_indirect[HostReadProbe::FallbackMesh],
 		                    reads_all.gpu_indirect[HostReadProbe::FallbackSrt],
 		                    reads_all.gpu_indirect_wait_ns / 1000000);
+		// Stage 2 reasons, appended so the fields above keep their positions.
+		line += " | gpu-indirect2";
+		for (uint32_t i = HostReadProbe::MeshGpuDraws; i < HostReadProbe::GpuIndirectCount; ++i) {
+			line += fmt::format(" {}={}", HostReadProbe::kGpuIndirectNames[i], reads_all.gpu_indirect[i]);
+		}
+		line += fmt::format(" args-wait-ms={}", reads_all.gpu_indirect_args_wait_ns / 1000000);
 		line += fmt::format(" | wait-pass {} (consumed {}, extra-syncs {}, bytes {})", syncs_all.wait_passes,
 		                    syncs_all.wait_consumed, syncs_all.wait_extra, syncs_all.wait_bytes);
 		line += fmt::format(" | host-resident binds {} bytes {} KiB fallbacks {}", resident_all.binds,
@@ -305,6 +312,20 @@ struct FaultSampler {
 					                    wr.reasons[r].first);
 				}
 			}
+			if (SubmitAheadConfig::Get().Enabled()) {
+				const auto sa = SubmitAheadProbe::Take();
+				line += fmt::format(" | submit-ahead producer {} timer {} learned {} forgotten {} producers {}",
+				                    sa[SubmitAheadProbe::ProducerSubmits], sa[SubmitAheadProbe::TimerSubmits],
+				                    sa[SubmitAheadProbe::Learned], sa[SubmitAheadProbe::Forgotten],
+				                    SubmitAheadProbe::s_producers.load(std::memory_order_relaxed));
+			}
+			const auto rb = ReadbackProbe::Take();
+			line += " | readbacks bar/copy:";
+			for (uint32_t r = 0; r < WaitReasonProbe::ReasonCount; ++r) {
+				if (rb[r][0] + rb[r][1] != 0) {
+					line += fmt::format(" {} {}/{}", WaitReasonProbe::Name(r), rb[r][0], rb[r][1]);
+				}
+			}
 		}
 		LOGF("%s\n", line.c_str());
 		last_total = now;
@@ -325,7 +346,9 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		m_buffer_cache.InvalidateWriteFault(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
-		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
+		m_buffer_cache.ReadMemory(fault_vaddr, fault_size, false,
+		                          GuestGpu::IsGpuThread() ? WaitReasonProbe::ReadFaultGpu
+		                                                  : WaitReasonProbe::ReadFaultGuest);
 	}
 	return true;
 }

@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/meshTaskIndirect.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -21,6 +22,7 @@
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 
+#include <array>
 #include <cstdlib>
 #include <algorithm>
 #include <cinttypes>
@@ -327,12 +329,27 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	vk::PipelineShaderStageCreateInfo shader_stages[5] {};
 	uint32_t                          shader_stage_count = 0;
+	// Task stage limits as specialization constants (meshTaskIndirect.h): its push block has to
+	// stay within the 24 bytes the mesh program leaves free.
+	const std::array<uint32_t, 3> task_limits {
+	    graphics.mesh_shader_properties.maxMeshWorkGroupCount[0],
+	    graphics.mesh_shader_properties.maxMeshWorkGroupCount[1],
+	    graphics.mesh_shader_properties.maxMeshWorkGroupTotalCount};
+	const std::array<vk::SpecializationMapEntry, 3> task_limit_entries {
+	    vk::SpecializationMapEntry {kTaskSpecMaxGroupsX, 0, sizeof(uint32_t)},
+	    vk::SpecializationMapEntry {kTaskSpecMaxGroupsY, sizeof(uint32_t), sizeof(uint32_t)},
+	    vk::SpecializationMapEntry {kTaskSpecMaxGroupsTotal, 2 * sizeof(uint32_t), sizeof(uint32_t)}};
+	const vk::SpecializationInfo task_specialization {
+	    static_cast<uint32_t>(task_limit_entries.size()), task_limit_entries.data(),
+	    sizeof(task_limits), task_limits.data()};
 	if (mesh && vs_input_info.mesh_task_indirect) {
 		EXIT_NOT_IMPLEMENTED(task_shader_module == nullptr);
 		shader_stages[shader_stage_count++] = {.stage =
 		                                           vk::ShaderStageFlagBits::eTaskEXT,
 		                                       .module = task_shader_module,
-		                                       .pName  = "main"};
+		                                       .pName  = "main",
+		                                       .pSpecializationInfo = &task_specialization};
+		pipeline.task_stage = true;
 	}
 	for (uint32_t i = 0; i < vertex_info.size(); i++) {
 		shader_stages[shader_stage_count++] = {.stage =

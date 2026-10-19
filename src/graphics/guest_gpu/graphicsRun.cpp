@@ -32,6 +32,7 @@
 #include <memory>
 #include <mutex>
 #include <semaphore>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -56,6 +57,17 @@ struct DrawIndexedIndirectArgs {
 	uint32_t base_vertex_location;
 	uint32_t start_instance_location;
 };
+
+// KYTY_CP_GPU_INDIRECT=1: indirect draws read their argument records on the GPU
+// (vkCmdDraw[Indexed]Indirect[Count]) instead of through host reads that wait for the producing
+// dispatch. Default off.
+static bool GpuIndirectEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_CP_GPU_INDIRECT");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
 
 static bool GraphicsRunDebugDumpEnabled() {
 	return Config::GraphicsDebugDumpEnabled() &&
@@ -241,6 +253,11 @@ void CommandProcessor::Reset() {
 	m_index_buffer_size                = 0;
 	m_index_base_addr                  = 0;
 	m_num_instances                    = 1;
+	m_sgpr_poison                      = {};
+	m_merge_probe                      = {};
+	m_submit_ahead                     = {};
+	m_any_sgpr_poison                  = false;
+	m_num_instances_stale              = false;
 	m_predicate_skip                   = false;
 	m_user_data_marker                 = HW::UserSgprType::Unknown;
 	m_draw_indirect_args_base_addr     = 0;
@@ -1012,6 +1029,12 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			     total_dw - remaining_dw, packet_header);
 		}
 
+		if (GpuIndirectEnabled()) {
+			NoteMergeOpcode(opcode);
+		}
+		if (SubmitAheadConfig::Get().Enabled()) {
+			SubmitAheadBeforePacket(opcode);
+		}
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		EXIT_IF(packet_dw > remaining_dw);
@@ -1060,7 +1083,8 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 		num_instances = 1;
 	}
 
-	m_num_instances = num_instances;
+	m_num_instances       = num_instances;
+	m_num_instances_stale = false;
 }
 
 void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t wait_op,
@@ -1124,10 +1148,206 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 	}
 }
 
+
+enum class PacketClass { ShRegs, CtxRegs, Work, Benign, Other };
+
+// Classifies PM4 packets for the (b1) merge probe and KYTY_SUBMIT_AHEAD.
+static PacketClass ClassifyPacket(uint32_t opcode) {
+	switch (opcode) {
+		case Pm4::IT_SET_SH_REG:
+		case Pm4::IT_SET_SH_REG_INDIRECT: return PacketClass::ShRegs;
+		case Pm4::IT_SET_CONTEXT_REG:
+		case Pm4::IT_SET_CONTEXT_REG_INDIRECT:
+		case Pm4::IT_SET_UCONFIG_REG:
+		case Pm4::IT_SET_UCONFIG_REG_INDEX:
+		case Pm4::IT_SET_UCONFIG_REG_INDIRECT:
+		case Pm4::IT_CLEAR_STATE: return PacketClass::CtxRegs;
+		case Pm4::IT_DRAW_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_INDIRECT:
+		case Pm4::IT_DRAW_INDIRECT_MULTI:
+		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI:
+		case Pm4::IT_DRAW_INDEX_2:
+		case Pm4::IT_DRAW_INDEX_OFFSET_2:
+		case Pm4::IT_DRAW_INDEX_AUTO:
+		case Pm4::IT_DISPATCH_DIRECT:
+		case Pm4::IT_DISPATCH_INDIRECT:
+		case Pm4::IT_DISPATCH_DRAW_PREAMBLE: return PacketClass::Work;
+		// No GPU work, no side effect: per-packet state the records carry, control flow, CE/DE sync.
+		case Pm4::IT_NOP:
+		case Pm4::IT_INDIRECT_BUFFER: // control flow only; its packets are classified one by one
+		case Pm4::IT_SET_BASE:
+		case Pm4::IT_INDEX_BASE:
+		case Pm4::IT_INDEX_TYPE:
+		case Pm4::IT_INDEX_BUFFER_SIZE:
+		case Pm4::IT_NUM_INSTANCES:
+		case Pm4::IT_PFP_SYNC_ME:
+		case Pm4::IT_INCREMENT_DE_COUNTER:
+		case Pm4::IT_INCREMENT_CE_COUNTER:
+		case Pm4::IT_WAIT_ON_CE_COUNTER:
+		case Pm4::IT_WAIT_ON_DE_COUNTER_DIFF:
+		case Pm4::IT_WRITE_CONST_RAM: return PacketClass::Benign;
+		default: return PacketClass::Other;
+	}
+}
+
+// (b1) diagnostics: classify every PM4 packet so consecutive GPU mesh packets can be compared.
+void CommandProcessor::NoteMergeOpcode(uint32_t opcode) {
+	auto& probe = m_merge_probe;
+	switch (ClassifyPacket(opcode)) {
+		case PacketClass::ShRegs: probe.sh++; break;
+		case PacketClass::CtxRegs: probe.ctx++; break;
+		case PacketClass::Work: probe.draw++; break;
+		case PacketClass::Benign: break;
+		case PacketClass::Other: probe.other++; break;
+	}
+}
+
+// KYTY_SUBMIT_AHEAD (submitAhead.h): before a work or side-effect packet, submit the open command
+// buffer when a learned producer was recorded into it, or when it has been recording longer than
+// the timer. Same operation as BufferFlush (submit, no wait).
+void CommandProcessor::SubmitAheadBeforePacket(uint32_t opcode) {
+	auto& scheduler = GetScheduler();
+	if (!scheduler.Active() || CurrentBuffer().IsInvalid()) {
+		return;
+	}
+	uint64_t producer_tick = 0;
+	if (const auto producer = m_renderer.GetRenderExecutor().ConsumeSubmitAheadProducer(producer_tick);
+	    producer != 0) {
+		m_submit_ahead.ProducerRecorded(producer_tick, producer);
+	}
+	const auto kind = ClassifyPacket(opcode);
+	using Packet    = SubmitAheadTrigger::Packet;
+	const auto packet = kind == PacketClass::ShRegs || kind == PacketClass::CtxRegs ? Packet::Register
+	                    : kind == PacketClass::Benign                               ? Packet::Benign
+	                                                                                : Packet::Work;
+	const auto reason = m_submit_ahead.Before(packet, scheduler.CurrentTick(),
+	                                          packet == Packet::Work ? scheduler.OpenCommandAgeNs() : 0,
+	                                          CurrentBuffer().IsRendering(), SubmitAheadConfig::Get());
+	if (reason == SubmitAheadTrigger::Reason::None) {
+		return;
+	}
+	BufferFlush();
+	if (const auto producer = m_submit_ahead.Submitted(reason, scheduler.CurrentTick()); producer != 0) {
+		m_renderer.GetBufferCache().NoteSubmitAhead(producer);
+	}
+	SubmitAheadProbe::Count(reason == SubmitAheadTrigger::Reason::Producer ? SubmitAheadProbe::ProducerSubmits
+	                                                                       : SubmitAheadProbe::TimerSubmits);
+}
+
+// Called for each GPU mesh packet after it was recorded (the packet itself is one probe.draw).
+void CommandProcessor::CountMergeRun(uint64_t mesh_hash) {
+	auto&       probe = m_merge_probe;
+	const auto& vs    = m_sh_ctx.GetVs();
+	const auto& ps    = m_sh_ctx.GetPs();
+	uint64_t    user_data = 0xcbf29ce484222325ull; // FNV-1a over the GS and PS user SGPR values
+	const auto  mix = [&](uint64_t value) {
+		 user_data = (user_data ^ value) * 0x100000001b3ull;
+	};
+	for (uint32_t i = 0; i < vs.gs_user_sgpr.count && i < HW::UserSgprInfo::SGPRS_MAX; ++i) {
+		mix(vs.gs_user_sgpr.value[i]);
+	}
+	mix(UINT64_MAX);
+	for (uint32_t i = 0; i < ps.ps_user_sgpr.count && i < HW::UserSgprInfo::SGPRS_MAX; ++i) {
+		mix(ps.ps_user_sgpr.value[i]);
+	}
+	const uint64_t ps_addr = ps.ps_regs.data_addr;
+	if (probe.valid) {
+		if (probe.other != probe.at_other || probe.draw != probe.at_draw + 1u) {
+			HostReadProbe::CountGpuIndirect(HostReadProbe::MergeBreakOp);
+		} else if (mesh_hash != probe.mesh_hash || ps_addr != probe.ps_addr) {
+			HostReadProbe::CountGpuIndirect(HostReadProbe::MergeBreakShader);
+		} else if (probe.ctx != probe.at_ctx) {
+			HostReadProbe::CountGpuIndirect(HostReadProbe::MergeBreakCtx);
+		} else if (user_data != probe.user_data) {
+			HostReadProbe::CountGpuIndirect(HostReadProbe::MergeUserData);
+		} else {
+			HostReadProbe::CountGpuIndirect(HostReadProbe::MergeSame);
+		}
+	}
+	probe.valid     = true;
+	probe.mesh_hash = mesh_hash;
+	probe.ps_addr   = ps_addr;
+	probe.user_data = user_data;
+	probe.at_ctx    = probe.ctx;
+	probe.at_draw   = probe.draw;
+	probe.at_other  = probe.other;
+}
+
+void CommandProcessor::PoisonGpuIndirectSlots(const ShaderDrawParameters& parameters,
+                                              uint64_t last_record_addr, bool indexed) {
+	const auto poison = [&](uint32_t slot, uint32_t field) {
+		if (slot == ShaderDrawParameters::kNoSlot || slot >= m_sgpr_poison.size()) {
+			return;
+		}
+		m_sgpr_poison[slot] = {.active      = true,
+		                       .writes      = m_sh_ctx.GsUserSgprWrites(slot),
+		                       .record_addr = last_record_addr,
+		                       .field       = field};
+		m_any_sgpr_poison   = true;
+	};
+	// DrawIndirectArgs: start vertex = dword 2, start instance = dword 3; DrawIndexedIndirectArgs:
+	// base vertex = dword 3, start instance = dword 4.
+	poison(parameters.base_vertex_slot, indexed ? 3u : 2u);
+	poison(parameters.base_instance_slot, indexed ? 4u : 3u);
+	m_num_instances_stale = true;
+}
+
+// Counts draws that read state a GPU packet left unpatched. `instances_from_state`: the draw took
+// its instance count from m_num_instances. Slots the current GPU packet names are served by it.
+void CommandProcessor::CountStaleDrawState(bool instances_from_state,
+                                           const GpuIndirectDraw* gpu_indirect) {
+	if (instances_from_state && m_num_instances_stale) {
+		HostReadProbe::CountGpuIndirect(HostReadProbe::StaleInstances);
+	}
+	if (!m_any_sgpr_poison) {
+		return;
+	}
+	const auto user_sgprs = static_cast<uint32_t>(m_sh_ctx.GetVs().gs_regs.rsrc2.user_sgpr);
+	bool       any        = false;
+	bool       stale      = false;
+	uint32_t   stale_slot = 0;
+	for (uint32_t slot = 0; slot < m_sgpr_poison.size(); ++slot) {
+		auto& poison = m_sgpr_poison[slot];
+		if (!poison.active) {
+			continue;
+		}
+		if (poison.writes != m_sh_ctx.GsUserSgprWrites(slot)) {
+			poison.active = false; // rewritten since the packet
+			continue;
+		}
+		any = true;
+		if (slot >= user_sgprs || (gpu_indirect != nullptr &&
+		                           (slot == gpu_indirect->parameters.base_vertex_slot ||
+		                            slot == gpu_indirect->parameters.base_instance_slot))) {
+			continue;
+		}
+		if (!stale) {
+			stale      = true;
+			stale_slot = slot;
+		}
+	}
+	m_any_sgpr_poison = any;
+	if (!stale) {
+		return;
+	}
+	HostReadProbe::CountGpuIndirect(HostReadProbe::StaleSgpr);
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+		const auto& poison = m_sgpr_poison[stale_slot];
+		LOGF("GpuIndirect(stale-sgpr): draw reads GS slot %u (user_sgprs=%u) left unpatched by a GPU"
+		     " packet; host path value = dword %u of record 0x%016" PRIx64 "\n",
+		     stale_slot, user_sgprs, poison.field, poison.record_addr);
+	}
+}
+
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	args.index_type_and_size = m_index_type_and_size;
+	const bool instances_from_state = args.instance_count == 0;
 	if (args.instance_count == 0) {
 		args.instance_count = m_num_instances;
+	}
+	if (GpuIndirectEnabled()) {
+		CountStaleDrawState(instances_from_state, args.gpu_indirect);
 	}
 	if (GraphicsRunDebugDumpEnabled() && (args.base_vertex != 0 || args.first_instance != 0)) {
 		LOGF("\t draw indexed offsets: base_vertex = %" PRId32 ", first_instance = %" PRIu32 "\n",
@@ -1173,15 +1393,36 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, IndirectDrawRegisters 
 	DrawIndirectMulti(data_offset, 1, nullptr, args_size, registers, draw_initiator, indexed);
 }
 
-// KYTY_CP_GPU_INDIRECT=1: indirect draws read their argument records on the GPU
-// (vkCmdDraw[Indexed]Indirect[Count]) instead of through host reads that wait for the producing
-// dispatch. Default off.
-static bool GpuIndirectEnabled() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_CP_GPU_INDIRECT");
-		return value != nullptr && value[0] == '1';
-	}();
-	return enabled;
+// Logs the first 32 distinct mesh-packet tuples with the decision (KYTY_CP_GPU_INDIRECT only).
+// Registers are printed as GS user-data slots (-1: not named, r<n>: not a GS user-data register).
+static void LogMeshTuple(const RenderExecutor::GpuIndirectShaderInfo& shader, bool indexed,
+                         uint32_t stride, uint32_t max_count, bool has_count_addr,
+                         IndirectDrawRegisters registers, uint32_t decision_id, const char* decision) {
+	using Tuple = std::array<uint64_t, 9>;
+	static std::mutex         mutex;
+	static std::vector<Tuple> seen;
+	const Tuple tuple {shader.hash, shader.fast_launch, shader.primitive, shader.ge_primitive_group_size,
+	                   (indexed ? 1u : 0u) | (has_count_addr ? 2u : 0u), stride,
+	                   registers.vertex_offset, registers.instance_offset, decision_id};
+	std::lock_guard lock(mutex);
+	if (seen.size() >= 32 || std::find(seen.begin(), seen.end(), tuple) != seen.end()) {
+		return;
+	}
+	seen.push_back(tuple);
+	const auto slot = [](uint32_t location) {
+		if (location == Pm4::SH_NOP) {
+			return std::string("-1");
+		}
+		if (location >= Pm4::SPI_SHADER_USER_DATA_GS_0 && location <= Pm4::SPI_SHADER_USER_DATA_GS_31) {
+			return std::to_string(location - Pm4::SPI_SHADER_USER_DATA_GS_0);
+		}
+		return "r" + std::to_string(location);
+	};
+	LOGF("GpuIndirect(mesh-tuple): ms=0x%016" PRIx64 " fl=%u prim=%u ge_ppg=%u indexed=%d stride=%u"
+	     " max_count=%u count_addr=%d vertex_offset_slot=%s instance_offset_slot=%s -> %s\n",
+	     shader.hash, shader.fast_launch, shader.primitive, shader.ge_primitive_group_size,
+	     indexed ? 1 : 0, stride, max_count, has_count_addr ? 1 : 0,
+	     slot(registers.vertex_offset).c_str(), slot(registers.instance_offset).c_str(), decision);
 }
 
 // Returns true when the draw was recorded with GPU-resident arguments. False keeps the host path
@@ -1228,16 +1469,44 @@ bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_c
 	}
 
 	auto& executor = m_renderer.GetRenderExecutor();
-	RenderExecutor::GpuIndirectBlock block = RenderExecutor::GpuIndirectBlock::Other;
-	if (!executor.CanDrawIndirectOnGpu(CurrentBuffer(), indexed, m_index_type_and_size,
-	                                   max_count_or_count, parameters, &block)) {
-		if (block == RenderExecutor::GpuIndirectBlock::Srt) {
-			// The vertex shader's resource plan reads an offset SGPR (or is not compiled yet).
-			HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackSrt);
-			return false;
+	using Block = RenderExecutor::GpuIndirectBlock;
+	Block                                   block = Block::Other;
+	RenderExecutor::GpuIndirectShaderInfo shader;
+	const bool eligible = executor.CanDrawIndirectOnGpu(CurrentBuffer(), indexed, m_index_type_and_size,
+	                                                    max_count_or_count, parameters, &block, &shader,
+	                                                    count_addr != nullptr);
+	if (shader.known && shader.mesh) {
+		const char* decision = "gpu";
+		switch (block) {
+			case Block::None: break;
+			case Block::Mesh: decision = "fallback(mesh)"; break;
+			case Block::MeshDenied: decision = "fallback(mesh-denied)"; break;
+			case Block::MeshCountAddr: decision = "fallback(mesh-count-addr)"; break;
+			case Block::MeshPrim: decision = "fallback(mesh-prim)"; break;
+			case Block::Denied: decision = "fallback(denied)"; break;
+			case Block::Srt: decision = "fallback(srt)"; break;
+			case Block::Other: decision = "fallback(other)"; break;
 		}
-		if (block == RenderExecutor::GpuIndirectBlock::Mesh) {
-			HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackMesh);
+		LogMeshTuple(shader, indexed, stride_in_bytes, max_count_or_count, count_addr != nullptr,
+		             registers, static_cast<uint32_t>(block), decision);
+	}
+	if (!eligible) {
+		switch (block) {
+			case Block::Srt:
+				// The vertex shader's resource plan reads an offset SGPR (or is not compiled yet).
+				HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackSrt);
+				return false;
+			case Block::Mesh: HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackMesh); break;
+			case Block::MeshDenied:
+			case Block::MeshCountAddr:
+			case Block::MeshPrim:
+				HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackMesh);
+				HostReadProbe::CountGpuIndirect(block == Block::MeshDenied      ? HostReadProbe::FallbackMeshDenied
+				                                : block == Block::MeshCountAddr ? HostReadProbe::FallbackMeshCountAddr
+				                                                                : HostReadProbe::FallbackMeshPrim);
+				break;
+			case Block::Denied: HostReadProbe::CountGpuIndirect(HostReadProbe::FallbackDenied); break;
+			default: break;
 		}
 		return fallback();
 	}
@@ -1265,6 +1534,13 @@ bool CommandProcessor::TryDrawIndirectOnGpu(uint32_t data_offset, uint32_t max_c
 		               .gpu_indirect   = &draw});
 	}
 	HostReadProbe::CountGpuIndirect(HostReadProbe::GpuDraws);
+	if (shader.mesh) {
+		HostReadProbe::CountGpuIndirect(HostReadProbe::MeshGpuDraws);
+		CountMergeRun(shader.hash);
+	}
+	PoisonGpuIndirectSlots(parameters,
+	                       draw.args_addr + static_cast<uint64_t>(max_count_or_count - 1u) * stride_in_bytes,
+	                       indexed);
 	return true;
 }
 
@@ -1332,7 +1608,8 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 			if (args->vertex_count_per_instance == 0 || args->instance_count == 0) {
 				continue;
 			}
-			m_num_instances = args->instance_count;
+			m_num_instances       = args->instance_count;
+			m_num_instances_stale = false;
 			DrawIndexAuto({.vertex_count   = args->vertex_count_per_instance,
 			               .instance_count = args->instance_count,
 			               .first_vertex   = args->start_vertex_location,
@@ -1364,7 +1641,8 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		auto* index_addr = reinterpret_cast<const void*>(
 		    m_index_base_addr + static_cast<uint64_t>(args->start_index_location) * index_size);
 
-		m_num_instances = args->instance_count;
+		m_num_instances       = args->instance_count;
+		m_num_instances_stale = false;
 		DrawIndex({.index_count    = index_count,
 		           .index_addr     = index_addr,
 		           .instance_count = args->instance_count,
@@ -1427,8 +1705,12 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 }
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
+	const bool instances_from_state = args.instance_count == 0;
 	if (args.instance_count == 0) {
 		args.instance_count = m_num_instances;
+	}
+	if (GpuIndirectEnabled()) {
+		CountStaleDrawState(instances_from_state, args.gpu_indirect);
 	}
 	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
 }

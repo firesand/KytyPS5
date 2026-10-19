@@ -605,6 +605,23 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
 	info.workgroup_register = regs.cs_regs.user_sgpr;
 }
 
+void ApplyDrawParameters(ShaderVertexInputInfo& info, const ShaderDrawParameters* draw_parameters) {
+	if (draw_parameters == nullptr || !draw_parameters->active) {
+		return;
+	}
+	info.draw_parameters = *draw_parameters;
+	if (info.logical_stage == ShaderType::Mesh) {
+		// Pass-through task shader: the mesh entry reads the record's vertex count from the task
+		// payload, and reads of the named offset slots load the payload's first vertex / first
+		// instance (EmitGetUserData).
+		info.mesh_task_indirect         = true;
+		info.draw_parameters.rebase_ids = false;
+	} else {
+		// Native fetch consumes the SGPRs the host path patched and expects ids without the base.
+		info.draw_parameters.rebase_ids = !info.fetch_embedded;
+	}
+}
+
 void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t>& key) {
 	EXIT_IF(info.resources_num < 0 || info.resources_num > ShaderVertexInputInfo::RES_MAX);
 	key.clear();
@@ -747,7 +764,8 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	auto        params = GetShaderParams(
 	    regs.es_regs.data_addr, hash,
 	    std::span<const uint32_t>(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr), data,
-	    merged || native_ngg ? 8u : 0u);
+	    merged || native_ngg ? kMeshUserSgprBase : 0u);
+	params.gate_hash = hash;
 	if (!merged && !native_ngg) {
 		if (!ShaderGetStaticVertexInputInfo(regs.es_regs.data_addr, regs.gs_user_sgpr,
 		                                    regs.gs_regs.rsrc2.user_sgpr, sh, data, info)) {

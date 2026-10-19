@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/gpuTimestamps.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <chrono>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -72,6 +73,12 @@ public:
 	void                           CheckActive() const;
 	CommandBuffer&                 Current();
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
+	// Nanoseconds since the open command buffer began recording (KYTY_SUBMIT_AHEAD timer).
+	[[nodiscard]] uint64_t         OpenCommandAgeNs() const noexcept {
+		return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                 std::chrono::steady_clock::now() - m_command_begin)
+		                                 .count());
+	}
 	[[nodiscard]] bool             IsFree(uint64_t tick);
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] DynamicState&    GetDynamicState() noexcept { return m_dynamic_state; }
@@ -118,6 +125,7 @@ private:
 	CommandPool                  m_command_pool;
 	std::unique_ptr<GpuTimestamps> m_timestamps;
 	CommandBuffer                m_command;
+	std::chrono::steady_clock::time_point m_command_begin {};
 	DynamicState                 m_dynamic_state;
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;

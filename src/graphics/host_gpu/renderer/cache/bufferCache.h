@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/lruCache.h"
 #include "common/slotVector.h"
+#include "graphics/host_gpu/hostReadStats.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
@@ -12,7 +13,9 @@
 #include "graphics/host_gpu/renderer/cache/hostResidentMemory.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/submitAhead.h"
 
+#include <array>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -83,13 +86,19 @@ public:
 	// Write-fault entry: InvalidateMemory with the fault-ahead window (see MemoryTracker).
 
 	void InvalidateWriteFault(uint64_t vaddr, uint64_t size);
-	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
+	// `reason`: what a download wait inside is charged to when the calling thread declares nothing
+	// (WaitReasonProbe; carried to the GPU thread).
+	void ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false,
+	                WaitReasonProbe::Reason reason = WaitReasonProbe::Download);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
+	// `allow_stream` false: never serve the range from the stream buffer (a host memcpy of guest
+	// memory), e.g. while unpublished unbounded GPU writes may cover part of it.
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
-	                                                        BufferId id              = {});
+	                                                        BufferId id              = {},
+	                                                        bool     allow_stream    = true);
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;
@@ -155,6 +164,26 @@ public:
 	void FlushWriteFaults(bool wait);
 	// Before the host reads guest memory that unbounded writes may have touched.
 	void PrepareHostRead(uint64_t vaddr, uint64_t size);
+	// Non-waiting counterpart for a GPU-side consumer (GPU-indirect argument records): when
+	// [vaddr, size) intersects pending unbounded writes, records the write-fault pass without
+	// waiting for it; publishes marks that already completed. Returns true when unpublished
+	// unbounded writes may still cover the range.
+	[[nodiscard]] bool PublishGpuWritesNoWait(uint64_t vaddr, uint64_t size);
+	// GPU thread: published bound GPU writes cover part of the range (no drain, no publish).
+	[[nodiscard]] bool HasPublishedGpuWrites(uint64_t vaddr, uint64_t size) const {
+		return m_gpu_modified_ranges.Intersects(vaddr, size);
+	}
+	// GPU thread, diagnostics (KYTY_CP_GPU_INDIRECT): the last kGpuIndirectArgsRing argument ranges
+	// drawn with GPU-resident arguments; ReadMemory counts and logs readbacks that touch their pages
+	// (does a host reader still consume GPU-built arguments?).
+	void NoteGpuIndirectArgs(uint64_t vaddr, uint64_t size);
+	// KYTY_SUBMIT_AHEAD producers (GPU thread): the dispatch whose bindings are being written
+	// (0 = none); NoteGpuWrite attributes written pages to it, waited readbacks learn producers.
+	void SetWriterTag(uint64_t writer) noexcept { m_writer_tag = writer; }
+	[[nodiscard]] bool IsSubmitAheadProducer(uint64_t writer) const {
+		return m_submit_ahead.IsProducer(writer);
+	}
+	void NoteSubmitAhead(uint64_t writer);
 	void MarkPageWritten(uint64_t vaddr);      // any thread (fault-processing operation)
 	void MarkWriteFaultOverflow();             // any thread
 	// Safe point between PM4 packets / at garbage collection: records the pending write-fault
@@ -317,6 +346,11 @@ private:
 	SyncStats                                         m_sync_stats;
 	GpuWriteTicks<CACHING_PAGEBITS>                    m_gpu_write_ticks;
 	uint64_t                                          m_bar_block_tick = 0;
+	uint64_t                                          m_writer_tag = 0;
+	SubmitAheadLearner                                m_submit_ahead;
+	static constexpr size_t                           kGpuIndirectArgsRing = 64;
+	std::array<std::pair<uint64_t, uint64_t>, kGpuIndirectArgsRing> m_gpu_indirect_args {}; // page range [first, last)
+	size_t                                            m_gpu_indirect_args_next = 0;
 	bool                                              m_last_download_bar = false;
 	int                                               m_last_bar_reason   = 0; // 1 unmapped, 2 no tick, 3 in flight
 	uint64_t                                          m_last_upload_bytes = 0;

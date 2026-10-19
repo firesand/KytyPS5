@@ -341,6 +341,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
+	m_command_begin = std::chrono::steady_clock::now();
 	m_dynamic_state.Invalidate();
 	if (m_timestamps) {
 		m_timestamps->BeginCommand(m_command.m_buffer, CurrentTick(), m_master.KnownGpuTick());

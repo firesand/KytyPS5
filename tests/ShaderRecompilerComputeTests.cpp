@@ -6,6 +6,7 @@
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "gpu_test_shaders/gpu_test_ms_depth_spv.h"
+#include "gpu_tiler_shaders/pass_through_task_spv.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -22,6 +23,9 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/gpuIndirectFilter.h"
+#include "graphics/host_gpu/renderer/meshTaskIndirect.h"
+#include "graphics/host_gpu/renderer/submitAhead.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -75,6 +79,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -82,6 +87,7 @@
 #include <fstream>
 #include <initializer_list>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -4068,6 +4074,73 @@ public:
                                   vk::ImageCreateFlagBits::e2DArrayCompatible),
             "2D slice views of a compatible 3D backing were rejected");
     std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // KYTY_SUBMIT_AHEAD producer learning through the real buffer cache (--submit-ahead-only sets
+  // KYTY_SUBMIT_AHEAD=1): a write recorded under a writer tag in the open command buffer, then a
+  // readback that has to copy (the tick is not submitted, so no BAR read), makes the tag a producer;
+  // an untagged write teaches nothing.
+  void CheckSubmitAheadLearning() {
+    constexpr const char *name = "SubmitAheadLearning";
+    if (!SubmitAheadConfig::Get().producers) {
+      std::printf("[gpu]     %-32s SKIP KYTY_SUBMIT_AHEAD producers off\n", name);
+      return;
+    }
+    constexpr uintptr_t base = 0x0000000209800000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t untagged_offset = 0x100;
+    constexpr uint64_t tagged_offset = 0x8100; // another 16 KiB tracking page
+    constexpr uint64_t writer = 0x5ab0c0de00000001ull;
+
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "submit-ahead direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "submit-ahead fixed direct-memory mapping failed");
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      (void)cache.ObtainBuffer(base + untagged_offset, 0x100, true, false);
+      cache.ReadMemory(base + untagged_offset, sizeof(uint32_t));
+      Require(name, "untagged write", !cache.IsSubmitAheadProducer(writer),
+              "a readback of an untagged write learned a producer");
+      cache.SetWriterTag(writer);
+      (void)cache.ObtainBuffer(base + tagged_offset, 0x100, true, false);
+      cache.SetWriterTag(0);
+      Require(name, "not yet learned", !cache.IsSubmitAheadProducer(writer),
+              "a tagged write alone made its writer a producer");
+      cache.ReadMemory(base + tagged_offset, sizeof(uint32_t));
+      Require(name, "learned from a waited readback", cache.IsSubmitAheadProducer(writer),
+              "a copy readback of a tagged write in the open command buffer learned nothing");
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "submit-ahead direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "submit-ahead direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
   }
 
   void CheckBufferCacheDirtyGarbageCollection() {
@@ -19275,6 +19348,18 @@ public:
                  .offset_source = DrawOffsetSource::IndirectArgs});
             return ReadCachedTexel(name, context, sparse_color.image_id, {}, {extent, extent, 1});
           };
+          // A packet that names no offset slot patches nothing on the host path, so the plan
+          // mask is irrelevant: eligible even before the shader was ever compiled (a shader whose
+          // records are always empty is never compiled by the host path, ng-147).
+          ShaderDrawParameters no_slots;
+          no_slots.active = true;
+          const auto no_slot_eligible = [&] {
+            auto block = RenderExecutor::GpuIndirectBlock::Other;
+            return executor.CanDrawIndirectOnGpu(scheduler.Current(), true, 1, 1, no_slots, &block) &&
+                   block == RenderExecutor::GpuIndirectBlock::None;
+          };
+          Require("GpuIndirectSrt", "no named slot, plan unknown", no_slot_eligible(),
+                  "a packet naming no offset slot waited for the shader's plan mask");
           // Host route for base instances 5 and 6 (the second record of the same packet): the
           // patched SGPR indexes the table, both reach 5, the target is covered.
           for (const u32 first_instance : {5u, 6u}) {
@@ -19288,6 +19373,8 @@ public:
           Require("GpuIndirectSrt", "fallback",
               !executor.CanDrawIndirectOnGpu(scheduler.Current(), true, 1, 1, indirect.parameters),
               "a shader whose resource plan reads the base-instance SGPR was made eligible");
+          Require("GpuIndirectSrt", "no named slot, plan reads s9", no_slot_eligible(),
+                  "a packet naming no offset slot was rejected for a plan read of an unpatched SGPR");
           // Forcing the GPU variant shows what the fallback prevents: slot 1 is stale (0), so the
           // host evaluates table[0] and the target stays clear.
           shaders.SetGsUserSgpr(1, 0, HW::UserSgprType::Unknown);
@@ -44277,6 +44364,537 @@ void CheckIndirectMeshDraws() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// FPS Stage 2 (reviews/stage2-gpu-indirect-spec-2026-10-18.md): GPU-side indirect mesh draws
+// through the pass-through task shader. Selector --mesh-task-indirect-only.
+static void CheckGpuIndirectReasonNames() {
+  const char *name = "GpuIndirectReasons";
+  using Probe = Libs::Graphics::HostReadProbe;
+  for (uint32_t i = 0; i < Probe::GpuIndirectCount; ++i) {
+    Require(name, "name present",
+            Probe::kGpuIndirectNames[i] != nullptr && Probe::kGpuIndirectNames[i][0] != 0,
+            "a GpuIndirect reason has no name");
+    for (uint32_t j = 0; j < i; ++j) {
+      Require(name, "names distinct",
+              std::strcmp(Probe::kGpuIndirectNames[i], Probe::kGpuIndirectNames[j]) != 0,
+              "two GpuIndirect reasons share a name");
+    }
+  }
+  // The FaultHistogram line prints the Stage 2 reasons from MeshGpuDraws to the end.
+  Require(name, "stage 2 block order",
+          Probe::FallbackSrt + 1 == Probe::MeshGpuDraws &&
+              Probe::StaleSgpr + 1 == Probe::GpuIndirectCount,
+          "the Stage 2 reasons are no longer one block at the end of the enum");
+  std::printf("[host]    %-32s ok (%u)\n", name, static_cast<uint32_t>(Probe::GpuIndirectCount));
+}
+
+static void CheckGpuIndirectHashFilter() {
+  const char *name = "GpuIndirectHashFilter";
+  using Filter = Libs::Graphics::GpuIndirectHashFilter;
+  const auto none = Filter::Parse(nullptr);
+  Require(name, "unset admits none", !none.all && none.hashes.empty() && !none.Contains(0) &&
+                                         !none.Contains(0x67e610ccc37800edull),
+          "an unset list admitted a hash");
+  const auto empty = Filter::Parse("");
+  Require(name, "empty admits none", !empty.Contains(0x1234),
+          "an empty list admitted a hash");
+  const auto all = Filter::Parse("*");
+  Require(name, "star admits all", all.Contains(0) && all.Contains(~0ull),
+          "'*' did not admit every hash");
+  const auto list = Filter::Parse("0x67e610ccc37800ed, ABCDEF;12 zz,0x,123456789abcdef01");
+  Require(name, "list members",
+          list.Contains(0x67e610ccc37800edull) && list.Contains(0xabcdefull) && list.Contains(0x12) &&
+              !list.all,
+          "a listed hash was not admitted");
+  Require(name, "malformed entries ignored",
+          list.hashes.size() == 3 && !list.Contains(0) && !list.Contains(0x123456789abcdef0ull),
+          "a malformed entry was parsed");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// SPIR-V disassembly (friendly names) split into token lines, with OpConstant values by id.
+struct SpirvListing {
+  std::vector<std::vector<std::string>> lines;
+  std::map<std::string, uint64_t> constants;
+
+  explicit SpirvListing(const std::string &text) {
+    std::istringstream input(text);
+    for (std::string line; std::getline(input, line);) {
+      std::istringstream words(line);
+      std::vector<std::string> tokens;
+      for (std::string word; words >> word;) {
+        tokens.push_back(word);
+      }
+      if (tokens.size() >= 5 && tokens[1] == "=" && tokens[2] == "OpConstant") {
+        constants[tokens[0]] = std::strtoull(tokens[4].c_str(), nullptr, 0);
+      }
+      lines.push_back(std::move(tokens));
+    }
+  }
+  // Result id of the OpVariable in `storage_class` ("" when absent).
+  [[nodiscard]] std::string Variable(const char *storage_class) const {
+    for (const auto &tokens : lines) {
+      if (tokens.size() >= 5 && tokens[2] == "OpVariable" && tokens[4] == storage_class) {
+        return tokens[0];
+      }
+    }
+    return {};
+  }
+  // Constant index operands (in order) of every OpAccessChain based on `base`; a non-constant
+  // index is reported as UINT64_MAX.
+  [[nodiscard]] std::vector<std::vector<uint64_t>> AccessChains(const std::string &base) const {
+    std::vector<std::vector<uint64_t>> chains;
+    for (const auto &tokens : lines) {
+      if (base.empty() || tokens.size() < 5 || tokens[2] != "OpAccessChain" || tokens[4] != base) {
+        continue;
+      }
+      std::vector<uint64_t> indices;
+      for (size_t i = 5; i < tokens.size(); ++i) {
+        const auto found = constants.find(tokens[i]);
+        indices.push_back(found == constants.end() ? UINT64_MAX : found->second);
+      }
+      chains.push_back(std::move(indices));
+    }
+    return chains;
+  }
+};
+
+// T1: a non-fast-launch point-list mesh program (this title's packet shape: fl=0, prim=1,
+// ppg=1) on the task path. Guest code stores GS slots 5 and 6 (registers s13 / s14 with
+// user_data_base 0). The slot reads must load payload.first_vertex / first_instance (fields 1 / 2)
+// and no draw dword may come from push constants (the task shader's push block occupies push
+// dwords 0-5). Fails on bc40a55: the reads came from the shader-data dwords, dwords 3-5 from
+// push constants.
+static void CheckMeshTaskPathEmission() {
+  const char *name = "MeshTaskPathEmission";
+  const u32 code[] = {
+      EncodeSMovB32(124, 255), 0x1001u, // m0: 1 primitive, 1 vertex
+      EncodeSopp(0x10, 9),              // s_sendmsg GS_ALLOC_REQ
+      EncodeVop1(0x01, 0, 128),         // v0 = 0
+      EncodeVop1(0x01, 9, 13),          // v9 = s13 (GS slot 5)
+      EncodeMubuf0(0x1c), EncodeMubuf1(9, 2, 5),
+      EncodeVop1(0x01, 10, 14),         // v10 = s14 (GS slot 6)
+      EncodeMubuf0(0x1c, 4), EncodeMubuf1(10, 2, 5),
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 0, 0, 0),
+      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0),
+      EncodeSopp(0x01),
+  };
+  const auto compile = [&](bool task_path, std::string &assembly) {
+    ShaderVertexInputInfo input{};
+    input.logical_stage = ShaderType::Mesh;
+    input.pa_cl_vs_out_cntl = 0x00c0f00fu;
+    auto &mesh = input.mesh;
+    mesh.input_primitive = static_cast<u32>(Prospero::PrimitiveType::kPointList);
+    mesh.fast_launch = false;
+    mesh.wave_size = 64;
+    mesh.host_subgroup_size = 32;
+    mesh.threads_num[0] = 64;
+    mesh.threads_num[1] = mesh.threads_num[2] = 1;
+    mesh.lds_size_dwords = 3840;
+    mesh.primitives_per_group = 1;
+    mesh.vertices_per_group = 1;
+    mesh.max_vertices = 64;
+    mesh.max_primitives = 64;
+    if (task_path) {
+      // What GetGraphicsPrograms applies for a GPU-indirect mesh packet naming GS slots 5 / 6.
+      ShaderDrawParameters draw;
+      draw.active = true;
+      draw.base_vertex_slot = 5;
+      draw.base_instance_slot = 6;
+      ApplyDrawParameters(input, &draw);
+      Require(name, "task path applied", input.mesh_task_indirect,
+              "ApplyDrawParameters did not select the task path for a mesh program");
+    }
+    std::array<u32, 16> user_data{};
+    user_data[8] = 0x10000008u; // V# in s[8:11]
+    user_data[9] = 4u << 16u;
+    user_data[10] = 64u;
+    user_data[11] = 0x00027000u;
+    user_data[13] = 0x1234u;
+    user_data[14] = 0x5678u;
+    ShaderRecompiler::CompileOptions options{};
+    options.stage = ShaderType::Mesh;
+    options.wave_size = 64;
+    options.input_info.vertex = &input;
+    options.user_data = user_data;
+    options.user_data_base = 0; // production value for Mesh (pipelineCache.cpp)
+    auto translated = ShaderRecompiler::TranslateProgram(code, options);
+    auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+    ShaderRecompiler::IR::ResourceSnapshot resources;
+    ShaderRecompiler::IR::ResourceSpecialization specialization;
+    const ShaderRecompiler::IR::SrtRuntime runtime{
+        .user_data = options.user_data,
+        .shader_base = reinterpret_cast<uint64_t>(code),
+    };
+    Require(name, "resource materialization",
+            ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization),
+            "mesh test resources did not materialize");
+    const auto result = ShaderRecompiler::CompileProgram(
+        std::move(translated), options, specialization,
+        ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
+    std::string messages;
+    tools.SetMessageConsumer([&messages](spv_message_level_t, const char *,
+                                         const spv_position_t &position, const char *message) {
+      char buffer[512];
+      std::snprintf(buffer, sizeof(buffer), "%zu:%zu: %s\n", position.line, position.column,
+                    message);
+      messages += buffer;
+    });
+    if (!tools.Validate(result.spirv)) {
+      Fail(name, task_path ? "task-path SPIR-V validation" : "host-path SPIR-V validation",
+           messages);
+    }
+    Require(name, "disassembly", tools.Disassemble(result.spirv, &assembly),
+            "failed to disassemble the mesh program");
+    return plan.user_data_mask;
+  };
+  // Constant push-constant dword indices below MeshDrawDwordCount (draw dwords).
+  const auto draw_dword_reads = [](const SpirvListing &listing) {
+    std::set<uint64_t> dwords;
+    // Push-constant element loads are {member 0, dword}.
+    for (const auto &chain : listing.AccessChains(listing.Variable("PushConstant"))) {
+      if (chain.size() == 2 && chain[1] < ShaderRecompiler::IR::PushData::MeshDrawDwordCount) {
+        dwords.insert(chain[1]);
+      }
+    }
+    return dwords;
+  };
+
+  // Negative control: the host-path program reads draw dwords 3-5 (index size / address) from
+  // push constants, so the check below can see the pattern.
+  std::string host_assembly;
+  (void)compile(false, host_assembly);
+  const SpirvListing host(host_assembly);
+  const auto host_dwords = draw_dword_reads(host);
+  Require(name, "host path control",
+          host.Variable("TaskPayloadWorkgroupEXT").empty() && host_dwords.count(3) != 0 &&
+              host_dwords.count(4) != 0 && host_dwords.count(5) != 0,
+          "the host-path mesh program no longer reads draw dwords 3-5 from push constants; the "
+          "task-path assertions below would prove nothing");
+
+  std::string task_assembly;
+  const auto task_mask = compile(true, task_assembly);
+  const SpirvListing task(task_assembly);
+  const auto payload = task.Variable("TaskPayloadWorkgroupEXT");
+  Require(name, "payload declared", !payload.empty(),
+          "the task-path mesh program declares no TaskPayloadWorkgroupEXT variable");
+  std::set<uint64_t> fields;
+  for (const auto &chain : task.AccessChains(payload)) {
+    Require(name, "payload chain shape", chain.size() == 1 && chain[0] != UINT64_MAX,
+            "a payload access chain does not use one constant field index");
+    fields.insert(chain[0]);
+  }
+  Require(name, "vertex count from payload", fields.count(0) != 0,
+          "draw dword 0 (vertex count) is not loaded from payload field 0");
+  Require(name, "base vertex slot from payload", fields.count(1) != 0,
+          "the GS slot 5 read (s13) is not served by payload field 1 (first_vertex)");
+  Require(name, "base instance slot from payload", fields.count(2) != 0,
+          "the GS slot 6 read (s14) is not served by payload field 2 (first_instance)");
+  const auto task_dwords = draw_dword_reads(task);
+  std::string listed;
+  for (const auto dword : task_dwords) {
+    listed += " " + std::to_string(dword);
+  }
+  Require(name, "no draw dwords from push constants", task_dwords.empty(),
+          "the task-path program reads draw dword(s)" + listed +
+              " from push constants, which the task shader's push block overwrites");
+  Require(name, "no draw-parameter built-ins",
+          task_assembly.find("BuiltIn BaseVertex") == std::string::npos &&
+              task_assembly.find("BuiltIn BaseInstance") == std::string::npos,
+          "a mesh program declared a vertex-stage draw-parameter built-in");
+  // The resource plan must not depend on the slots (else the gate's SRT check rejects them).
+  ShaderDrawParameters slots;
+  slots.base_vertex_slot = 5;
+  slots.base_instance_slot = 6;
+  Require(name, "plan independent of the slots",
+          (task_mask & DrawParameterSlotMask(slots, kMeshUserSgprBase)) == 0,
+          "the resource plan reads a GS offset slot; the gate would keep this program on the host");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// T2: the pass-through task shader's push block fits in the push dwords the task-path mesh
+// program leaves free (0-5; its shader data starts at MeshDrawDwordCount), and the compiled GLSL
+// block (pass_through_task_spv.h) has the C++ layout (meshTaskIndirect.h) and spec constant ids.
+// Fails on bc40a55 (a 32-byte block).
+static void CheckMeshTaskPushLayout() {
+  const char *name = "MeshTaskPushLayout";
+  constexpr u32 budget = ShaderRecompiler::IR::PushData::MeshDrawDwordCount * 4u;
+  Require(name, "push budget", kTaskPushBytes <= budget,
+          "the task push block (" + std::to_string(kTaskPushBytes) + " bytes) overlaps the mesh "
+          "program's shader-data window at byte " + std::to_string(budget));
+  Require(name, "C++ layout",
+          offsetof(MeshTaskPushConstants, args_bda) == 0 &&
+              offsetof(MeshTaskPushConstants, stride) == 8 &&
+              offsetof(MeshTaskPushConstants, primitive_info) == 12 &&
+              offsetof(MeshTaskPushConstants, counters_bda) == 16,
+          "MeshTaskPushConstants changed; update pass_through_task.task and this test");
+  Require(name, "primitive info packing",
+          PackMeshTaskPrimitiveInfo(62, 3, 1) == (62u | (3u << 16u) | (1u << 24u)),
+          "PackMeshTaskPrimitiveInfo does not match the task shader's unpacking");
+
+  constexpr u32 kOpTypeInt = 21, kOpTypeStruct = 30, kOpTypePointer = 32, kOpVariable = 59,
+                kOpDecorate = 71, kOpMemberDecorate = 72;
+  constexpr u32 kDecorationSpecId = 1, kDecorationOffset = 35, kStorageClassPushConstant = 9;
+  const std::span<const u32> words(PASS_THROUGH_TASK_SPV);
+  Require(name, "SPIR-V header", words.size() > 5 && words[0] == 0x07230203u,
+          "pass_through_task_spv.h is not a SPIR-V module");
+  std::map<u32, u32> int_width;
+  std::map<u32, std::vector<u32>> struct_members;
+  std::map<u32, std::pair<u32, u32>> pointer_types; // id -> storage class, pointee
+  std::map<std::pair<u32, u32>, u32> member_offsets;
+  std::set<u32> spec_ids;
+  u32 push_pointer_type = 0;
+  for (size_t at = 5; at < words.size();) {
+    const u32 count = words[at] >> 16u;
+    const u32 opcode = words[at] & 0xffffu;
+    Require(name, "SPIR-V instruction stream", count != 0 && at + count <= words.size(),
+            "malformed instruction in the task shader module");
+    const auto operands = words.subspan(at + 1, count - 1);
+    switch (opcode) {
+      case kOpTypeInt:
+        int_width[operands[0]] = operands[1];
+        break;
+      case kOpTypeStruct:
+        struct_members[operands[0]].assign(operands.begin() + 1, operands.end());
+        break;
+      case kOpTypePointer:
+        pointer_types[operands[0]] = {operands[1], operands[2]};
+        break;
+      case kOpVariable:
+        if (operands.size() >= 3 && operands[2] == kStorageClassPushConstant) {
+          Require(name, "one push block", push_pointer_type == 0,
+                  "the task shader declares two push-constant variables");
+          push_pointer_type = operands[0];
+        }
+        break;
+      case kOpDecorate:
+        if (operands.size() >= 3 && operands[1] == kDecorationSpecId) {
+          spec_ids.insert(operands[2]);
+        }
+        break;
+      case kOpMemberDecorate:
+        if (operands.size() >= 4 && operands[2] == kDecorationOffset) {
+          member_offsets[{operands[0], operands[1]}] = operands[3];
+        }
+        break;
+      default: break;
+    }
+    at += count;
+  }
+  Require(name, "push block present", pointer_types.count(push_pointer_type) != 0,
+          "the task shader declares no push-constant block");
+  const u32 block = pointer_types[push_pointer_type].second;
+  Require(name, "push block struct", struct_members.count(block) != 0,
+          "the task shader's push constant is not a struct");
+  std::vector<u32> offsets;
+  u32 block_end = 0;
+  const auto &members = struct_members[block];
+  for (u32 member = 0; member < members.size(); ++member) {
+    const auto offset = member_offsets.find({block, member});
+    Require(name, "member offsets", offset != member_offsets.end() && int_width.count(members[member]) != 0,
+            "a push block member has no Offset or is not an integer");
+    offsets.push_back(offset->second);
+    block_end = std::max(block_end, offset->second + int_width[members[member]] / 8u);
+  }
+  Require(name, "GLSL layout matches C++",
+          offsets == std::vector<u32>{0, 8, 12, 16} && block_end == kTaskPushBytes,
+          "pass_through_task.task's push block (" + std::to_string(block_end) +
+              " bytes) does not match MeshTaskPushConstants (" + std::to_string(kTaskPushBytes) +
+              " bytes)");
+  Require(name, "spec constant ids",
+          spec_ids == std::set<u32>{kTaskSpecMaxGroupsX, kTaskSpecMaxGroupsY, kTaskSpecMaxGroupsTotal},
+          "the task shader's specialization constants do not match meshTaskIndirect.h");
+  std::printf("[host]    %-32s ok (%u bytes)\n", name, kTaskPushBytes);
+}
+
+// T3: ApplyDrawParameters (what GetGraphicsPrograms does for a GPU-indirect packet). Mesh programs
+// take the task path and keep the packet's slots, so the static program key separates programs by
+// slot (the slot reads are compiled in); vertex programs keep their rebase rule.
+static void CheckApplyDrawParameters() {
+  const char *name = "ApplyDrawParameters";
+  const auto parameters = [](u32 vertex_slot, u32 instance_slot) {
+    ShaderDrawParameters draw;
+    draw.active = true;
+    draw.base_vertex_slot = vertex_slot;
+    draw.base_instance_slot = instance_slot;
+    return draw;
+  };
+  const auto mesh_input = [] {
+    ShaderVertexInputInfo input{};
+    input.logical_stage = ShaderType::Mesh;
+    input.mesh.threads_num[0] = 64;
+    input.mesh.primitives_per_group = 1;
+    input.mesh.input_primitive = static_cast<u32>(Prospero::PrimitiveType::kPointList);
+    return input;
+  };
+  const auto key_of = [](const ShaderVertexInputInfo &input) {
+    std::vector<u32> key;
+    BuildStageStaticKey(input, key);
+    return key;
+  };
+
+  auto untouched = mesh_input();
+  ApplyDrawParameters(untouched, nullptr);
+  ShaderDrawParameters inactive;
+  inactive.base_vertex_slot = 5;
+  ApplyDrawParameters(untouched, &inactive);
+  Require(name, "no packet map", !untouched.mesh_task_indirect && !untouched.draw_parameters.active,
+          "a missing or inactive map changed the program");
+
+  const auto slots_56 = parameters(5, 6);
+  auto mesh = mesh_input();
+  ApplyDrawParameters(mesh, &slots_56);
+  Require(name, "mesh keeps its slots",
+          mesh.mesh_task_indirect && mesh.draw_parameters.active &&
+              mesh.draw_parameters.base_vertex_slot == 5 &&
+              mesh.draw_parameters.base_instance_slot == 6 && !mesh.draw_parameters.rebase_ids,
+          "a mesh program did not take the task path with the packet's slots");
+
+  auto mesh_same = mesh_input();
+  ApplyDrawParameters(mesh_same, &slots_56);
+  const auto slots_57 = parameters(5, 7);
+  auto mesh_other = mesh_input();
+  ApplyDrawParameters(mesh_other, &slots_57);
+  const auto slots_none = parameters(ShaderDrawParameters::kNoSlot, 6);
+  auto mesh_none = mesh_input();
+  ApplyDrawParameters(mesh_none, &slots_none);
+  const auto key = key_of(mesh);
+  Require(name, "same slots share a program", key == key_of(mesh_same),
+          "identical packets produced different program keys");
+  Require(name, "slots separate programs",
+          key != key_of(mesh_other) && key != key_of(mesh_none) && key != key_of(mesh_input()),
+          "mesh programs with different packet slots (or none) share a program key");
+
+  ShaderVertexInputInfo vertex{};
+  ApplyDrawParameters(vertex, &slots_56);
+  ShaderVertexInputInfo embedded{};
+  embedded.fetch_embedded = true;
+  ApplyDrawParameters(embedded, &slots_56);
+  Require(name, "vertex rule unchanged",
+          !vertex.mesh_task_indirect && vertex.draw_parameters.rebase_ids &&
+              vertex.draw_parameters.base_vertex_slot == 5 && !embedded.mesh_task_indirect &&
+              !embedded.draw_parameters.rebase_ids,
+          "vertex programs lost the native-fetch rebase rule or took the mesh path");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// Wait-reason attribution of readbacks: names complete and distinct; the outermost declared
+// reason wins and CurrentOr (what ReadMemory carries to the GPU thread) honours it.
+static void CheckWaitReasonAttribution() {
+  const char *name = "WaitReasonAttribution";
+  using Probe = Libs::Graphics::WaitReasonProbe;
+  for (uint32_t i = 0; i < Probe::ReasonCount; ++i) {
+    for (uint32_t j = 0; j < i; ++j) {
+      Require(name, "names distinct", std::strcmp(Probe::Name(i), Probe::Name(j)) != 0,
+              "two wait reasons share a name");
+    }
+  }
+  Require(name, "undeclared", Probe::CurrentOr(Probe::ReadFaultGuest) == Probe::ReadFaultGuest,
+          "with no declared reason the caller's fallback must be used");
+  {
+    Libs::Graphics::WaitReasonScope outer(Probe::DrawArgs);
+    Require(name, "declared wins", Probe::CurrentOr(Probe::ReadFaultGpu) == Probe::DrawArgs,
+            "a host read inside a declared scope lost its reason");
+    Libs::Graphics::WaitReasonScope inner(Probe::Download);
+    Require(name, "outermost wins", Probe::CurrentOr(Probe::Other) == Probe::DrawArgs,
+            "an inner scope overrode the outer reason");
+  }
+  Require(name, "scope restored", Probe::CurrentOr(Probe::BackingRead) == Probe::BackingRead,
+          "a wait-reason scope leaked past its end");
+  std::printf("[host]    %-32s ok (%u)\n", name, static_cast<uint32_t>(Probe::ReasonCount));
+}
+
+// KYTY_SUBMIT_AHEAD decision logic (submitAhead.h), host only.
+static void CheckSubmitAheadLogic() {
+  const char *name = "SubmitAheadLogic";
+  using Config = Libs::Graphics::SubmitAheadConfig;
+  Require(name, "config off", !Config::Parse(nullptr, nullptr).Enabled() &&
+                                  !Config::Parse("0", "2").Enabled() && !Config::Parse("x", nullptr).Enabled(),
+          "submit-ahead enabled without KYTY_SUBMIT_AHEAD=1|p|t");
+  const auto both = Config::Parse("1", nullptr);
+  const auto producers = Config::Parse("p", "2");
+  const auto timer = Config::Parse("t", "2.5");
+  const auto bad_ms = Config::Parse("t", "abc");
+  Require(name, "config modes",
+          both.producers && both.timer_ns == 4000000u && producers.producers && producers.timer_ns == 0 &&
+              !timer.producers && timer.timer_ns == 2500000u && bad_ms.timer_ns == 4000000u,
+          "KYTY_SUBMIT_AHEAD / _MS parsed wrongly");
+
+  Libs::Graphics::SubmitAheadLearner learner;
+  learner.NoteWrite(10, 12, 0xaa);
+  learner.NoteWrite(100, 100 + Libs::Graphics::SubmitAheadLearner::kMaxWritePages + 1, 0xbb);
+  uint64_t learned = 0;
+  Require(name, "BAR readback teaches nothing", learner.NoteReadback(11, 12, false) == 0 &&
+                                                    !learner.IsProducer(0xaa),
+          "a readback served over BAR learned a producer");
+  Require(name, "waited readback learns", learner.NoteReadback(11, 12, true, &learned) == 1 &&
+                                              learned == 0xaa && learner.IsProducer(0xaa),
+          "a waited readback of a written page did not learn its writer");
+  Require(name, "heap writes ignored", learner.NoteReadback(100, 101, true) == 0 && !learner.IsProducer(0xbb),
+          "a write larger than kMaxWritePages was attributed");
+  for (uint32_t i = 0; i < Libs::Graphics::SubmitAheadLearner::kIdleLimit; ++i) {
+    learner.NoteSubmitAhead(0xaa);
+  }
+  (void)learner.NoteReadback(10, 11, false); // BAR read of its page: alive again
+  learner.NoteSubmitAhead(0xaa);
+  Require(name, "readback keeps a producer", learner.IsProducer(0xaa),
+          "a producer whose pages were read back was forgotten");
+  for (uint32_t i = 0; i <= Libs::Graphics::SubmitAheadLearner::kIdleLimit; ++i) {
+    learner.NoteSubmitAhead(0xaa);
+  }
+  Require(name, "idle producer forgotten", !learner.IsProducer(0xaa) && learner.ProducerCount() == 0,
+          "a producer without readbacks survived kIdleLimit submit-aheads");
+
+  using Trigger = Libs::Graphics::SubmitAheadTrigger;
+  Trigger trigger;
+  const auto work = Trigger::Packet::Work;
+  Require(name, "first work packet never submits",
+          trigger.Before(work, 5, 100000000u, false, both) == Trigger::Reason::None,
+          "submitted before anything was recorded into the command buffer");
+  Require(name, "registers never submit",
+          trigger.Before(Trigger::Packet::Register, 5, 100000000u, false, both) == Trigger::Reason::None &&
+              trigger.Before(Trigger::Packet::Benign, 5, 100000000u, false, both) == Trigger::Reason::None,
+          "submitted before a register write or a benign packet");
+  trigger.ProducerRecorded(5, 0xcc);
+  const auto producer_reason = trigger.Before(work, 5, 0, true, both);
+  Require(name, "producer submits even in a render pass",
+          producer_reason == Trigger::Reason::Producer && trigger.Submitted(producer_reason, 6) == 0xcc,
+          "a recorded producer did not trigger a submit at the next work packet");
+  trigger.ProducerRecorded(6, 0xdd);
+  (void)trigger.Before(work, 7, 0, false, both); // another path submitted: the producer is gone
+  Require(name, "stale producer ignored", trigger.Before(work, 7, 0, false, both) == Trigger::Reason::None,
+          "a producer recorded into an already submitted command buffer triggered a submit");
+  Require(name, "timer below threshold", trigger.Before(work, 7, 3999999u, false, both) == Trigger::Reason::None,
+          "the timer fired early");
+  Require(name, "timer waits for the render pass",
+          trigger.Before(work, 7, 5000000u, true, both) == Trigger::Reason::None &&
+              trigger.Before(work, 7, 12000000u, true, both) == Trigger::Reason::Timer,
+          "the timer split an open render pass before 3x its threshold");
+  const auto timer_reason = trigger.Before(work, 7, 4000000u, false, timer);
+  Require(name, "timer outside a render pass",
+          timer_reason == Trigger::Reason::Timer && trigger.Submitted(timer_reason, 8) == 0,
+          "the timer did not fire outside a render pass");
+  Require(name, "producers off",
+          [&] {
+            Trigger off;
+            (void)off.Before(work, 1, 0, false, timer);
+            off.ProducerRecorded(1, 0xee);
+            return off.Before(work, 1, 0, false, timer) == Trigger::Reason::None;
+          }(),
+          "a producer triggered a submit with KYTY_SUBMIT_AHEAD=t");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+void CheckMeshTaskIndirect() {
+  CheckGpuIndirectReasonNames();
+  CheckSubmitAheadLogic();
+  CheckWaitReasonAttribution();
+  CheckGpuIndirectHashFilter();
+  CheckMeshTaskPathEmission();
+  CheckMeshTaskPushLayout();
+  CheckApplyDrawParameters();
+}
+
 void CheckDepthTargetFootprints() {
   TileSizeAlign stencil{};
   TileSizeAlign htile{};
@@ -47132,6 +47750,17 @@ int main(int argc, char **argv) {
     CheckIndirectMeshDraws();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--mesh-task-indirect-only") == 0) {
+    CheckMeshTaskIndirect();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--submit-ahead-only") == 0) {
+    setenv("KYTY_SUBMIT_AHEAD", "1", 0); // an explicit value from the caller wins
+    CheckSubmitAheadLogic();
+    VulkanHarness vulkan;
+    vulkan.CheckSubmitAheadLearning();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--depth-feedback-only") == 0) {
     CheckDepthAttachmentWrites();
     CheckDepthFeedbackAspects();
@@ -47450,6 +48079,7 @@ int main(int argc, char **argv) {
   CheckPm4CeCompletion(vulkan.RuntimeRenderer());
   CheckEmbeddedFetchVertexOffset();
   CheckIndirectMeshDraws();
+  CheckMeshTaskIndirect();
   CheckEmbeddedFetchLaneSpill();
   CheckTessellationPrograms();
   CheckPixelParameterAliases();

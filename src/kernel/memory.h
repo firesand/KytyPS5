@@ -116,6 +116,9 @@ bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 const void*            TryGetBackingPointer(uint64_t vaddr, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
+// Calling thread's count of TryReadBufferBacking calls that downloaded GPU-dirty bytes first, and
+// the last such address (diagnostics: which program walk reads GPU-written memory).
+uint64_t               BufferBackingDownloads(uint64_t* last_address);
 // Host-resident guest memory prototype: guest vaddr -> direct-memory (backing object) offset for a
 // range mapped as one contiguous run, and the permanent always-writable host view of the object.
 bool                   QueryBackingOffset(uint64_t vaddr, uint64_t size, uint64_t* backing_offset);
