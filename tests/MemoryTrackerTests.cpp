@@ -1915,6 +1915,34 @@ void TestWriteWatchLabels() {
   Check(write_watch->WasLabelWritten(label, 8), "a label in an unregistered range must count as written");
 }
 
+// The label pass scans nearby label pages as one range; another written page it meets there is
+// reported like any collected run.
+void TestWriteWatchLabelPassMergesRanges() {
+  auto *write_watch = WriteWatch::Get();
+  constexpr uint64_t page = TRACKER_PAGE_SIZE;
+  auto view = MapWriteWatchView(8);
+  const auto first_label = view.Address() + page;
+  const auto second_label = view.Address() + 6 * page;
+  (void)write_watch->WasLabelWritten(first_label, 8); // both join the label set
+  (void)write_watch->WasLabelWritten(second_label, 8);
+  write_watch->CollectLabels([](uint64_t, uint64_t) {});
+  view.memory[3 * page] = 1; // between the labels
+  (void)WriteWatch::TakeStats();
+  std::vector<std::pair<uint64_t, uint64_t>> runs;
+  write_watch->CollectLabels(
+      [&](uint64_t start, uint64_t bytes) { runs.emplace_back(start, start + bytes); });
+  const auto stats = WriteWatch::TakeStats();
+  const auto &labels = stats.sources[static_cast<size_t>(WriteWatch::Source::Labels)];
+  Check(labels.calls == 1 && labels.ranges == 1 && labels.ioctls == 1,
+        "nearby label pages were not scanned as one range");
+  Check(runs.size() == 1 && runs[0].first == view.Address() + 3 * page &&
+            runs[0].second == view.Address() + 4 * page,
+        "the label pass did not report exactly the page written between the labels");
+  Check(!write_watch->WasLabelWritten(first_label, 8) && !write_watch->WasLabelWritten(second_label, 8),
+        "a write next to the labels made them count as written");
+  UnmapWriteWatchView(view);
+}
+
 void RunWriteWatchCases() {
   setenv("KYTY_WRITE_WATCH", "1", 1);
   if (WriteWatch::Get() == nullptr) {
@@ -1929,6 +1957,7 @@ void RunWriteWatchCases() {
   TestWriteWatchUnalignedCollection();
   TestWriteWatchFullCollectionCrossesPlaceholders();
   TestWriteWatchLabels();
+  TestWriteWatchLabelPassMergesRanges();
   std::puts("MemoryTrackerTests: write-watch cases passed");
   std::exit(0);
 }

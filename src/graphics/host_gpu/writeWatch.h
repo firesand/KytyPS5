@@ -5,11 +5,13 @@
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <functional>
 #include <mutex>
 #include <shared_mutex>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -28,17 +30,47 @@ namespace Libs::Graphics {
 class WriteWatch final {
 public:
 	using RunFunc = std::function<void(uint64_t vaddr, uint64_t size)>;
+	using Ranges  = std::vector<std::pair<uint64_t, uint64_t>>; // [start, end)
+
+	// Who asked for a scan (per-source statistics).
+	enum class Source : uint8_t {
+		Inline,     // Collect: bindings, fault passes, single ranges
+		Rearm,      // Rearm: a run gaining its first write watcher
+		Full,       // CollectRanges: the span pass of a full collection
+		Prearm,     // CollectRanges: the regions a BDA sync is about to upload
+		Labels,     // CollectLabels: the label pass of a full collection
+		LabelCheck, // WasLabelWritten's report-only scan
+		Count
+	};
+	struct SourceStats {
+		uint64_t calls  = 0;
+		uint64_t ioctls = 0;
+		uint64_t ns     = 0;
+		uint64_t walked = 0; // bytes handed to PAGEMAP_SCAN (a re-walk after a full vector counts again)
+		uint64_t ranges = 0; // merged ranges scanned (CollectRanges, CollectLabels)
+		uint64_t pages  = 0; // written pages reported
+	};
 
 	struct Stats {
-		uint64_t collects      = 0; // Collect calls
-		uint64_t ioctls        = 0; // PAGEMAP_SCAN calls (Collect and WasWritten)
+		uint64_t collects      = 0; // Collect and CollectRanges calls (Rearm included, labels not)
+		uint64_t ioctls        = 0; // PAGEMAP_SCAN calls (every source)
 		uint64_t pages         = 0; // written pages reported
 		uint64_t errors        = 0; // failed scans, reported as fully written
-		uint64_t ns            = 0; // time inside Collect
+		uint64_t ns            = 0; // time inside Collect and CollectRanges (not labels)
 		uint64_t label_checks  = 0; // WasLabelWritten calls
 		uint64_t label_written = 0; // ... that returned true
-		uint64_t range_passes  = 0; // CollectRanges calls (full collections)
+		uint64_t range_passes  = 0; // full collections (CollectRanges, Source::Full)
 		uint64_t rearms        = 0; // Rearm calls (pages gaining their first write watcher)
+		uint64_t rearm_skipped = 0; // pages that gained it inside a PageManager::PrearmScope
+		std::array<SourceStats, static_cast<size_t>(Source::Count)> sources {};
+		// Why WasLabelWritten answered "written" (first reason that applied).
+		uint64_t label_scanning  = 0; // a label scan was running when the check began
+		uint64_t label_unknown   = 0; // page not in the label set yet (or the set is full)
+		uint64_t label_flagged   = 0; // a collection re-protected the page after a write
+		uint64_t label_uncovered = 0; // page outside every registered view
+		uint64_t label_scanned   = 0; // the report-only scan found the page written
+		uint64_t label_raced     = 0; // a label scan overlapped the check
+		uint64_t label_set       = 0; // label pages known (gauge, bounded)
 	};
 
 	// The process-wide instance, or nullptr when write-watch is off: KYTY_WRITE_WATCH unset, a
@@ -68,12 +100,17 @@ public:
 	// released. A failed scan reports its whole chunk. Any thread.
 	void Collect(uint64_t vaddr, uint64_t size, const RunFunc& func) noexcept;
 	// One pass over many [start, end) ranges (a full collection), same result contract as Collect.
-	// Ranges closer than 64 MiB are scanned as one: a gap's placeholders and unwatched pages cost a
-	// short walk, a separate ioctl costs far more (ng-154: about 4200 ioctls per collection when
-	// every watched span had its own). The merged ranges cross unregistered placeholders, so the
-	// scan skips unregistered VMAs instead of failing on them; every registered guest view is in
-	// the registry (RegisterView/UnregisterView), so none is skipped by mistake.
-	void CollectRanges(std::vector<std::pair<uint64_t, uint64_t>> ranges, const RunFunc& func) noexcept;
+	// Ranges closer than a merge gap are scanned as one: a gap's placeholders and unwatched pages
+	// cost a short walk, a separate ioctl costs more (ng-154: about 4200 ioctls per collection
+	// when every watched span had its own). The gap is KYTY_WRITE_WATCH_MERGE_GAP_MB (default 64)
+	// for Source::Full and 8 MiB for Source::Prearm (4 MiB regions; the prototype puts the
+	// break-even between an ioctl and a walk at about 4-10 MiB). The merged ranges cross
+	// unregistered placeholders, so the scan skips unregistered VMAs instead of failing on them;
+	// every registered guest view is in the registry (RegisterView/UnregisterView), so none is
+	// skipped by mistake. scanned (optional) receives the merged ranges, sorted and disjoint:
+	// every page of them was re-protected by this pass (left empty when a scan failed).
+	void CollectRanges(Ranges ranges, const RunFunc& func, Source source = Source::Full,
+	                   Ranges* scanned = nullptr) noexcept;
 	// Re-protects [vaddr, vaddr + size) and drops what it reports: for pages gaining their first
 	// write watcher, whose earlier writes nobody tracked (PageManager; the protect a fault-based
 	// watcher would have applied). Label pages it re-protects are still flagged. Any thread.
@@ -85,7 +122,12 @@ public:
 	// seen for the first time join the label set (bounded). Any thread.
 	[[nodiscard]] bool WasLabelWritten(uint64_t vaddr, uint64_t size) noexcept;
 	// Collects every known label page (call first in a full collection; same result contract).
+	// Label pages closer than 8 MiB are scanned as one range, so the pass may also report other
+	// written pages; the caller applies them like any collected run.
 	void CollectLabels(const RunFunc& func) noexcept;
+
+	// PageManager: pages that gained their first write watcher inside a PrearmScope, not re-armed.
+	static void NoteRearmSkipped(uint64_t pages) noexcept;
 
 	static Stats TakeStats() noexcept;
 
@@ -95,10 +137,14 @@ private:
 
 	static WriteWatch* Create() noexcept;
 
+	void CollectFrom(uint64_t vaddr, uint64_t size, const RunFunc& func, Source source) noexcept;
 	// One PAGEMAP_SCAN pass over [start, end); appends written runs. check_async: fail on an
 	// unregistered VMA (one registered view) instead of skipping it (a merged range).
-	void ScanChunk(uint64_t start, uint64_t end, std::vector<std::pair<uint64_t, uint64_t>>* runs,
-	               bool check_async = true) noexcept;
+	// Returns false when a call failed (its rest was reported as written, not re-protected).
+	bool ScanChunk(uint64_t start, uint64_t end, Ranges* runs, bool check_async, Source source) noexcept;
+	// The registered parts of the merged ranges, in chunks of at most chunk bytes, check_async off.
+	// Returns false when a scan failed.
+	bool ScanMerged(const Ranges& merged, uint64_t chunk, Ranges* runs, Source source) noexcept;
 	// Report-only: any written page in [start, end) of a registered view?
 	[[nodiscard]] bool AnyWritten(uint64_t start, uint64_t end) noexcept;
 	void NoteLabelRuns(const std::vector<std::pair<uint64_t, uint64_t>>& runs) noexcept;

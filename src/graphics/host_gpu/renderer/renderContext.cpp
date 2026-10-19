@@ -274,6 +274,21 @@ struct FaultSampler {
 			                    wwb.fault_pass_collects, wwb.ownership_unscanned, ww.ioctls, ww.pages,
 			                    g_ww_applied_pages.exchange(0, std::memory_order_relaxed), ww.errors,
 			                    ww.ns / 1000000, ww.label_written, ww.label_checks);
+			// Per scan source: calls, ioctls, ms, MiB handed to PAGEMAP_SCAN, merged ranges, pages
+			// reported. "labels" is not in "ms" above.
+			static constexpr const char* kSources[] = {"inline", "rearm", "full", "prearm", "labels", "check"};
+			static_assert(std::size(kSources) == static_cast<size_t>(WriteWatch::Source::Count));
+			line += " | ww-src";
+			for (size_t i = 0; i < ww.sources.size(); ++i) {
+				const auto& source = ww.sources[i];
+				line += fmt::format(" {} c {} i {} ms {} MiB {} r {} p {};", kSources[i], source.calls,
+				                    source.ioctls, source.ns / 1000000, source.walked >> 20, source.ranges,
+				                    source.pages);
+			}
+			line += fmt::format(" rearm-skipped {} | ww-label-written scanning {} unknown {} flagged {} "
+			                    "uncovered {} scanned {} raced {} set {}",
+			                    ww.rearm_skipped, ww.label_scanning, ww.label_unknown, ww.label_flagged,
+			                    ww.label_uncovered, ww.label_scanned, ww.label_raced, ww.label_set);
 		}
 		line += fmt::format(" | host-resident binds {} bytes {} KiB fallbacks {}", resident_all.binds,
 		                    resident_all.bytes >> 10, resident_all.fallbacks);
