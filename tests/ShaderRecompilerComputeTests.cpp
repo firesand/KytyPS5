@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/hostResidentMemory.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "graphics/host_gpu/renderer/cache/writeCombinedCopy.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/gpuIndirectFilter.h"
@@ -4166,6 +4167,103 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
             "readback-classification direct-memory allocation release failed");
     std::printf("[gpu]     %-32s ok (open read: %s, finished read: %s)\n", name, open_kind, finished_kind);
+  }
+
+  // Stage 3a: a GPU fill at a non-16-aligned offset, read back after Finish (BAR when the cache
+  // buffer is host-visible), must land byte-exactly in guest memory and leave the neighbours alone;
+  // and the ClampRangeSize memo must follow map edits.
+  void CheckBarReadbackBytes() {
+    constexpr const char *name = "BarReadbackBytes";
+    constexpr uintptr_t base = 0x0000000209800000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t fill_offset = 0x8104; // 4 mod 16: unaligned head for the streaming loads
+    constexpr uint64_t fill_size = 0x1234;
+    constexpr uint32_t fill_value = 0x5ab0c0deu;
+    using Probe = Libs::Graphics::ReadbackProbe;
+
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "bar-readback direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size / 2, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "bar-readback fixed direct-memory mapping failed");
+    std::memset(reinterpret_cast<void *>(base), 0x3c, allocation_size / 2);
+
+    // ClampRangeSize memo: the same query twice, then after mapping the adjacent half, then after
+    // unmapping it again.
+    {
+      namespace Memory = Libs::LibKernel::Memory;
+      const auto half = allocation_size / 2;
+      Require(name, "clamp before", Memory::ClampRangeSize(base, allocation_size) == half &&
+                                        Memory::ClampRangeSize(base, allocation_size) == half,
+              "the clamp of a half-mapped range is wrong (or the memo changed it)");
+      void *upper = reinterpret_cast<void *>(base + half);
+      Require(name, "map upper half",
+              Memory::KernelMapDirectMemory(&upper, half, 0x3, 0x10, direct_offset + static_cast<int64_t>(half),
+                                            allocation_alignment) == 0 &&
+                  upper == reinterpret_cast<void *>(base + half),
+              "mapping the adjacent half failed");
+      Require(name, "clamp after map", Memory::ClampRangeSize(base, allocation_size) == allocation_size,
+              "the memo returned a stale clamp after an adjacent mapping was added");
+      Require(name, "unmap upper half", Memory::KernelMunmap(base + half, half) == 0,
+              "unmapping the adjacent half failed");
+      Require(name, "clamp after unmap", Memory::ClampRangeSize(base, allocation_size) == half,
+              "the memo returned a stale clamp after the adjacent mapping was removed");
+    }
+
+    const char *kind = "?";
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size / 2);
+      cache.FillBuffer(base + fill_offset, fill_size, fill_value, false);
+      scheduler.Finish();
+      (void)Probe::Take();
+      cache.ReadMemory(base + fill_offset, fill_size); // every page of the fill
+      const auto readbacks = Probe::Take();
+      const auto &k = readbacks[Libs::Graphics::WaitReasonProbe::Download];
+      kind = k[Probe::Bar] ? "bar" : k[Probe::CopyOther] ? "copy" : "?";
+      std::vector<uint8_t> guest(fill_size + 32);
+      Require(name, "read guest",
+              Libs::LibKernel::Memory::TryReadBacking(base + fill_offset - 16, guest.data(), guest.size()),
+              "the guest backing could not be read");
+      for (size_t i = 0; i < 16; ++i) {
+        Require(name, "bytes before", guest[i] == 0x3c && guest[16 + fill_size + i] == 0x3c,
+                "a byte outside the filled range changed");
+      }
+      for (size_t i = 0; i < fill_size; i += 4) {
+        uint32_t value = 0;
+        std::memcpy(&value, guest.data() + 16 + i, sizeof(value));
+        Require(name, "filled bytes", value == fill_value, "a filled dword did not come back exactly");
+      }
+      context.UnmapMemory(base, allocation_size / 2);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size / 2) == 0,
+            "bar-readback direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "bar-readback direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok (readback %s, streaming %s)\n", name, kind,
+                Libs::Graphics::WriteCombinedCopyEnabled() ? "on" : "off");
   }
 
   void CheckBufferCacheDirtyGarbageCollection() {
@@ -45023,6 +45121,46 @@ static void CheckOpSplitProbe() {
   std::printf("[host]    %-32s ok (%.1f ns per phase switch)\n", name, per_switch);
 }
 
+// Stage 3a (writeCombinedCopy.h): the streaming-load copy must equal memcpy for every source and
+// destination misalignment and size, and write nothing outside the destination range.
+static void CheckWriteCombinedCopy() {
+  const char *name = "WriteCombinedCopy";
+  std::vector<uint8_t> source(1u << 20u);
+  for (size_t i = 0; i < source.size(); ++i) {
+    source[i] = static_cast<uint8_t>((i * 131u + 7u) ^ (i >> 9u));
+  }
+  std::vector<uint8_t> destination(source.size() + 256u);
+  for (const bool streaming : {true, false}) {
+    for (size_t src_offset = 0; src_offset < 64; ++src_offset) {
+      for (size_t dst_offset = 0; dst_offset < 64; dst_offset += 7) {
+        for (size_t size = 0; size <= 300; size += (size < 70 ? 1 : 23)) {
+          std::fill(destination.begin(), destination.end(), uint8_t{0xa5});
+          Libs::Graphics::CopyFromWriteCombined(destination.data() + 64 + dst_offset,
+                                                source.data() + src_offset, size, streaming);
+          const auto *begin = destination.data() + 64 + dst_offset;
+          const bool bytes = std::memcmp(begin, source.data() + src_offset, size) == 0;
+          const bool guards =
+              std::all_of(destination.data(), begin, [](uint8_t b) { return b == 0xa5; }) &&
+              std::all_of(begin + size, begin + size + 64, [](uint8_t b) { return b == 0xa5; });
+          if (!bytes || !guards) {
+            Fail(name, bytes ? "guard bytes" : "bytes",
+                 "streaming=" + std::to_string(streaming) + " src+" + std::to_string(src_offset) + " dst+" +
+                     std::to_string(dst_offset) + " size " + std::to_string(size));
+          }
+        }
+      }
+    }
+    const size_t large = source.size() - 77u;
+    std::fill(destination.begin(), destination.end(), uint8_t{0xa5});
+    Libs::Graphics::CopyFromWriteCombined(destination.data() + 3, source.data() + 13, large, streaming);
+    Require(name, "large", std::memcmp(destination.data() + 3, source.data() + 13, large) == 0 &&
+                               destination[2] == 0xa5 && destination[3 + large] == 0xa5,
+            "a large unaligned copy was wrong");
+  }
+  std::printf("[host]    %-32s ok (streaming %s)\n", name,
+              Libs::Graphics::WriteCombinedCopyEnabled() ? "on" : "off");
+}
+
 void CheckMeshTaskIndirect() {
   CheckGpuIndirectReasonNames();
   CheckSubmitAheadLogic();
@@ -47927,6 +48065,13 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--indirect-mesh-only") == 0) {
     CheckIndirectMeshDraws();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bar-copy-only") == 0) {
+    setenv("KYTY_PROBE_FAULT_HISTOGRAM", "1", 0); // explicit caller values win
+    CheckWriteCombinedCopy();
+    VulkanHarness vulkan;
+    vulkan.CheckBarReadbackBytes();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--op-split-only") == 0) {

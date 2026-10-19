@@ -225,6 +225,7 @@ public:
 	bool Add(uint64_t start, uint64_t size, uint64_t offset, int protection, int memory_type,
 	         VirtualRangeType type, const char* name, bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
+		BumpGeneration();
 
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
@@ -255,6 +256,7 @@ public:
 
 	bool Remove(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
+		BumpGeneration();
 
 		auto position = m_ranges.find(start);
 		if (position != m_ranges.end() && position->second.size == size) {
@@ -284,6 +286,7 @@ public:
 
 	bool ReleaseReserved(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
+		BumpGeneration();
 
 		auto position = m_ranges.find(start);
 		if (position != m_ranges.end() && position->second.size == size &&
@@ -297,6 +300,7 @@ public:
 	                 int protection, int memory_type, VirtualRangeType type, const char* name,
 	                 bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
+		BumpGeneration();
 
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
@@ -343,6 +347,7 @@ public:
 
 	void Rename(uint64_t start, uint64_t size, const char* name) {
 		Common::LockGuard lock(m_mutex);
+		BumpGeneration();
 
 		auto position = m_ranges.find(start);
 		if (position != m_ranges.end() && position->second.size == size) {
@@ -355,6 +360,7 @@ public:
 
 	void Protect(uint64_t start, uint64_t size, int protection) {
 		Common::LockGuard lock(m_mutex);
+		BumpGeneration();
 
 		EditUnlocked(start, size, [protection](Range* r) { r->protection = protection; });
 	}
@@ -442,6 +448,10 @@ public:
 
 		return clamped_size;
 	}
+
+	// Changes on every mutation (taken under m_mutex); lets callers memoize queries such as
+	// ClampRangeSize. Read it before the query whose result is memoized.
+	[[nodiscard]] uint64_t Generation() const noexcept { return m_generation.load(std::memory_order_acquire); }
 
 	uint64_t CountPageTableEntries(bool gpu) {
 		Common::LockGuard lock(m_mutex);
@@ -620,6 +630,8 @@ private:
 	}
 
 	RangeMap      m_ranges;
+	std::atomic<uint64_t> m_generation {1};
+	void BumpGeneration() noexcept { m_generation.fetch_add(1, std::memory_order_acq_rel); }
 	Common::Mutex m_mutex;
 	uint64_t      m_cpu_page_table_entries = 0;
 	uint64_t      m_gpu_page_table_entries = 0;
@@ -904,6 +916,18 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 
+	// Memo per thread (whole-heap descriptors clamp the same ranges on every binding; ng-173: the
+	// locked VMA walk plus the "reported" scan below were ~2 % of the GPU thread), keyed by the
+	// range and the VirtualRanges generation, which changes on every map edit.
+	struct ClampMemo {
+		uint64_t vaddr = 0, size = 0, generation = 0, clamped = 0;
+	};
+	static thread_local std::array<ClampMemo, 64> memo {};
+	const auto generation = g_virtual_ranges->Generation(); // before the query (see Generation)
+	auto&      slot       = memo[((vaddr ^ (size << 7u)) * 0x9e3779b97f4a7c15ull) >> 58u];
+	if (slot.generation == generation && slot.vaddr == vaddr && slot.size == size) {
+		return slot.clamped;
+	}
 	const auto clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size);
 	if (clamped_size == 0) {
 		EXIT("Memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64
@@ -921,6 +945,7 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 			     vaddr, size, clamped_size);
 		}
 	}
+	slot = {vaddr, size, generation, clamped_size};
 	return clamped_size;
 }
 

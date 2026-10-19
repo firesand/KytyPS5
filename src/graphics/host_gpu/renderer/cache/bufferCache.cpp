@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/cache/writeCombinedCopy.h"
 #include "graphics/host_gpu/hostReadStats.h"
 #include "graphics/host_gpu/renderer/gpuTimestamps.h"
 
@@ -1028,12 +1029,32 @@ bool BufferCache::TryBarReadback(const Buffer& buffer, std::span<const vk::Buffe
 		m_last_bar_reason = latest >= m_scheduler.CurrentTick() ? 4 : 3;
 		return false;
 	}
+	// The mapping is uncached for CPU reads (no HOST_CACHED): stream it into a cached bounce
+	// buffer (writeCombinedCopy.h), then write the guest backing from there.
+	const bool streaming = WriteCombinedCopyEnabled();
+	const auto copy_begin = ProbeEnabled::Get() ? std::chrono::steady_clock::now()
+	                                            : std::chrono::steady_clock::time_point {};
+	constexpr uint64_t kBounceBytes = 256 * 1024;
 	for (const auto& copy: copies) {
 		if (!buffer.IsCoherent()) {
 			const_cast<Buffer&>(buffer).Invalidate(copy.srcOffset, copy.size);
 		}
-		Libs::LibKernel::Memory::WriteBacking(address + copy.srcOffset,
-		                                      buffer.Mapped().data() + copy.srcOffset, copy.size);
+		for (uint64_t done = 0; done < copy.size;) {
+			const auto bytes = std::min<uint64_t>(copy.size - done, kBounceBytes);
+			if (m_bar_bounce.size() < bytes) {
+				m_bar_bounce.resize(kBounceBytes);
+			}
+			CopyFromWriteCombined(m_bar_bounce.data(), buffer.Mapped().data() + copy.srcOffset + done, bytes,
+			                      streaming);
+			Libs::LibKernel::Memory::WriteBacking(address + copy.srcOffset + done, m_bar_bounce.data(), bytes);
+			done += bytes;
+		}
+		m_sync_stats.bar_readback_bytes += copy.size;
+	}
+	if (ProbeEnabled::Get()) {
+		m_sync_stats.bar_readback_ns += static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - copy_begin)
+		        .count());
 	}
 	m_sync_stats.bar_readbacks++;
 	m_last_download_bar = true;

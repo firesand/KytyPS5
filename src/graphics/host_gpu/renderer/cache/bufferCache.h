@@ -233,7 +233,8 @@ public:
 		uint64_t download_calls = 0, download_wait_ns = 0, read_memory_calls = 0;
 		uint64_t copy_batches = 0; // barrier pairs recorded around staging copies
 		uint64_t copy_buffers = 0; // SynchronizeBuffer calls that recorded or queued a staging copy
-		uint64_t bar_readbacks = 0;
+		uint64_t bar_readbacks = 0, bar_readback_bytes = 0;
+		uint64_t bar_readback_ns = 0; // copy time (KYTY_PROBE_FAULT_HISTOGRAM only)
 		uint64_t host_joins = 0; // replaced buffers copied on the host (complete)
 		uint64_t gpu_joins  = 0; // replaced buffers copied on the GPU (in flight)
 	};
@@ -375,6 +376,7 @@ private:
 	static constexpr size_t                           kGpuIndirectArgsRing = 64;
 	std::array<std::pair<uint64_t, uint64_t>, kGpuIndirectArgsRing> m_gpu_indirect_args {}; // page range [first, last)
 	size_t                                            m_gpu_indirect_args_next = 0;
+	std::vector<uint8_t>                              m_bar_bounce; // TryBarReadback: BAR -> cached -> guest
 	bool                                              m_last_download_bar = false;
 	int                                               m_last_bar_reason   = 0; // 1 unmapped, 2 no tick, 3 in flight, 4 open buffer
 	uint64_t                                          m_last_upload_bytes = 0;

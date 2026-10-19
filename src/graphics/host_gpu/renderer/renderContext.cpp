@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "graphics/host_gpu/hostReadStats.h"
+#include "graphics/host_gpu/renderer/cache/writeCombinedCopy.h"
 #include "graphics/host_gpu/renderer/submitAhead.h"
 #include "graphics/host_gpu/renderer/hazardState.h"
 #include "graphics/host_gpu/writeWatch.h"
@@ -149,6 +150,9 @@ struct FaultSampler {
 		sync_sum.range_repasses += sync.range_repasses;
 		sync_sum.range_repass_ranges += sync.range_repass_ranges;
 		sync_sum.download_calls += sync.download_calls;
+		sync_sum.bar_readbacks += sync.bar_readbacks;
+		sync_sum.bar_readback_bytes += sync.bar_readback_bytes;
+		sync_sum.bar_readback_ns += sync.bar_readback_ns;
 		sync_sum.download_wait_ns += sync.download_wait_ns;
 		sync_sum.read_memory_calls += sync.read_memory_calls;
 		sync_sum.copy_batches += sync.copy_batches;
@@ -228,12 +232,15 @@ struct FaultSampler {
 			                    page_count, describe(page));
 		}
 		line += fmt::format(" | syncs: obtain {} calls {} ranges {} KiB, range {} calls {} ranges {} KiB"
-		                    " (repass {} passes {} ranges) | downloads {} ({} ms waited), ReadMemory {}",
+		                    " (repass {} passes {} ranges) | downloads {} ({} ms waited), ReadMemory {}"
+		                    " | bar readbacks {} ({} KiB, {} us copy, {})",
 		                    sync_all.obtain_calls, sync_all.obtain_pages, sync_all.obtain_bytes >> 10,
 		                    sync_all.range_calls, sync_all.range_pages, sync_all.range_bytes >> 10,
 		                    sync_all.range_repasses, sync_all.range_repass_ranges,
 		                    sync_all.download_calls, sync_all.download_wait_ns / 1000000,
-		                    sync_all.read_memory_calls);
+		                    sync_all.read_memory_calls, sync_all.bar_readbacks,
+		                    sync_all.bar_readback_bytes >> 10, sync_all.bar_readback_ns / 1000,
+		                    WriteCombinedCopyEnabled() ? "streaming" : "memcpy");
 		line += fmt::format(" | protect {} calls {} KiB | hot hashed {} skipped {} demoted {} rehash-miss {}",
 		                    protects_all.first, protects_all.second >> 10, hot_all.hashed,
 		                    hot_all.skipped, hot_all.demoted, hot_all.invalidated);
