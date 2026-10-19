@@ -37,6 +37,8 @@ public:
 		uint64_t ns            = 0; // time inside Collect
 		uint64_t label_checks  = 0; // WasLabelWritten calls
 		uint64_t label_written = 0; // ... that returned true
+		uint64_t range_passes  = 0; // CollectRanges calls (full collections)
+		uint64_t rearms        = 0; // Rearm calls (pages gaining their first write watcher)
 	};
 
 	// The process-wide instance, or nullptr when write-watch is off: KYTY_WRITE_WATCH unset, a
@@ -65,6 +67,13 @@ public:
 	// whole pages (the range is widened to page bounds), called after every internal lock is
 	// released. A failed scan reports its whole chunk. Any thread.
 	void Collect(uint64_t vaddr, uint64_t size, const RunFunc& func) noexcept;
+	// One pass over many [start, end) ranges (a full collection), same result contract as Collect.
+	// Ranges closer than 64 MiB are scanned as one: a gap's placeholders and unwatched pages cost a
+	// short walk, a separate ioctl costs far more (ng-154: about 4200 ioctls per collection when
+	// every watched span had its own). The merged ranges cross unregistered placeholders, so the
+	// scan skips unregistered VMAs instead of failing on them; every registered guest view is in
+	// the registry (RegisterView/UnregisterView), so none is skipped by mistake.
+	void CollectRanges(std::vector<std::pair<uint64_t, uint64_t>> ranges, const RunFunc& func) noexcept;
 	// Re-protects [vaddr, vaddr + size) and drops what it reports: for pages gaining their first
 	// write watcher, whose earlier writes nobody tracked (PageManager; the protect a fault-based
 	// watcher would have applied). Label pages it re-protects are still flagged. Any thread.
@@ -86,8 +95,10 @@ private:
 
 	static WriteWatch* Create() noexcept;
 
-	// One PAGEMAP_SCAN pass over [start, end) (one registered view); appends written runs.
-	void ScanChunk(uint64_t start, uint64_t end, std::vector<std::pair<uint64_t, uint64_t>>* runs) noexcept;
+	// One PAGEMAP_SCAN pass over [start, end); appends written runs. check_async: fail on an
+	// unregistered VMA (one registered view) instead of skipping it (a merged range).
+	void ScanChunk(uint64_t start, uint64_t end, std::vector<std::pair<uint64_t, uint64_t>>* runs,
+	               bool check_async = true) noexcept;
 	// Report-only: any written page in [start, end) of a registered view?
 	[[nodiscard]] bool AnyWritten(uint64_t start, uint64_t end) noexcept;
 	void NoteLabelRuns(const std::vector<std::pair<uint64_t, uint64_t>>& runs) noexcept;

@@ -34,6 +34,8 @@ namespace {
 
 constexpr uint64_t PAGE_SIZE  = TRACKER_PAGE_SIZE;
 constexpr uint64_t SCAN_CHUNK = 64ull * 1024ull * 1024ull; // bounds a run-count early return's re-walk
+constexpr uint64_t RANGE_CHUNK = 256ull * 1024ull * 1024ull; // CollectRanges' per-ioctl span
+constexpr uint64_t MERGE_GAP   = 64ull * 1024ull * 1024ull;  // CollectRanges merges closer ranges
 constexpr size_t   MAX_LABELS = 4096;
 
 std::atomic<uint64_t> g_collects {0};
@@ -43,6 +45,8 @@ std::atomic<uint64_t> g_errors {0};
 std::atomic<uint64_t> g_ns {0};
 std::atomic<uint64_t> g_label_checks {0};
 std::atomic<uint64_t> g_label_written {0};
+std::atomic<uint64_t> g_range_passes {0};
+std::atomic<uint64_t> g_rearms {0};
 
 // KYTY_WRITE_WATCH_LOG=1: one line per collection that reported pages (first 4000).
 bool LogEnabled() {
@@ -205,14 +209,14 @@ bool WriteWatch::IsCovered(uint64_t vaddr, uint64_t size) const noexcept {
 }
 
 void WriteWatch::ScanChunk(uint64_t start, uint64_t end,
-                           std::vector<std::pair<uint64_t, uint64_t>>* runs) noexcept {
+                           std::vector<std::pair<uint64_t, uint64_t>>* runs, bool check_async) noexcept {
 #if defined(KYTY_WRITE_WATCH_SUPPORTED)
 	static thread_local std::array<page_region, 512> vec {};
 	uint64_t cursor = start;
 	while (cursor < end) {
 		pm_scan_arg arg {};
 		arg.size          = sizeof(arg);
-		arg.flags         = PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC;
+		arg.flags         = PM_SCAN_WP_MATCHING | (check_async ? PM_SCAN_CHECK_WPASYNC : 0);
 		arg.start         = cursor;
 		arg.end           = end;
 		arg.vec           = reinterpret_cast<uint64_t>(vec.data());
@@ -243,6 +247,7 @@ void WriteWatch::ScanChunk(uint64_t start, uint64_t end,
 	(void)start;
 	(void)end;
 	(void)runs;
+	(void)check_async;
 #endif
 }
 
@@ -342,7 +347,72 @@ void WriteWatch::Collect(uint64_t vaddr, uint64_t size, const RunFunc& func) noe
 }
 
 void WriteWatch::Rearm(uint64_t vaddr, uint64_t size) noexcept {
+	g_rearms.fetch_add(1, std::memory_order_relaxed);
 	Collect(vaddr, size, [](uint64_t, uint64_t) {});
+}
+
+void WriteWatch::CollectRanges(std::vector<std::pair<uint64_t, uint64_t>> ranges,
+                               const RunFunc& func) noexcept {
+	if (ranges.empty()) {
+		return;
+	}
+	for (auto& [start, end]: ranges) {
+		start = Common::AlignDown(start, PAGE_SIZE);
+		end   = Common::AlignUp(end, PAGE_SIZE);
+	}
+	std::sort(ranges.begin(), ranges.end());
+	std::vector<std::pair<uint64_t, uint64_t>> merged;
+	for (const auto& [start, end]: ranges) {
+		if (!merged.empty() && start <= merged.back().second + MERGE_GAP) {
+			merged.back().second = std::max(merged.back().second, end);
+		} else {
+			merged.emplace_back(start, end);
+		}
+	}
+	const auto begin = std::chrono::steady_clock::now();
+	g_collects.fetch_add(1, std::memory_order_relaxed);
+	g_range_passes.fetch_add(1, std::memory_order_relaxed);
+	bool labels = false;
+	for (const auto& [start, end]: merged) {
+		labels = labels || TouchesLabels(start, end - start);
+	}
+	if (labels) {
+		m_label_scans_active.fetch_add(1, std::memory_order_seq_cst);
+	}
+	std::vector<std::pair<uint64_t, uint64_t>> runs;
+	{
+		std::shared_lock lock(m_views_mutex);
+		for (const auto& [start, end]: merged) {
+			// The registered extent of this range; the kernel skips unregistered VMAs inside it.
+			uint64_t low  = UINT64_MAX;
+			uint64_t high = 0;
+			m_views.ForEachInRange(start, end - start, [&](uint64_t view_start, uint64_t view_end) {
+				low  = std::min(low, view_start);
+				high = std::max(high, view_end);
+			});
+			for (auto chunk = low; chunk < high;) {
+				const auto chunk_end = std::min(high, Common::AlignDown(chunk, RANGE_CHUNK) + RANGE_CHUNK);
+				ScanChunk(chunk, chunk_end, &runs, /*check_async=*/false);
+				chunk = chunk_end;
+			}
+		}
+	}
+	NoteLabelRuns(runs);
+	if (!merged.empty()) {
+		LogRuns("collect-ranges", merged.front().first, merged.back().second - merged.front().first, runs);
+	}
+	if (labels) {
+		m_label_scan_seq.fetch_add(1, std::memory_order_seq_cst);
+		m_label_scans_active.fetch_sub(1, std::memory_order_seq_cst);
+	}
+	g_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                         std::chrono::steady_clock::now() - begin)
+	                                         .count()),
+	               std::memory_order_relaxed);
+	for (const auto& [start, end]: runs) {
+		g_pages.fetch_add((end - start) / PAGE_SIZE, std::memory_order_relaxed);
+		func(start, end - start);
+	}
 }
 
 bool WriteWatch::WasLabelWritten(uint64_t vaddr, uint64_t size) noexcept {
@@ -436,6 +506,8 @@ WriteWatch::Stats WriteWatch::TakeStats() noexcept {
 	stats.ns            = g_ns.exchange(0, std::memory_order_relaxed);
 	stats.label_checks  = g_label_checks.exchange(0, std::memory_order_relaxed);
 	stats.label_written = g_label_written.exchange(0, std::memory_order_relaxed);
+	stats.range_passes  = g_range_passes.exchange(0, std::memory_order_relaxed);
+	stats.rearms        = g_rearms.exchange(0, std::memory_order_relaxed);
 	return stats;
 }
 

@@ -180,7 +180,13 @@ void MemoryTracker::CollectWrittenPages(uint64_t vaddr, uint64_t size,
 		});
 	};
 	if (size == 0) {
-		m_page_manager.ForEachWriteWatchedSpan(collect);
+		// One pass over every span holding write-watched pages (WriteWatch::CollectRanges).
+		std::vector<std::pair<uint64_t, uint64_t>> spans;
+		m_page_manager.ForEachWriteWatchedSpan(
+		    [&](uint64_t start, uint64_t bytes) { spans.emplace_back(start, start + bytes); });
+		write_watch->CollectRanges(std::move(spans), [&](uint64_t run, uint64_t run_size) {
+			m_page_manager.ForEachWriteWatchedRun(run, run_size, func);
+		});
 	} else {
 		collect(vaddr, size);
 	}

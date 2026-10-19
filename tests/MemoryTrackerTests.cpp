@@ -1625,14 +1625,14 @@ struct WriteWatchView {
   [[nodiscard]] uint64_t Address() const { return reinterpret_cast<uint64_t>(memory); }
 };
 
-WriteWatchView MapWriteWatchView(uint64_t pages) {
+WriteWatchView MapWriteWatchView(uint64_t pages, uintptr_t offset = 0x40000) {
   WriteWatchView view;
   view.size = pages * TRACKER_PAGE_SIZE;
   view.fd = ::memfd_create("WriteWatchTest", MFD_CLOEXEC);
   Check(view.fd >= 0 && ::ftruncate(view.fd, static_cast<off_t>(view.size)) == 0,
         "memfd creation failed");
   // A fixed guest-range placeholder, then the shared view over it.
-  view.memory = AllocateFixedGuestRange(view.size, 0x40000);
+  view.memory = AllocateFixedGuestRange(view.size, offset);
   Check(::mmap(view.memory, view.size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, view.fd,
                0) == view.memory,
         "memfd view mapping failed");
@@ -1863,6 +1863,39 @@ void TestWriteWatchUnalignedCollection() {
   UnmapWriteWatchView(view);
 }
 
+// A full collection scans merged ranges in one pass: it must cross the unregistered anonymous
+// mapping between two views (a placeholder) without failing, and report the writes in both.
+void TestWriteWatchFullCollectionCrossesPlaceholders() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  constexpr uint64_t page = TRACKER_PAGE_SIZE;
+  auto first = MapWriteWatchView(4, 0x40000);
+  auto *gap = AllocateFixedGuestRange(4 * page, 0x50000); // anonymous, never registered
+  auto second = MapWriteWatchView(4, 0x60000);
+  Check(reinterpret_cast<uint64_t>(gap) / Libs::Graphics::TRACKER_REGION_SIZE ==
+            first.Address() / Libs::Graphics::TRACKER_REGION_SIZE &&
+            second.Address() / Libs::Graphics::TRACKER_REGION_SIZE ==
+                first.Address() / Libs::Graphics::TRACKER_REGION_SIZE,
+        "the two views and the gap were not placed in one tracker region");
+  UploadAll(tracker, first.Address(), first.size);
+  UploadAll(tracker, second.Address(), second.size);
+  (void)WriteWatch::TakeStats();
+  first.memory[page] = 1;
+  second.memory[3 * page] = 2;
+  Check(CollectAndApply(tracker, 0, 0) == 2 &&
+            tracker.IsRegionCpuModified(first.Address() + page, page) &&
+            tracker.IsRegionCpuModified(second.Address() + 3 * page, page),
+        "a full collection across a placeholder missed a view's write");
+  const auto stats = WriteWatch::TakeStats();
+  Check(stats.errors == 0 && stats.range_passes == 1,
+        "a full collection failed on the placeholder or was not one pass");
+  tracker.UntrackMemory(first.Address(), first.size);
+  tracker.UntrackMemory(second.Address(), second.size);
+  UnmapWriteWatchView(second);
+  Release(gap);
+  UnmapWriteWatchView(first);
+}
+
 void TestWriteWatchLabels() {
   auto *write_watch = WriteWatch::Get();
   constexpr uint64_t page = TRACKER_PAGE_SIZE;
@@ -1894,6 +1927,7 @@ void RunWriteWatchCases() {
   TestWriteWatchUncoveredMemoryKeepsProtection();
   TestWriteWatchFirstWatcherDropsOldWrites();
   TestWriteWatchUnalignedCollection();
+  TestWriteWatchFullCollectionCrossesPlaceholders();
   TestWriteWatchLabels();
   std::puts("MemoryTrackerTests: write-watch cases passed");
   std::exit(0);

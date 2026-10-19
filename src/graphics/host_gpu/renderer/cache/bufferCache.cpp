@@ -31,6 +31,12 @@
 namespace Libs::Graphics {
 
 namespace {
+// Kernel write-watch diagnostics (BufferCache::TakeWriteWatchStats).
+std::atomic<uint64_t> g_ww_ownership_unscanned {0};
+std::atomic<uint64_t> g_ww_fault_pass_collects {0};
+} // namespace
+
+namespace {
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
@@ -645,10 +651,12 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
-	if (is_written) {
-		// The GPU takes ownership of the range below: CPU writes not collected yet must reach the
-		// upload first, as faulted ones would have (kernel write-watch).
-		CollectCpuWritesInline(vaddr, size);
+	if (is_written && WriteWatch::Get() != nullptr) {
+		// Kernel write-watch: no scan per written binding (ng-154: tens of thousands per second).
+		// CPU writes up to this stream's (or acquire's) collection are applied; a later one races
+		// the GPU's ownership and is merged at the next collection, where the download copies only
+		// GPU-written bytes, so CPU bytes outside this binding survive.
+		g_ww_ownership_unscanned.fetch_add(1, std::memory_order_relaxed);
 	}
 	if (!is_written && !is_texel_buffer) {
 		const uint64_t current_epoch  = m_scheduler.Context().BdaSyncEpoch();
@@ -1081,6 +1089,64 @@ void BufferCache::OnCommandBoundary() {
 	if (HasPendingCpuWrites()) {
 		m_scheduler.Context().ApplyPendingCpuWrites();
 	}
+}
+
+BufferCache::WriteWatchStats BufferCache::TakeWriteWatchStats() {
+	WriteWatchStats stats;
+	stats.ownership_unscanned = g_ww_ownership_unscanned.exchange(0, std::memory_order_relaxed);
+	stats.fault_pass_collects = g_ww_fault_pass_collects.exchange(0, std::memory_order_relaxed);
+	return stats;
+}
+
+void BufferCache::MarkPagesWritten(const uint64_t* encoded, uint32_t count) {
+	if (WriteWatch::Get() == nullptr) {
+		for (uint32_t index = 0; index < count; ++index) {
+			MarkPageWritten(GuestAddress(encoded[index]));
+		}
+		return;
+	}
+	RangeSet pages;
+	for (uint32_t index = 0; index < count; ++index) {
+		pages.Add(GuestAddress(encoded[index]), WRITE_FAULT_PAGESIZE);
+	}
+	// A CPU write the kernel recorded but nobody collected yet wins, as a faulted one does.
+	pages.ForEach([&](uint64_t start, uint64_t end) {
+		g_ww_fault_pass_collects.fetch_add(1, std::memory_order_relaxed);
+		CollectCpuWritesInline(start, end - start);
+	});
+	RangeSet marked;
+	pages.ForEach([&](uint64_t start, uint64_t end) {
+		for (auto page = start; page < end; page += WRITE_FAULT_PAGESIZE) {
+			if (m_memory_tracker.TryMarkRegionAsGpuModified(page, WRITE_FAULT_PAGESIZE)) {
+				marked.Add(page, WRITE_FAULT_PAGESIZE);
+				continue;
+			}
+			static std::atomic<uint32_t> reported {0};
+			if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("BufferCache: unbounded GPU write to CPU-dirty page 0x%016" PRIx64 " kept CPU data\n",
+				     page);
+			}
+		}
+	});
+	// A CPU write between that collection and the read protection the marks applied predates the
+	// GPU's ownership: the CPU wins the pages it wrote, the GPU keeps the rest.
+	RangeSet written;
+	marked.ForEach([&](uint64_t start, uint64_t end) {
+		g_ww_fault_pass_collects.fetch_add(1, std::memory_order_relaxed);
+		m_memory_tracker.CollectWrittenPages(start, end - start,
+		                                     [&](uint64_t run, uint64_t bytes) { written.Add(run, bytes); });
+	});
+	written.ForEach([&](uint64_t start, uint64_t end) {
+		m_memory_tracker.UnmarkRegionAsGpuModified(start, end - start);
+		CollectCpuWritesApply(start, end - start);
+		marked.Subtract(start, end - start);
+		static std::atomic<uint32_t> reported {0};
+		if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("BufferCache: CPU write in the marking window of 0x%016" PRIx64 " kept CPU data\n",
+			     start);
+		}
+	});
+	marked.ForEach([&](uint64_t start, uint64_t end) { QueueGpuModified(start, end - start); });
 }
 
 void BufferCache::CollectCpuWritesInline(uint64_t vaddr, uint64_t size) {

@@ -178,9 +178,7 @@ void FaultManager::Process(bool write_faults) {
 			const auto* faults = std::bit_cast<const uint64_t*>(mapped);
 			const auto  count  = std::min<uint32_t>(static_cast<uint32_t>(faults[0]),
 			                                        static_cast<uint32_t>(MaxPageFaults - 1));
-			for (uint32_t index = 1; index <= count; ++index) {
-				m_buffer_cache.MarkPageWritten(BufferCache::GuestAddress(faults[index]));
-			}
+			m_buffer_cache.MarkPagesWritten(faults + 1, count);
 			if (static_cast<uint32_t>(faults[0]) >= MaxPageFaults - 1) {
 				m_buffer_cache.MarkWriteFaultOverflow();
 			}

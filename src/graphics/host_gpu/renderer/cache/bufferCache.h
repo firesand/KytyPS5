@@ -186,6 +186,9 @@ public:
 	}
 	void NoteSubmitAhead(uint64_t writer);
 	void MarkPageWritten(uint64_t vaddr);      // any thread (fault-processing operation)
+	// A fault pass's pages (encoded offsets, GuestAddress): MarkPageWritten for each, with the kernel
+	// write-watch collections batched over the whole pass (one before, one after marking).
+	void MarkPagesWritten(const uint64_t* encoded, uint32_t count); // any thread
 	void MarkWriteFaultOverflow();             // any thread
 	// Kernel write-watch (writeWatch.h; no-op without it). CPU writes the kernel recorded in
 	// [vaddr, vaddr + size), collected where a full write-fault replay is not allowed (inside cache
@@ -210,6 +213,13 @@ public:
 	                         const std::function<void(uint64_t, uint64_t)>& func) {
 		m_memory_tracker.CollectWrittenPages(vaddr, size, func);
 	}
+	// Kernel write-watch diagnostics since the last call: written bindings that took GPU ownership
+	// without a scan, and the collections made by fault passes.
+	struct WriteWatchStats {
+		uint64_t ownership_unscanned = 0;
+		uint64_t fault_pass_collects = 0;
+	};
+	static WriteWatchStats TakeWriteWatchStats();
 	// Safe point between PM4 packets / at garbage collection: records the pending write-fault
 	// pass, publishes marked pages and deferred texture invalidations.
 	void OnCommandBoundary();

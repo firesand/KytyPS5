@@ -263,13 +263,17 @@ struct FaultSampler {
 		line += fmt::format(" | wait-pass {} (consumed {}, extra-syncs {}, bytes {})", syncs_all.wait_passes,
 		                    syncs_all.wait_consumed, syncs_all.wait_extra, syncs_all.wait_bytes);
 		if (WriteWatch::Get() != nullptr) {
-			const auto ww = WriteWatch::TakeStats();
-			line += fmt::format(" | write-watch collects {} (stream {} acquire {}) ioctls {} pages {} "
-			                    "applied {} errors {} ms {} labels {}/{}",
-			                    ww.collects, g_ww_stream_collects.exchange(0, std::memory_order_relaxed),
-			                    g_ww_acquire_collects.exchange(0, std::memory_order_relaxed), ww.ioctls,
-			                    ww.pages, g_ww_applied_pages.exchange(0, std::memory_order_relaxed),
-			                    ww.errors, ww.ns / 1000000, ww.label_written, ww.label_checks);
+			const auto ww  = WriteWatch::TakeStats();
+			const auto wwb = BufferCache::TakeWriteWatchStats();
+			line += fmt::format(" | write-watch collects {} (full {}: stream {} acquire {}; rearm {} "
+			                    "fault-pass {}) ownership-unscanned {} ioctls {} pages {} applied {} "
+			                    "errors {} ms {} labels {}/{}",
+			                    ww.collects, ww.range_passes,
+			                    g_ww_stream_collects.exchange(0, std::memory_order_relaxed),
+			                    g_ww_acquire_collects.exchange(0, std::memory_order_relaxed), ww.rearms,
+			                    wwb.fault_pass_collects, wwb.ownership_unscanned, ww.ioctls, ww.pages,
+			                    g_ww_applied_pages.exchange(0, std::memory_order_relaxed), ww.errors,
+			                    ww.ns / 1000000, ww.label_written, ww.label_checks);
 		}
 		line += fmt::format(" | host-resident binds {} bytes {} KiB fallbacks {}", resident_all.binds,
 		                    resident_all.bytes >> 10, resident_all.fallbacks);
