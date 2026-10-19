@@ -1225,8 +1225,14 @@ void CommandProcessor::SubmitAheadBeforePacket(uint32_t opcode) {
 	if (reason == SubmitAheadTrigger::Reason::None) {
 		return;
 	}
+	const auto tick = scheduler.CurrentTick();
 	BufferFlush();
 	m_submit_ahead.Submitted(packet, scheduler.CurrentTick());
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+		LOGF("SubmitAhead: submit tick %" PRIu64 " before opcode 0x%02x (%s)\n", tick, opcode,
+		     reason == SubmitAheadTrigger::Reason::DispatchTimer ? "dispatch-timer" : "timer");
+	}
 	SubmitAheadProbe::Count(reason == SubmitAheadTrigger::Reason::DispatchTimer
 	                            ? SubmitAheadProbe::DispatchTimerSubmits
 	                            : SubmitAheadProbe::TimerSubmits);
