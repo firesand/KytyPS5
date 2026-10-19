@@ -21,6 +21,11 @@ namespace Libs::Graphics {
 // streaming-load guidance: required before reading a location that may have changed). Unaligned
 // head and tail bytes use ordinary loads.
 #if defined(__x86_64__)
+// A lambda does not inherit the enclosing function's target attribute, so the load is a function.
+__attribute__((target("sse4.1"))) inline __m128i StreamLoad16(const uint8_t* p) {
+	return _mm_stream_load_si128(reinterpret_cast<__m128i*>(const_cast<uint8_t*>(p)));
+}
+
 __attribute__((target("sse4.1"))) inline void CopyFromWriteCombinedSse41(uint8_t* dst, const uint8_t* src,
                                                                         size_t size) {
 	_mm_mfence();
@@ -33,21 +38,18 @@ __attribute__((target("sse4.1"))) inline void CopyFromWriteCombinedSse41(uint8_t
 	dst += head;
 	src += head;
 	size -= head;
-	const auto load = [](const uint8_t* p) {
-		return _mm_stream_load_si128(reinterpret_cast<__m128i*>(const_cast<uint8_t*>(p)));
-	};
 	// 16-byte blocks up to the next 64-byte line, then whole lines (four loads in flight per line).
 	while (size >= 16 && (reinterpret_cast<uintptr_t>(src) & 63u) != 0) {
-		_mm_storeu_si128(reinterpret_cast<__m128i*>(dst), load(src));
+		_mm_storeu_si128(reinterpret_cast<__m128i*>(dst), StreamLoad16(src));
 		dst += 16;
 		src += 16;
 		size -= 16;
 	}
 	while (size >= 64) {
-		const __m128i a = load(src);
-		const __m128i b = load(src + 16);
-		const __m128i c = load(src + 32);
-		const __m128i d = load(src + 48);
+		const __m128i a = StreamLoad16(src);
+		const __m128i b = StreamLoad16(src + 16);
+		const __m128i c = StreamLoad16(src + 32);
+		const __m128i d = StreamLoad16(src + 48);
 		_mm_storeu_si128(reinterpret_cast<__m128i*>(dst), a);
 		_mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 16), b);
 		_mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 32), c);
@@ -57,7 +59,7 @@ __attribute__((target("sse4.1"))) inline void CopyFromWriteCombinedSse41(uint8_t
 		size -= 64;
 	}
 	while (size >= 16) {
-		_mm_storeu_si128(reinterpret_cast<__m128i*>(dst), load(src));
+		_mm_storeu_si128(reinterpret_cast<__m128i*>(dst), StreamLoad16(src));
 		dst += 16;
 		src += 16;
 		size -= 16;

@@ -45137,10 +45137,11 @@ static void CheckWriteCombinedCopy() {
           std::fill(destination.begin(), destination.end(), uint8_t{0xa5});
           Libs::Graphics::CopyFromWriteCombined(destination.data() + 64 + dst_offset,
                                                 source.data() + src_offset, size, streaming);
-          const auto *begin = destination.data() + 64 + dst_offset;
+          const uint8_t *first = destination.data();
+          const uint8_t *begin = first + 64 + dst_offset;
           const bool bytes = std::memcmp(begin, source.data() + src_offset, size) == 0;
           const bool guards =
-              std::all_of(destination.data(), begin, [](uint8_t b) { return b == 0xa5; }) &&
+              std::all_of(first, begin, [](uint8_t b) { return b == 0xa5; }) &&
               std::all_of(begin + size, begin + size + 64, [](uint8_t b) { return b == 0xa5; });
           if (!bytes || !guards) {
             Fail(name, bytes ? "guard bytes" : "bytes",
