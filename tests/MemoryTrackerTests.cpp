@@ -2035,6 +2035,20 @@ void TestWriteWatchInChildProcess() {
 #endif
 
 int main(int argc, char **argv) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+  // KYTY_WRITE_WATCH is read once per process and turns hot pages off. The cases in this process
+  // and the death cases test the fault (mprotect) tracker and have no fault handler: under an
+  // inherited KYTY_WRITE_WATCH=1 TestHotPageSnapshotHash's page never turns hot and its direct
+  // store hits a read-only page (SIGSEGV). So a caller's value is dropped before anything reads it;
+  // the write-watch cases set it in their own child process (--write-watch).
+  if (std::getenv("KYTY_WRITE_WATCH") != nullptr) {
+    unsetenv("KYTY_WRITE_WATCH");
+    if (argc == 1) {
+      std::puts("MemoryTrackerTests: KYTY_WRITE_WATCH from the environment ignored (the write-watch "
+                "cases set it in their child process)");
+    }
+  }
+#endif
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
   }
