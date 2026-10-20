@@ -4252,6 +4252,9 @@ public:
     {
       auto &cache = context.GetBufferCache();
       context.MapMemory(base, allocation_size / 2);
+      // A GPU fill: the written binding takes GPU ownership (FillBuffer fills untracked memory on
+      // the CPU, and then nothing is read back).
+      (void)cache.ObtainBuffer(base + fill_offset, fill_size, true);
       cache.FillBuffer(base + fill_offset, fill_size, fill_value, false);
       scheduler.Finish();
       (void)Probe::Take();
@@ -4259,6 +4262,8 @@ public:
       const auto readbacks = Probe::Take();
       const auto &k = readbacks[Libs::Graphics::WaitReasonProbe::Download];
       kind = k[Probe::Bar] ? "bar" : k[Probe::CopyOther] ? "copy" : "?";
+      Require(name, "readback", k[Probe::Bar] + k[Probe::CopyOther] == 1,
+              "the GPU-filled range was not read back exactly once");
       std::vector<uint8_t> guest(fill_size + 32);
       Require(name, "read guest",
               Libs::LibKernel::Memory::TryReadBacking(base + fill_offset - 16, guest.data(), guest.size()),
@@ -4284,6 +4289,134 @@ public:
             "bar-readback direct-memory allocation release failed");
     std::printf("[gpu]     %-32s ok (readback %s, streaming %s)\n", name, kind,
                 Libs::Graphics::WriteCombinedCopyEnabled() ? "on" : "off");
+  }
+
+  // SynchronizeBufferFromImage (a texel read binding over a GPU-written image) records an
+  // image->buffer copy into the cache buffer. A guest fault on those pages while the copy is
+  // still open must take the copy path, which runs after it, not the BAR read of the old bytes.
+  void CheckImageSyncStamp() {
+    constexpr const char *name = "ImageSyncStamp";
+    constexpr uintptr_t base = 0x000000020a400000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t image_offset = 0x10000; // 64x64 R32, its own 16 KiB GpuWriteTicks entry
+    constexpr uint64_t image_size = 0x4000;
+    constexpr uint64_t control_offset = 0x40000; // GPU-dirty, no image: shows whether BAR is used
+    constexpr uint32_t buffer_value = 0x0badc0deu;
+    constexpr uint32_t image_value = 0x1ee7f00du;
+    using Probe = Libs::Graphics::ReadbackProbe;
+
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "image-sync direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "image-sync fixed direct-memory mapping failed");
+    std::memset(reinterpret_cast<void *>(base), 0x3c, allocation_size);
+
+    const char *path = "?";
+    {
+      auto &cache = context.GetBufferCache();
+      auto &texture_cache = context.GetTextureCache();
+      LibKernel::Memory::InstallGpuResources(&context);
+      context.MapMemory(base, allocation_size);
+      const auto readbacks = [] {
+        uint64_t bar = 0, open = 0, other = 0;
+        for (const auto &k : Probe::Take()) {
+          bar += k[Probe::Bar];
+          open += k[Probe::CopyOpen];
+          other += k[Probe::CopyInFlight] + k[Probe::CopyOther];
+        }
+        return std::array<uint64_t, 3>{bar, open, other};
+      };
+      const auto guest_word = [&](uint64_t offset) {
+        uint32_t value = 0;
+        Require(name, "read guest",
+                Libs::LibKernel::Memory::TryReadBacking(base + offset, &value, sizeof(value)),
+                "the guest backing could not be read");
+        return value;
+      };
+
+      // 1. GPU-dirty cache pages whose writes finished, under the image and a control page. The
+      // written bindings make the fills GPU fills (FillBuffer fills untracked memory on the CPU).
+      (void)cache.ObtainBuffer(base + image_offset, image_size, true, false);
+      (void)cache.ObtainBuffer(base + control_offset, 0x1000, true, false);
+      cache.FillBuffer(base + image_offset, image_size, buffer_value, false);
+      cache.FillBuffer(base + control_offset, 0x1000, buffer_value, false);
+      scheduler.Finish();
+      (void)readbacks();
+      Require(name, "control fault", context.HandleFault(PageFaultAccess::Write, base + control_offset),
+              "a write fault over GPU-written memory was not handled");
+      const auto control = readbacks();
+      const bool bar = control[0] != 0; // host-visible cache buffers (ReBAR)
+      Require(name, "control bytes", guest_word(control_offset) == buffer_value,
+              "the control readback did not return the GPU-written bytes");
+
+      // 2. A GPU-written image over the first pages, with other pixels than the buffer holds.
+      auto desc = MakeLinearDesc(base + image_offset, image_size, vk::Format::eR32Uint,
+                                 Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+                                 {64, 64, 1}, 1, 4, 1);
+      const auto image = texture_cache.FindImage(desc);
+      (void)texture_cache.FindTexture(image, desc);
+      vk::ClearValue clear{};
+      clear.color.uint32[0] = image_value;
+      TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), image,
+                                         {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+      texture_cache.MarkGpuWritten(image);
+      scheduler.Finish();
+
+      // 3. The texel-read sync records image -> cache buffer in the open command buffer.
+      auto [buffer, offset] = cache.ObtainBuffer(base + image_offset, image_size, false, false);
+      Require(name, "image sync recorded",
+              buffer != nullptr && BufferCacheTestAccess::SynchronizeBufferFromImage(
+                                       cache, *buffer, base + image_offset, image_size),
+              "the image was not copied into its cache buffer");
+      Require(name, "copied pages stamped",
+              cache.LastGpuWriteTick(base + image_offset) == scheduler.CurrentTick() &&
+                  cache.LastGpuWriteTick(base + image_offset + image_size - 4) ==
+                      scheduler.CurrentTick(),
+              "the image->buffer copy left its pages with the finished fill's stamp");
+
+      // 4. A guest fault on them before the copy ran: the copy path (it waits for the open
+      // buffer), never BAR; the guest gets the image's pixels, not the older buffer bytes.
+      (void)readbacks();
+      Require(name, "image-page fault", context.HandleFault(PageFaultAccess::Write, base + image_offset),
+              "a write fault over the image's pages was not handled");
+      const auto faulted = readbacks();
+      path = faulted[0] != 0 ? "bar" : faulted[1] != 0 ? "copy-open" : "copy";
+      Require(name, "no BAR over an open image copy", !bar || faulted[0] == 0,
+              "a guest fault read the cache buffer over BAR before the image copy into it ran");
+      Require(name, "image pixels", guest_word(image_offset) == image_value,
+              "the guest fault published the buffer's bytes from before the image copy");
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "image-sync direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "image-sync direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok (fault path %s)\n", name, path);
   }
 
   void CheckBufferCacheDirtyGarbageCollection() {
@@ -48325,6 +48458,7 @@ int main(int argc, char **argv) {
     CheckWriteCombinedCopy();
     VulkanHarness vulkan;
     vulkan.CheckBarReadbackBytes();
+    vulkan.CheckImageSyncStamp();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--op-split-only") == 0) {
