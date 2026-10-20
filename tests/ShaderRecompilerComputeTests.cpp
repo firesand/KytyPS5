@@ -96,6 +96,7 @@
 #include <optional>
 #include <semaphore>
 #include <thread>
+#include <utility>
 #include <set>
 #include <span>
 #include <sstream>
@@ -386,6 +387,13 @@ struct TextureCacheTestAccess {
   static void DeleteImage(TextureCache &cache, ImageId id) {
     std::lock_guard lock(cache.m_lock);
     cache.DeleteImage(id);
+  }
+
+  // Stands in for a host format without color attachment support.
+  static vk::ImageUsageFlags ReplaceImageUsage(TextureCache &cache, ImageId id,
+                                               vk::ImageUsageFlags usage) {
+    auto lock = Lock(cache);
+    return std::exchange(cache.m_slot_images[id].backing.usage, usage);
   }
 
   static void RecordResolvedDccMeta(TextureCache &cache, uint64_t address,
@@ -13572,6 +13580,24 @@ public:
                 read_texel() == expected,
                 "completing the metadata overwrite did not restore its clear");
 
+        // Aliased views clear through an attachment on the CPU path as well: an image without
+        // attachment usage (its format cannot be one) must not take the GPU resolver.
+        if (!fill_case.reuse_unorm) {
+          paint();
+          const auto attachment_usage = TextureCacheTestAccess::ReplaceImageUsage(
+              texture_cache, color.image_id,
+              texture_cache.GetImage(color.image_id).backing.usage &
+                  ~vk::ImageUsageFlagBits::eColorAttachment);
+          fill_metadata(metadata_words);
+          bind();
+          Require(name, "non-attachment image clears through readback",
+                  !context.GetBufferCache().IsRegionGpuModified(dcc_address, metadata_size) &&
+                      read_texel() == expected,
+                  "a conditional attachment clear targeted an image without attachment usage");
+          (void)TextureCacheTestAccess::ReplaceImageUsage(texture_cache, color.image_id,
+                                                          attachment_usage);
+        }
+
         // Consuming a clear key updates metadata backing without invalidating
         // a pooled image whose first texel precedes the metadata range.
         constexpr uint32_t alias_value = 0x13579bdfu;
@@ -13667,7 +13693,13 @@ public:
                 "the former HTile entry swallowed the native color metadata fill");
         check_expanded_metadata();
         RenderExecutorTestAccess::ResetBindings(executor);
+        // A remap at this address must not find a resolved-metadata entry from the old mapping.
+        TextureCacheTestAccess::RecordResolvedDccMeta(texture_cache, dcc_address,
+                                                      metadata_size);
         resources.UnmapMemory(base, allocation_size);
+        Require(name, "unmap drops resolved DCC metadata",
+                !TextureCacheTestAccess::HasResolvedDccMeta(texture_cache, dcc_address),
+                "unmapped metadata kept its resolved entry and would skip a later resolve");
         scheduler.Finish();
       });
       context.ShutdownGpu();
