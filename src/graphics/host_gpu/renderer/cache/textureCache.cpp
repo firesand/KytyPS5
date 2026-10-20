@@ -362,12 +362,13 @@ void TextureCache::CountResolvedDccMetaPages(uint64_t address, uint64_t size, in
 }
 
 void TextureCache::RecordResolvedDccMeta(uint64_t address, uint64_t size) {
+	// Count the new range before releasing the old one: a page shared by both never reads 0.
+	CountResolvedDccMetaPages(address, size, 1);
 	if (const auto it = m_resolved_dcc_meta.find(address); it != m_resolved_dcc_meta.end()) {
 		CountResolvedDccMetaPages(address, it->second.first, -1);
 	}
 	m_resolved_dcc_meta[address] = {size, m_dcc_meta_epoch};
 	m_resolved_dcc_meta_max_size = std::max(m_resolved_dcc_meta_max_size, size);
-	CountResolvedDccMetaPages(address, size, 1);
 }
 
 std::map<uint64_t, std::pair<uint64_t, uint64_t>>::iterator TextureCache::EraseResolvedDccMeta(
@@ -1493,7 +1494,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		request.extent      = ViewExtent(image, view.base_level, view.format);
 		m_color_clear_resolver->Resolve(command, request);
 		CommitGpuWrite(image);
-		// Protected by m_lock acquired at line 1411 (held across image lookup, resolve, and commit).
+		// Protected by m_lock taken above, before the image lookup (held across lookup, resolve and commit).
 		// Do NOT add an inner scoped_lock here: TrackingSpinLock is non-recursive and will abort.
 		RecordResolvedDccMeta(meta_address, meta_size);
 		ZeroCompanyImageLifecycle::Record(m_scheduler, "materialize-color-clear-gpu", id, image,

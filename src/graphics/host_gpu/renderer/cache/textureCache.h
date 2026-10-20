@@ -13,6 +13,9 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <array>
+#include <atomic>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <type_traits>
