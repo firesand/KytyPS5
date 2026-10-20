@@ -1367,6 +1367,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			EXIT_IF(indirect_count.first == nullptr || (indirect_count.second & 3u) != 0);
 		}
 		// Obtaining the arguments can merge cache buffers; finalize shader bindings afterward.
+		const ReadbackTopProbe::RebindScope rebind; // already counted by readback-top above
 		for (auto* stage_bindings: stages) {
 			RebindBuffers(*stage_bindings);
 		}

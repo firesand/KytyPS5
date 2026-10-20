@@ -746,8 +746,9 @@ private:
 // ("| readback-top"; the owning buffers' extent and the span actually read), and how shaders and draws
 // bound the previous window's top ranges (written / read). Only binds marked by MarkShaderBind count
 // (descriptor, vertex, index and argument buffers), not the caches' own ObtainBuffer calls, and only
-// those served by a cache buffer (not the stream buffer); BDA page-table accesses are not seen, so it
-// is a lower bound of their GPU use. Keyed by guest range and merged by intersection, never by buffer:
+// those served by a cache buffer (not the stream buffer). GPU-indirect draws re-obtain their storage
+// buffers after the arguments (RebindScope): counted once. Unsynced whole-heap reads (FindBuffer,
+// descriptors.cpp) and BDA page-table accesses are not seen, so it is a lower bound of their GPU use. Keyed by guest range and merged by intersection, never by buffer:
 // joins rebuild buffers at new addresses, GC deletes them and slot ids are reused. GPU thread only,
 // like the readbacks, ObtainBuffer and the histogram dump (RunGarbageCollector).
 // At namespace scope: the probe's static arrays need these complete, with their initializers.
@@ -776,6 +777,7 @@ struct ReadbackTopProbe {
 	inline static std::array<Watched, kTop>   s_watched {};
 	inline static size_t                      s_watched_count = 0;
 	inline static thread_local bool           t_shader_bind = false; // set by MarkShaderBind
+	inline static thread_local bool           t_rebinding   = false; // inside a RebindScope
 
 	static void NoteBar(uint64_t begin, uint64_t end, uint64_t read_begin, uint64_t read_end, uint64_t bytes,
 	                    uint64_t ns) noexcept {
@@ -809,7 +811,18 @@ struct ReadbackTopProbe {
 		}
 	}
 	// Marks the next ObtainBuffer on this thread as a shader or draw bind (call right before it).
-	static void MarkShaderBind() noexcept { t_shader_bind = ProbeEnabled::Get(); }
+	static void MarkShaderBind() noexcept { t_shader_bind = !t_rebinding && ProbeEnabled::Get(); }
+	// Re-obtains bindings this op already counted: marks inside it do not count again.
+	class RebindScope {
+	public:
+		RebindScope() noexcept: m_outer(t_rebinding) { t_rebinding = true; }
+		~RebindScope() { t_rebinding = m_outer; }
+		RebindScope(const RebindScope&)            = delete;
+		RebindScope& operator=(const RebindScope&) = delete;
+
+	private:
+		bool m_outer;
+	};
 	static void NoteBind(uint64_t vaddr, uint64_t size, bool written) noexcept {
 		for (size_t i = 0; i < s_watched_count; ++i) {
 			auto& watched = s_watched[i];
