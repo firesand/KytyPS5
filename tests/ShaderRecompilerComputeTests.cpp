@@ -4232,6 +4232,9 @@ public:
     {
       auto &cache = context.GetBufferCache();
       context.MapMemory(base, allocation_size / 2);
+      // A GPU fill: the written binding takes GPU ownership (FillBuffer fills untracked memory on
+      // the CPU, and then nothing is read back).
+      (void)cache.ObtainBuffer(base + fill_offset, fill_size, true);
       cache.FillBuffer(base + fill_offset, fill_size, fill_value, false);
       scheduler.Finish();
       (void)Probe::Take();
@@ -4239,6 +4242,8 @@ public:
       const auto readbacks = Probe::Take();
       const auto &k = readbacks[Libs::Graphics::WaitReasonProbe::Download];
       kind = k[Probe::Bar] ? "bar" : k[Probe::CopyOther] ? "copy" : "?";
+      Require(name, "readback", k[Probe::Bar] + k[Probe::CopyOther] == 1,
+              "the GPU-filled range was not read back exactly once");
       std::vector<uint8_t> guest(fill_size + 32);
       Require(name, "read guest",
               Libs::LibKernel::Memory::TryReadBacking(base + fill_offset - 16, guest.data(), guest.size()),
