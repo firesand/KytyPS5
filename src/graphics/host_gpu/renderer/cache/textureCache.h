@@ -13,6 +13,9 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <array>
+#include <atomic>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <type_traits>
@@ -134,6 +137,26 @@ private:
 	using ImageIds       = InlinePageOwnerList<ImageId, 16>;
 	using ImagePageTable = MultiLevelPageTable<ImageIds, 20, 44, 14>;
 
+	// Registered images, plus resolved DCC metadata ranges (a CPU write there must still erase
+	// the entry, see InvalidateDccMetadata), per page of the image page table.
+	// Written under m_lock, read without it.
+	class RegisteredPageCounts final {
+	public:
+		RegisteredPageCounts() = default;
+		~RegisteredPageCounts();
+		KYTY_CLASS_NO_COPY(RegisteredPageCounts);
+
+		void               Add(size_t page, int32_t delta);
+		[[nodiscard]] bool Any(size_t first, size_t last_exclusive) const noexcept;
+
+	private:
+		static constexpr size_t kLeafBits = 10;
+		static constexpr size_t kLeafSize = size_t {1} << kLeafBits;
+		using Leaf                        = std::array<std::atomic<uint32_t>, kLeafSize>;
+
+		std::array<std::atomic<Leaf*>, ImagePageTable::kPageCount / kLeafSize> m_leaves {};
+	};
+
 	// Callers have validated the nonempty 44-bit range with TryGetPageRange.
 	template <typename Func>
 	static void ForEachPage(uint64_t address, size_t size, Func&& func) {
@@ -228,6 +251,7 @@ private:
 	std::unique_ptr<ColorClearResolver>               m_color_clear_resolver;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
+	RegisteredPageCounts                              m_registered_pages;
 	std::unordered_map<vk::Format, ImageId>           m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
@@ -235,6 +259,11 @@ private:
 	// Protected by m_lock. Maps metadata base address -> {size, epoch}; ordered, so an overlap
 	// query walks only the starts within the largest size before the range (InvalidateDccMetadata).
 	std::map<uint64_t, std::pair<uint64_t, uint64_t>> m_resolved_dcc_meta;
+	// All three keep m_registered_pages in step with m_resolved_dcc_meta; callers hold m_lock.
+	void RecordResolvedDccMeta(uint64_t address, uint64_t size);
+	std::map<uint64_t, std::pair<uint64_t, uint64_t>>::iterator EraseResolvedDccMeta(
+	    std::map<uint64_t, std::pair<uint64_t, uint64_t>>::iterator it);
+	void CountResolvedDccMetaPages(uint64_t address, uint64_t size, int32_t delta);
 	uint64_t m_resolved_dcc_meta_max_size = 0; // no entry is larger (reset when the map empties)
 	uint64_t                                          m_dcc_meta_epoch = 1;
 	uint64_t                                          m_total_used_memory  = 0;

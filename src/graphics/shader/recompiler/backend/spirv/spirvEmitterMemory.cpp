@@ -176,10 +176,10 @@ void RecordBdaFault(EmitterState& state, uint32_t page) {
 	    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
 	           Binary(state, spv::OpBitwiseAnd, TypeU32(state), page, ConstantU32(state, 31)));
 	const auto pointer = FaultElementPointer(state, word);
-	const auto value   = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
-	state.builder.AddFunction(spv::OpStore, pointer,
-	                          Binary(state, spv::OpBitwiseOr, TypeU32(state), value, bit));
+	const auto old     = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state), old, pointer,
+	                          ConstantU32(state, spv::ScopeDevice),
+	                          ConstantU32(state, spv::MemorySemanticsMaskNone), bit);
 }
 
 // Stores and atomics through an unbounded (whole-heap) descriptor set the touched guest page's
