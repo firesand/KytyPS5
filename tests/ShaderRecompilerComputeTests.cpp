@@ -95,6 +95,7 @@
 #include <numeric>
 #include <optional>
 #include <semaphore>
+#include <thread>
 #include <set>
 #include <span>
 #include <sstream>
@@ -385,6 +386,17 @@ struct TextureCacheTestAccess {
   static void DeleteImage(TextureCache &cache, ImageId id) {
     std::lock_guard lock(cache.m_lock);
     cache.DeleteImage(id);
+  }
+
+  static void RecordResolvedDccMeta(TextureCache &cache, uint64_t address,
+                                    uint64_t size) {
+    std::lock_guard lock(cache.m_lock);
+    cache.RecordResolvedDccMeta(address, size);
+  }
+
+  static bool HasResolvedDccMeta(TextureCache &cache, uint64_t address) {
+    std::lock_guard lock(cache.m_lock);
+    return cache.m_resolved_dcc_meta.contains(address);
   }
 
   static const Image *Owner(const TextureCache &cache, ImageId id) {
@@ -11482,6 +11494,100 @@ public:
             "metadata write is outside the mapped allocation");
     const std::vector<uint32_t> words(size / sizeof(value), value);
     LibKernel::Memory::WriteBacking(address, words.data(), size);
+  }
+
+  void CheckImagelessPageInvalidation() {
+    constexpr const char *name = "ImagelessPageInvalidation";
+    constexpr uintptr_t base = 0x000000020c000000ull;
+    constexpr uint64_t allocation_size = 0x400000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t imageless_offset = 0x200000;
+    constexpr uint64_t dcc_meta_offset = 0x300000;
+    constexpr uint32_t width = 64;
+    constexpr uint32_t height = 64;
+
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+    std::memset(mapped, 0x5a, allocation_size);
+
+    {
+      context.MapMemory(base, allocation_size);
+      auto &texture_cache = context.GetTextureCache();
+      auto desc = MakeLinearDesc(base, width * height * 4, vk::Format::eR8G8B8A8Unorm,
+                                 Prospero::BufferFormat::k8_8_8_8UNorm,
+                                 Prospero::ImageType::kColor2D, {width, height, 1}, 1, 4, 1);
+      const auto image = texture_cache.FindImage(desc);
+      (void)texture_cache.FindTexture(image, desc);
+      // CPU write faults arrive while the GPU thread holds the cache lock to record draws.
+      const auto invalidate_while_locked = [&](uint64_t address, auto wait) {
+        auto lock = TextureCacheTestAccess::Lock(texture_cache);
+        std::binary_semaphore done{0};
+        std::thread writer([&] {
+          texture_cache.InvalidateMemory(address, sizeof(uint32_t));
+          done.release();
+        });
+        const bool unblocked = done.try_acquire_for(wait);
+        lock.unlock();
+        writer.join();
+        return unblocked;
+      };
+      Require(name, "imageless page",
+              invalidate_while_locked(base + imageless_offset, std::chrono::seconds(5)) &&
+                  !texture_cache.GetImage(image).IsCpuDirty(),
+              "a write to a page without images waited for the texture cache lock");
+      texture_cache.InvalidateMemory(base, sizeof(uint32_t));
+      Require(name, "image page", texture_cache.GetImage(image).IsDefinitelyCpuDirty(),
+              "a write to an image page did not invalidate the image");
+      TextureCacheTestAccess::DeleteImage(texture_cache, image);
+      Require(name, "unregistered image page",
+              invalidate_while_locked(base, std::chrono::seconds(5)),
+              "a write to the pages of a removed image waited for the texture cache lock");
+
+      // Resolved DCC metadata lives on pages without images; a CPU write there must still
+      // reach InvalidateDccMetadata (the early return would otherwise leave the entry stale).
+      const uint64_t meta_address = base + dcc_meta_offset;
+      TextureCacheTestAccess::RecordResolvedDccMeta(texture_cache, meta_address, 0x1000);
+      // The writer waits for the lock (0.5 s here), then drops the entry once released.
+      Require(name, "metadata page takes the lock",
+              !invalidate_while_locked(meta_address, std::chrono::milliseconds(500)),
+              "a write to resolved DCC metadata skipped the texture cache lock");
+      Require(name, "metadata invalidation",
+              !TextureCacheTestAccess::HasResolvedDccMeta(texture_cache, meta_address),
+              "a CPU write did not drop the resolved DCC metadata entry");
+      Require(name, "metadata page released",
+              invalidate_while_locked(meta_address, std::chrono::seconds(5)),
+              "the pages of a dropped DCC metadata entry still wait for the lock");
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
   }
 
   static TextureCache::ImageDesc MakeLinearDesc(
@@ -48348,6 +48454,11 @@ int main(int argc, char **argv) {
     vulkan.CheckUnifiedTextureCacheFlow();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--imageless-invalidation-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckImagelessPageInvalidation();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBufferCacheDirtyGarbageCollection();
@@ -48553,6 +48664,7 @@ int main(int argc, char **argv) {
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();
+  vulkan.CheckImagelessPageInvalidation();
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorageExpansion();
   if (rasterization) {

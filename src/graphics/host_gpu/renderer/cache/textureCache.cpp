@@ -324,6 +324,58 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	return id;
 }
 
+TextureCache::RegisteredPageCounts::~RegisteredPageCounts() {
+	for (auto& leaf: m_leaves) {
+		delete leaf.load(std::memory_order_relaxed);
+	}
+}
+
+void TextureCache::RegisteredPageCounts::Add(size_t page, int32_t delta) {
+	auto& slot = m_leaves[page >> kLeafBits];
+	auto* leaf = slot.load(std::memory_order_relaxed);
+	if (leaf == nullptr) {
+		leaf = new Leaf {};
+		slot.store(leaf, std::memory_order_release);
+	}
+	(*leaf)[page & (kLeafSize - 1)].fetch_add(static_cast<uint32_t>(delta),
+	                                          std::memory_order_release);
+}
+
+bool TextureCache::RegisteredPageCounts::Any(size_t first, size_t last_exclusive) const noexcept {
+	for (auto page = first; page < last_exclusive; page++) {
+		const auto* leaf = m_leaves[page >> kLeafBits].load(std::memory_order_acquire);
+		if (leaf != nullptr &&
+		    (*leaf)[page & (kLeafSize - 1)].load(std::memory_order_acquire) != 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void TextureCache::CountResolvedDccMetaPages(uint64_t address, uint64_t size, int32_t delta) {
+	ImagePageTable::PageRange pages {};
+	if (size != 0 && ImagePageTable::TryGetPageRange(address, size, pages)) {
+		ForEachPage(address, size, [this, delta](uint64_t page) {
+			m_registered_pages.Add(page, delta);
+		});
+	}
+}
+
+void TextureCache::RecordResolvedDccMeta(uint64_t address, uint64_t size) {
+	if (const auto it = m_resolved_dcc_meta.find(address); it != m_resolved_dcc_meta.end()) {
+		CountResolvedDccMetaPages(address, it->second.first, -1);
+	}
+	m_resolved_dcc_meta[address] = {size, m_dcc_meta_epoch};
+	m_resolved_dcc_meta_max_size = std::max(m_resolved_dcc_meta_max_size, size);
+	CountResolvedDccMetaPages(address, size, 1);
+}
+
+std::map<uint64_t, std::pair<uint64_t, uint64_t>>::iterator TextureCache::EraseResolvedDccMeta(
+    std::map<uint64_t, std::pair<uint64_t, uint64_t>>::iterator it) {
+	CountResolvedDccMetaPages(it->first, it->second.first, -1);
+	return m_resolved_dcc_meta.erase(it);
+}
+
 void TextureCache::RegisterImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.registered || image.info.data.Empty()) {
@@ -335,6 +387,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	}
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
+		m_registered_pages.Add(page, 1);
 	});
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
@@ -356,6 +409,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 		if (owners == nullptr || !owners->Erase(id)) {
 			EXIT("TextureCache: image missing from page owner index\n");
 		}
+		m_registered_pages.Add(page, -1);
 	});
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
@@ -1434,8 +1488,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		CommitGpuWrite(image);
 		// Protected by m_lock acquired at line 1411 (held across image lookup, resolve, and commit).
 		// Do NOT add an inner scoped_lock here: TrackingSpinLock is non-recursive and will abort.
-		m_resolved_dcc_meta[meta_address] = {meta_size, m_dcc_meta_epoch};
-		m_resolved_dcc_meta_max_size       = std::max(m_resolved_dcc_meta_max_size, meta_size);
+		RecordResolvedDccMeta(meta_address, meta_size);
 		ZeroCompanyImageLifecycle::Record(m_scheduler, "materialize-color-clear-gpu", id, image,
 		    {.request = &desc.info, .address = meta_address, .size = meta_size});
 		if (clear_log) {
@@ -2035,6 +2088,14 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid memory-invalidation range\n");
 	}
+	// Images and resolved DCC metadata ranges count their pages before the pages are tracked, so
+	// CPU writes to pages with neither have nothing to invalidate. Most write faults land there
+	// and need not wait for the lock.
+	ImagePageTable::PageRange pages {};
+	if (ImagePageTable::TryGetPageRange(address, size, pages) &&
+	    !m_registered_pages.Any(pages.first, pages.last_exclusive)) {
+		return;
+	}
 	std::scoped_lock lock {m_lock};
 	InvalidateCpuAliases(address, size);
 }
@@ -2579,7 +2640,7 @@ void TextureCache::InvalidateDccMetadata(uint64_t address, uint64_t size) {
 	for (auto it = m_resolved_dcc_meta.lower_bound(from); it != m_resolved_dcc_meta.end() && it->first < end;) {
 		const uint64_t meta_end = it->first + it->second.first;
 		if (address < meta_end) {
-			it = m_resolved_dcc_meta.erase(it);
+			it = EraseResolvedDccMeta(it);
 		} else {
 			++it;
 		}
