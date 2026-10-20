@@ -12,6 +12,7 @@
 #include <cinttypes>
 #include <cstdlib>
 #include <string>
+#include <thread>
 #include <utility>
 
 #if defined(__linux__)
@@ -35,8 +36,19 @@ namespace {
 constexpr uint64_t PAGE_SIZE  = TRACKER_PAGE_SIZE;
 constexpr uint64_t SCAN_CHUNK = 64ull * 1024ull * 1024ull; // bounds a run-count early return's re-walk
 constexpr uint64_t RANGE_CHUNK = 256ull * 1024ull * 1024ull; // CollectRanges' per-ioctl span
-constexpr uint64_t MERGE_GAP   = 64ull * 1024ull * 1024ull;  // CollectRanges merges closer ranges
+constexpr uint64_t SMALL_MERGE_GAP = 8ull * 1024ull * 1024ull; // pre-arm and label passes
 constexpr size_t   MAX_LABELS = 4096;
+
+// KYTY_WRITE_WATCH_MERGE_GAP_MB (default 64): full collections scan watched spans closer than this
+// as one range.
+uint64_t FullMergeGap() {
+	static const uint64_t gap = [] {
+		const char* value = std::getenv("KYTY_WRITE_WATCH_MERGE_GAP_MB");
+		const auto  mib   = value != nullptr ? std::strtoull(value, nullptr, 10) : 64ull;
+		return std::min<uint64_t>(mib, 1ull << 20) * 1024ull * 1024ull;
+	}();
+	return gap;
+}
 
 std::atomic<uint64_t> g_collects {0};
 std::atomic<uint64_t> g_ioctls {0};
@@ -47,6 +59,67 @@ std::atomic<uint64_t> g_label_checks {0};
 std::atomic<uint64_t> g_label_written {0};
 std::atomic<uint64_t> g_range_passes {0};
 std::atomic<uint64_t> g_rearms {0};
+std::atomic<uint64_t> g_rearm_skipped {0};
+std::atomic<uint64_t> g_label_scanning {0};
+std::atomic<uint64_t> g_label_unknown {0};
+std::atomic<uint64_t> g_label_flagged {0};
+std::atomic<uint64_t> g_label_uncovered {0};
+std::atomic<uint64_t> g_label_scanned {0};
+std::atomic<uint64_t> g_label_raced {0};
+std::atomic<uint64_t> g_label_set {0};
+std::atomic<uint64_t> g_label_evicted {0};
+std::atomic<uint64_t> g_apply_waits {0};
+std::atomic<uint64_t> g_apply_timeouts {0};
+
+// ApplyScopes this thread holds (nested ones included), so OtherAppliesInFlight leaves them out.
+thread_local uint32_t t_applies_in_flight = 0;
+
+// KYTY_WRITE_WATCH_LABELS: "consumed" (default) or "set" (WriteWatch::WasLabelWritten).
+bool ConsumedLabels() {
+	static const bool consumed = [] {
+		const char* value = std::getenv("KYTY_WRITE_WATCH_LABELS");
+		return value == nullptr || std::string(value) != "set";
+	}();
+	return consumed;
+}
+
+struct SourceCounters {
+	std::atomic<uint64_t> calls {0};
+	std::atomic<uint64_t> ioctls {0};
+	std::atomic<uint64_t> ns {0};
+	std::atomic<uint64_t> walked {0};
+	std::atomic<uint64_t> ranges {0};
+	std::atomic<uint64_t> pages {0};
+	std::atomic<uint64_t> requested {0};
+};
+std::array<SourceCounters, static_cast<size_t>(WriteWatch::Source::Count)> g_sources;
+
+SourceCounters& Counters(WriteWatch::Source source) {
+	return g_sources[static_cast<size_t>(source)];
+}
+
+uint64_t NsSince(std::chrono::steady_clock::time_point begin) {
+	return static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count());
+}
+
+// Sorted, page-aligned [start, end) ranges merged across gaps of at most gap bytes.
+WriteWatch::Ranges MergeRanges(WriteWatch::Ranges ranges, uint64_t gap) {
+	for (auto& [start, end]: ranges) {
+		start = Common::AlignDown(start, PAGE_SIZE);
+		end   = Common::AlignUp(end, PAGE_SIZE);
+	}
+	std::sort(ranges.begin(), ranges.end());
+	WriteWatch::Ranges merged;
+	for (const auto& [start, end]: ranges) {
+		if (!merged.empty() && start <= merged.back().second + gap) {
+			merged.back().second = std::max(merged.back().second, end);
+		} else {
+			merged.emplace_back(start, end);
+		}
+	}
+	return merged;
+}
 
 // KYTY_WRITE_WATCH_LOG=1: one line per collection that reported pages (first 4000).
 bool LogEnabled() {
@@ -149,6 +222,10 @@ void WriteWatch::RegisterView(uint64_t vaddr, uint64_t size) noexcept {
 	}
 #if defined(KYTY_WRITE_WATCH_SUPPORTED)
 	std::unique_lock lock(m_views_mutex);
+	// Seqlock as for a scan (entered once the lock is held, so a check made while this waits for a
+	// collection is not counted as overlapping): a check cannot fall between the remap or arming
+	// below and the record after it.
+	m_label_scans_active.fetch_add(1, std::memory_order_seq_cst);
 	uffdio_register reg {};
 	reg.range.start = vaddr;
 	reg.range.len   = size;
@@ -179,6 +256,13 @@ void WriteWatch::RegisterView(uint64_t vaddr, uint64_t size) noexcept {
 	});
 	m_views.Add(vaddr, size);
 	m_views_epoch.fetch_add(1, std::memory_order_acq_rel);
+	lock.unlock();
+	// Arming re-protects without reporting, and a part mapped over a live view (MapFixed maps over
+	// it without UnregisterView) is a new VMA that is not armed at all: freed page tables there read
+	// as not written. A label anywhere in the view counts as written until the next label pass.
+	NoteLabelRuns(Ranges {{vaddr, vaddr + size}});
+	m_label_scan_seq.fetch_add(1, std::memory_order_seq_cst);
+	m_label_scans_active.fetch_sub(1, std::memory_order_seq_cst);
 #else
 	(void)vaddr;
 #endif
@@ -189,9 +273,13 @@ void WriteWatch::UnregisterView(uint64_t vaddr, uint64_t size) noexcept {
 		return;
 	}
 	std::unique_lock lock(m_views_mutex);
+	// Seqlock: a label check that passed IsCovered before this must not trust a scan after it.
+	m_label_scans_active.fetch_add(1, std::memory_order_seq_cst);
 	// The placeholder mapping that replaces the view drops the kernel registration itself.
 	m_views.Subtract(vaddr, size);
 	m_views_epoch.fetch_add(1, std::memory_order_acq_rel);
+	m_label_scan_seq.fetch_add(1, std::memory_order_seq_cst);
+	m_label_scans_active.fetch_sub(1, std::memory_order_seq_cst);
 }
 
 void WriteWatch::CoveredPages(uint64_t region_base, RegionBits* covered) const noexcept {
@@ -208,11 +296,12 @@ bool WriteWatch::IsCovered(uint64_t vaddr, uint64_t size) const noexcept {
 	return m_views.Contains(vaddr, size);
 }
 
-void WriteWatch::ScanChunk(uint64_t start, uint64_t end,
-                           std::vector<std::pair<uint64_t, uint64_t>>* runs, bool check_async) noexcept {
+bool WriteWatch::ScanChunk(uint64_t start, uint64_t end, Ranges* runs, bool check_async,
+                           Source source) noexcept {
 #if defined(KYTY_WRITE_WATCH_SUPPORTED)
 	static thread_local std::array<page_region, 512> vec {};
-	uint64_t cursor = start;
+	auto&    counters = Counters(source);
+	uint64_t cursor   = start;
 	while (cursor < end) {
 		pm_scan_arg arg {};
 		arg.size          = sizeof(arg);
@@ -225,6 +314,8 @@ void WriteWatch::ScanChunk(uint64_t start, uint64_t end,
 		arg.return_mask   = PAGE_IS_WRITTEN;
 		const long count  = ::ioctl(m_pagemap, PAGEMAP_SCAN, &arg);
 		g_ioctls.fetch_add(1, std::memory_order_relaxed);
+		counters.ioctls.fetch_add(1, std::memory_order_relaxed);
+		counters.walked.fetch_add(end - cursor, std::memory_order_relaxed);
 		if (count < 0 || arg.walk_end <= cursor) {
 			// A failed call may already have re-protected pages it could not report (the
 			// prototype's EPERM case): everything from the cursor on counts as written.
@@ -236,7 +327,7 @@ void WriteWatch::ScanChunk(uint64_t start, uint64_t end,
 				     cursor, end, count < 0 ? std::strerror(errno) : "no progress");
 			}
 			AppendRun(runs, cursor, end);
-			return;
+			return false;
 		}
 		for (long i = 0; i < count; i++) {
 			AppendRun(runs, vec[i].start, vec[i].end);
@@ -248,7 +339,28 @@ void WriteWatch::ScanChunk(uint64_t start, uint64_t end,
 	(void)end;
 	(void)runs;
 	(void)check_async;
+	(void)source;
 #endif
+	return true;
+}
+
+bool WriteWatch::ScanMerged(const Ranges& merged, uint64_t chunk, Ranges* runs, Source source) noexcept {
+	bool ok = true;
+	for (const auto& [start, end]: merged) {
+		// The registered extent of this range; the kernel skips unregistered VMAs inside it.
+		uint64_t low  = UINT64_MAX;
+		uint64_t high = 0;
+		m_views.ForEachInRange(start, end - start, [&](uint64_t view_start, uint64_t view_end) {
+			low  = std::min(low, view_start);
+			high = std::max(high, view_end);
+		});
+		for (auto cursor = low; cursor < high;) {
+			const auto chunk_end = std::min(high, Common::AlignDown(cursor, chunk) + chunk);
+			ok = ScanChunk(cursor, chunk_end, runs, /*check_async=*/false, source) && ok;
+			cursor = chunk_end;
+		}
+	}
+	return ok;
 }
 
 bool WriteWatch::AnyWritten(uint64_t start, uint64_t end) noexcept {
@@ -256,6 +368,7 @@ bool WriteWatch::AnyWritten(uint64_t start, uint64_t end) noexcept {
 	page_region region {};
 	pm_scan_arg arg {};
 	arg.size          = sizeof(arg);
+	arg.flags         = PM_SCAN_CHECK_WPASYNC; // an unregistered VMA fails (EPERM): "written"
 	arg.start         = start;
 	arg.end           = end;
 	arg.vec           = reinterpret_cast<uint64_t>(&region);
@@ -265,6 +378,8 @@ bool WriteWatch::AnyWritten(uint64_t start, uint64_t end) noexcept {
 	arg.return_mask   = PAGE_IS_WRITTEN;
 	const long count  = ::ioctl(m_pagemap, PAGEMAP_SCAN, &arg);
 	g_ioctls.fetch_add(1, std::memory_order_relaxed);
+	Counters(Source::LabelCheck).ioctls.fetch_add(1, std::memory_order_relaxed);
+	Counters(Source::LabelCheck).walked.fetch_add(end - start, std::memory_order_relaxed);
 	return count != 0; // an error is "written"
 #else
 	(void)start;
@@ -274,7 +389,17 @@ bool WriteWatch::AnyWritten(uint64_t start, uint64_t end) noexcept {
 }
 
 void WriteWatch::NoteLabelRuns(const std::vector<std::pair<uint64_t, uint64_t>>& runs) noexcept {
-	if (!m_has_labels.load(std::memory_order_acquire) || runs.empty()) {
+	if (runs.empty()) {
+		return;
+	}
+	if (ConsumedLabels()) {
+		std::lock_guard lock(m_labels_mutex);
+		for (const auto& [start, end]: runs) {
+			m_consumed.Add(start, end - start);
+		}
+		return;
+	}
+	if (!m_has_labels.load(std::memory_order_acquire)) {
 		return;
 	}
 	std::lock_guard lock(m_labels_mutex);
@@ -288,6 +413,9 @@ void WriteWatch::NoteLabelRuns(const std::vector<std::pair<uint64_t, uint64_t>>&
 }
 
 bool WriteWatch::TouchesLabels(uint64_t vaddr, uint64_t size) noexcept {
+	if (ConsumedLabels()) {
+		return true; // any page can be a label
+	}
 	if (!m_has_labels.load(std::memory_order_acquire)) {
 		return false;
 	}
@@ -298,9 +426,14 @@ bool WriteWatch::TouchesLabels(uint64_t vaddr, uint64_t size) noexcept {
 }
 
 void WriteWatch::Collect(uint64_t vaddr, uint64_t size, const RunFunc& func) noexcept {
+	CollectFrom(vaddr, size, func, Source::Inline);
+}
+
+void WriteWatch::CollectFrom(uint64_t vaddr, uint64_t size, const RunFunc& func, Source source) noexcept {
 	if (size == 0) {
 		return;
 	}
+	ApplyScope applying(this);
 	// PAGEMAP_SCAN rejects an unaligned start (EINVAL), which would report the range as written.
 	const auto first = Common::AlignDown(vaddr, PAGE_SIZE);
 	const auto last  = Common::AlignUp(vaddr + size, PAGE_SIZE);
@@ -323,7 +456,7 @@ void WriteWatch::Collect(uint64_t vaddr, uint64_t size, const RunFunc& func) noe
 		m_views.ForEachInRange(vaddr, size, [&](uint64_t start, uint64_t end) {
 			for (auto chunk = start; chunk < end;) {
 				const auto chunk_end = std::min(end, Common::AlignDown(chunk, SCAN_CHUNK) + SCAN_CHUNK);
-				ScanChunk(chunk, chunk_end, &runs);
+				(void)ScanChunk(chunk, chunk_end, &runs, /*check_async=*/true, source);
 				chunk = chunk_end;
 			}
 		});
@@ -334,44 +467,98 @@ void WriteWatch::Collect(uint64_t vaddr, uint64_t size, const RunFunc& func) noe
 		m_label_scan_seq.fetch_add(1, std::memory_order_seq_cst);
 		m_label_scans_active.fetch_sub(1, std::memory_order_seq_cst);
 	}
-	g_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-	                                         std::chrono::steady_clock::now() - begin)
-	                                         .count()),
-	               std::memory_order_relaxed);
+	const auto ns = NsSince(begin);
+	g_ns.fetch_add(ns, std::memory_order_relaxed);
+	auto& counters = Counters(source);
+	counters.calls.fetch_add(1, std::memory_order_relaxed);
+	counters.ns.fetch_add(ns, std::memory_order_relaxed);
 	// The callback may re-enter Collect (nested trackers); work on a copy.
 	const auto reported = runs;
 	for (const auto& [start, end]: reported) {
 		g_pages.fetch_add((end - start) / PAGE_SIZE, std::memory_order_relaxed);
+		counters.pages.fetch_add((end - start) / PAGE_SIZE, std::memory_order_relaxed);
 		func(start, end - start);
 	}
 }
 
 void WriteWatch::Rearm(uint64_t vaddr, uint64_t size) noexcept {
 	g_rearms.fetch_add(1, std::memory_order_relaxed);
-	Collect(vaddr, size, [](uint64_t, uint64_t) {});
+	CollectFrom(vaddr, size, [](uint64_t, uint64_t) {}, Source::Rearm);
 }
 
-void WriteWatch::CollectRanges(std::vector<std::pair<uint64_t, uint64_t>> ranges,
-                               const RunFunc& func) noexcept {
+void WriteWatch::NoteRearmSkipped(uint64_t pages) noexcept {
+	g_rearm_skipped.fetch_add(pages, std::memory_order_relaxed);
+}
+
+WriteWatch::ApplyScope::ApplyScope(WriteWatch* write_watch) noexcept: m_write_watch(write_watch) {
+	if (m_write_watch == nullptr) {
+		return;
+	}
+	m_bucket = m_write_watch->m_apply_epoch.load(std::memory_order_seq_cst) & 1u;
+	m_write_watch->m_applies_in_flight[m_bucket].fetch_add(1, std::memory_order_seq_cst);
+	++t_applies_in_flight;
+}
+
+WriteWatch::ApplyScope::~ApplyScope() {
+	if (m_write_watch == nullptr) {
+		return;
+	}
+	--t_applies_in_flight;
+	m_write_watch->m_applies_in_flight[m_bucket].fetch_sub(1, std::memory_order_seq_cst);
+}
+
+bool WriteWatch::OtherAppliesInFlight() const noexcept {
+	return m_applies_in_flight[0].load(std::memory_order_seq_cst) +
+	           m_applies_in_flight[1].load(std::memory_order_seq_cst) >
+	       t_applies_in_flight;
+}
+
+bool WriteWatch::WaitForOtherApplies() noexcept {
+	if (t_applies_in_flight != 0) {
+		return !OtherAppliesInFlight(); // cannot wait for a counter that holds this thread's scope
+	}
+	// A scope that reads the old bucket after this flip increments it before its scan: if this
+	// wait missed it, its scan comes after the caller's clear and records what it consumes.
+	const uint32_t old_bucket = m_apply_epoch.fetch_add(1, std::memory_order_seq_cst) & 1u;
+	if (m_applies_in_flight[old_bucket].load(std::memory_order_seq_cst) == 0) {
+		return true;
+	}
+	g_apply_waits.fetch_add(1, std::memory_order_relaxed);
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+	while (m_applies_in_flight[old_bucket].load(std::memory_order_seq_cst) != 0) {
+		if (std::chrono::steady_clock::now() > deadline) {
+			g_apply_timeouts.fetch_add(1, std::memory_order_relaxed);
+			static std::atomic<uint32_t> reported {0};
+			if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+				LOGF("WriteWatch: another thread's collection still applying after 50 ms\n");
+			}
+			return false;
+		}
+		std::this_thread::yield();
+	}
+	return true;
+}
+
+void WriteWatch::CollectRanges(Ranges ranges, const RunFunc& func, Source source, Ranges* scanned) noexcept {
+	if (scanned != nullptr) {
+		scanned->clear();
+	}
 	if (ranges.empty()) {
 		return;
 	}
-	for (auto& [start, end]: ranges) {
-		start = Common::AlignDown(start, PAGE_SIZE);
-		end   = Common::AlignUp(end, PAGE_SIZE);
-	}
-	std::sort(ranges.begin(), ranges.end());
-	std::vector<std::pair<uint64_t, uint64_t>> merged;
+	ApplyScope applying(this);
+	uint64_t   requested = 0;
 	for (const auto& [start, end]: ranges) {
-		if (!merged.empty() && start <= merged.back().second + MERGE_GAP) {
-			merged.back().second = std::max(merged.back().second, end);
-		} else {
-			merged.emplace_back(start, end);
-		}
+		requested += end - start;
 	}
+	Counters(source).requested.fetch_add(requested, std::memory_order_relaxed);
+	const auto merged =
+	    MergeRanges(std::move(ranges), source == Source::Prearm ? SMALL_MERGE_GAP : FullMergeGap());
 	const auto begin = std::chrono::steady_clock::now();
 	g_collects.fetch_add(1, std::memory_order_relaxed);
-	g_range_passes.fetch_add(1, std::memory_order_relaxed);
+	if (source == Source::Full) {
+		g_range_passes.fetch_add(1, std::memory_order_relaxed);
+	}
 	bool labels = false;
 	for (const auto& [start, end]: merged) {
 		labels = labels || TouchesLabels(start, end - start);
@@ -379,86 +566,123 @@ void WriteWatch::CollectRanges(std::vector<std::pair<uint64_t, uint64_t>> ranges
 	if (labels) {
 		m_label_scans_active.fetch_add(1, std::memory_order_seq_cst);
 	}
-	std::vector<std::pair<uint64_t, uint64_t>> runs;
+	Ranges runs;
+	bool   ok = true;
 	{
 		std::shared_lock lock(m_views_mutex);
-		for (const auto& [start, end]: merged) {
-			// The registered extent of this range; the kernel skips unregistered VMAs inside it.
-			uint64_t low  = UINT64_MAX;
-			uint64_t high = 0;
-			m_views.ForEachInRange(start, end - start, [&](uint64_t view_start, uint64_t view_end) {
-				low  = std::min(low, view_start);
-				high = std::max(high, view_end);
-			});
-			for (auto chunk = low; chunk < high;) {
-				const auto chunk_end = std::min(high, Common::AlignDown(chunk, RANGE_CHUNK) + RANGE_CHUNK);
-				ScanChunk(chunk, chunk_end, &runs, /*check_async=*/false);
-				chunk = chunk_end;
-			}
-		}
+		ok = ScanMerged(merged, RANGE_CHUNK, &runs, source);
 	}
 	NoteLabelRuns(runs);
-	if (!merged.empty()) {
-		LogRuns("collect-ranges", merged.front().first, merged.back().second - merged.front().first, runs);
-	}
+	LogRuns(source == Source::Prearm ? "prearm" : "collect-ranges", merged.front().first,
+	        merged.back().second - merged.front().first, runs);
 	if (labels) {
 		m_label_scan_seq.fetch_add(1, std::memory_order_seq_cst);
 		m_label_scans_active.fetch_sub(1, std::memory_order_seq_cst);
 	}
-	g_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-	                                         std::chrono::steady_clock::now() - begin)
-	                                         .count()),
-	               std::memory_order_relaxed);
+	const auto ns = NsSince(begin);
+	g_ns.fetch_add(ns, std::memory_order_relaxed);
+	auto& counters = Counters(source);
+	counters.calls.fetch_add(1, std::memory_order_relaxed);
+	counters.ns.fetch_add(ns, std::memory_order_relaxed);
+	counters.ranges.fetch_add(merged.size(), std::memory_order_relaxed);
+	if (scanned != nullptr && ok) {
+		*scanned = merged;
+	}
 	for (const auto& [start, end]: runs) {
 		g_pages.fetch_add((end - start) / PAGE_SIZE, std::memory_order_relaxed);
+		counters.pages.fetch_add((end - start) / PAGE_SIZE, std::memory_order_relaxed);
 		func(start, end - start);
 	}
 }
 
 bool WriteWatch::WasLabelWritten(uint64_t vaddr, uint64_t size) noexcept {
+	const auto begin = std::chrono::steady_clock::now();
 	g_label_checks.fetch_add(1, std::memory_order_relaxed);
-	const auto seq_before = m_label_scan_seq.load(std::memory_order_seq_cst);
-	if (m_label_scans_active.load(std::memory_order_seq_cst) != 0) {
+	// reason: the counter of the first cause that made the answer "written", or null.
+	const auto finish = [&](std::atomic<uint64_t>* reason) {
+		auto& counters = Counters(Source::LabelCheck);
+		counters.calls.fetch_add(1, std::memory_order_relaxed);
+		counters.ns.fetch_add(NsSince(begin), std::memory_order_relaxed);
+		if (reason == nullptr) {
+			return false;
+		}
+		reason->fetch_add(1, std::memory_order_relaxed);
 		g_label_written.fetch_add(1, std::memory_order_relaxed);
 		return true;
+	};
+	const auto seq_before = m_label_scan_seq.load(std::memory_order_seq_cst);
+	if (m_label_scans_active.load(std::memory_order_seq_cst) != 0) {
+		return finish(&g_label_scanning);
 	}
 	const auto first = Common::AlignDown(vaddr, PAGE_SIZE);
 	const auto last  = Common::AlignUp(vaddr + std::max<uint64_t>(size, 1), PAGE_SIZE);
-	bool       known = true;
-	bool       flagged = false;
+	const bool consumed_mode = ConsumedLabels();
+	bool       known         = true;
+	bool       flagged       = false;
 	{
 		std::lock_guard lock(m_labels_mutex);
+		const auto      clock = ++m_label_clock;
+		const auto      find  = [&](uint64_t page) {
+			return std::lower_bound(m_labels.begin(), m_labels.end(), page,
+			                        [](const Label& label, uint64_t p) { return label.page < p; });
+		};
 		for (auto page = first; page < last; page += PAGE_SIZE) {
-			auto it = std::lower_bound(m_labels.begin(), m_labels.end(), page,
-			                           [](const Label& label, uint64_t p) { return label.page < p; });
+			auto it = find(page);
 			if (it == m_labels.end() || it->page != page) {
 				known = false;
-				if (m_labels.size() < MAX_LABELS) {
-					m_labels.insert(it, Label {page, false});
-					m_has_labels.store(true, std::memory_order_release);
+				if (consumed_mode && m_labels.size() >= MAX_LABELS) {
+					// The set only picks the pages the label pass re-protects first here.
+					m_labels.erase(std::min_element(m_labels.begin(), m_labels.end(),
+					                                [](const Label& a, const Label& b) { return a.seen < b.seen; }));
+					g_label_evicted.fetch_add(1, std::memory_order_relaxed);
+					it = find(page);
 				}
-			} else if (it->written) {
-				flagged = true;
+				if (m_labels.size() < MAX_LABELS) {
+					m_labels.insert(it, Label {page, false, clock});
+					m_has_labels.store(true, std::memory_order_release);
+					g_label_set.store(m_labels.size(), std::memory_order_relaxed);
+				}
+			} else {
+				it->seen = clock;
+				flagged  = flagged || it->written;
 			}
+		}
+		if (consumed_mode) {
+			// A scan that re-protected the page since the last label pass may have consumed a
+			// label write; the kernel bit covers the rest, whether or not the page was known.
+			known   = true;
+			flagged = m_consumed.Intersects(first, last - first);
 		}
 	}
 	// Unknown pages were never re-protected for this purpose, and uncovered pages cannot be
 	// checked: both mean "possibly written".
-	bool written = !known || flagged || !IsCovered(first, last - first) || AnyWritten(first, last);
+	if (!known) {
+		return finish(&g_label_unknown);
+	}
+	if (flagged) {
+		return finish(&g_label_flagged);
+	}
+	if (!IsCovered(first, last - first)) {
+		return finish(&g_label_uncovered);
+	}
+	if (AnyWritten(first, last)) {
+		return finish(&g_label_scanned);
+	}
 	// A scan that touched label pages overlapped this check: its re-protect may have hidden the
 	// write and its flag may have come too late.
-	written = written || m_label_scans_active.load(std::memory_order_seq_cst) != 0 ||
-	          m_label_scan_seq.load(std::memory_order_seq_cst) != seq_before;
-	if (written) {
-		g_label_written.fetch_add(1, std::memory_order_relaxed);
+	if (m_label_scans_active.load(std::memory_order_seq_cst) != 0 ||
+	    m_label_scan_seq.load(std::memory_order_seq_cst) != seq_before) {
+		return finish(&g_label_raced);
 	}
-	return written;
+	return finish(nullptr);
 }
 
 void WriteWatch::CollectLabels(const RunFunc& func) noexcept {
-	if (!m_has_labels.load(std::memory_order_acquire)) {
+	// "consumed" mode starts a new label epoch even with no label known yet.
+	if (!m_has_labels.load(std::memory_order_acquire) && !ConsumedLabels()) {
 		return;
 	}
+	ApplyScope applying(this);
 	std::vector<uint64_t> pages;
 	{
 		std::lock_guard lock(m_labels_mutex);
@@ -467,32 +691,47 @@ void WriteWatch::CollectLabels(const RunFunc& func) noexcept {
 			pages.push_back(label.page);
 		}
 	}
-	// Adjacent label pages are scanned together.
-	RangeSet ranges;
+	// Label pages closer than 8 MiB are scanned as one range (ng-168: about 2,500 single-page
+	// ioctls per full collection, scanned one by one). A merged range also re-protects the
+	// written pages between the labels and reports them; the caller applies them like any
+	// collected run, and the span pass that follows covers every write-watched page again, so
+	// a data write the label pass missed is still collected by this full collection.
+	const auto begin = std::chrono::steady_clock::now();
+	Ranges     wanted;
+	wanted.reserve(pages.size());
 	for (const auto page: pages) {
-		ranges.Add(page, PAGE_SIZE);
+		wanted.emplace_back(page, page + PAGE_SIZE);
 	}
+	const auto merged = MergeRanges(std::move(wanted), SMALL_MERGE_GAP);
 	m_label_scans_active.fetch_add(1, std::memory_order_seq_cst);
-	std::vector<std::pair<uint64_t, uint64_t>> runs;
+	Ranges runs;
 	{
 		std::shared_lock lock(m_views_mutex);
-		ranges.ForEach([&](uint64_t range_start, uint64_t range_end) {
-			m_views.ForEachInRange(range_start, range_end - range_start,
-			                       [&](uint64_t start, uint64_t end) { ScanChunk(start, end, &runs); });
-		});
+		(void)ScanMerged(merged, SCAN_CHUNK, &runs, Source::Labels);
 	}
 	{
 		// Cleared after the label scans and before the caller's span scans: a label written
-		// after this point is either still unprotected or flagged by the scan that protects it.
+		// after this point is either still unprotected or flagged (consumed) by the scan that
+		// protects it. A label write consumed before this point preceded the span pass, which
+		// collects every write-watched page written before it.
 		std::lock_guard lock(m_labels_mutex);
-		for (auto& label: m_labels) {
-			label.written = false;
+		if (ConsumedLabels()) {
+			m_consumed.Clear();
+		} else {
+			for (auto& label: m_labels) {
+				label.written = false;
+			}
 		}
 	}
 	m_label_scan_seq.fetch_add(1, std::memory_order_seq_cst);
 	m_label_scans_active.fetch_sub(1, std::memory_order_seq_cst);
+	auto& counters = Counters(Source::Labels);
+	counters.calls.fetch_add(1, std::memory_order_relaxed);
+	counters.ns.fetch_add(NsSince(begin), std::memory_order_relaxed);
+	counters.ranges.fetch_add(merged.size(), std::memory_order_relaxed);
 	for (const auto& [start, end]: runs) {
 		g_pages.fetch_add((end - start) / PAGE_SIZE, std::memory_order_relaxed);
+		counters.pages.fetch_add((end - start) / PAGE_SIZE, std::memory_order_relaxed);
 		func(start, end - start);
 	}
 }
@@ -508,6 +747,28 @@ WriteWatch::Stats WriteWatch::TakeStats() noexcept {
 	stats.label_written = g_label_written.exchange(0, std::memory_order_relaxed);
 	stats.range_passes  = g_range_passes.exchange(0, std::memory_order_relaxed);
 	stats.rearms        = g_rearms.exchange(0, std::memory_order_relaxed);
+	stats.rearm_skipped = g_rearm_skipped.exchange(0, std::memory_order_relaxed);
+	for (size_t i = 0; i < stats.sources.size(); i++) {
+		auto& counters        = g_sources[i];
+		stats.sources[i].calls  = counters.calls.exchange(0, std::memory_order_relaxed);
+		stats.sources[i].ioctls = counters.ioctls.exchange(0, std::memory_order_relaxed);
+		stats.sources[i].ns     = counters.ns.exchange(0, std::memory_order_relaxed);
+		stats.sources[i].walked = counters.walked.exchange(0, std::memory_order_relaxed);
+		stats.sources[i].ranges = counters.ranges.exchange(0, std::memory_order_relaxed);
+		stats.sources[i].pages  = counters.pages.exchange(0, std::memory_order_relaxed);
+		stats.sources[i].requested = counters.requested.exchange(0, std::memory_order_relaxed);
+	}
+	stats.label_scanning  = g_label_scanning.exchange(0, std::memory_order_relaxed);
+	stats.label_unknown   = g_label_unknown.exchange(0, std::memory_order_relaxed);
+	stats.label_flagged   = g_label_flagged.exchange(0, std::memory_order_relaxed);
+	stats.label_uncovered = g_label_uncovered.exchange(0, std::memory_order_relaxed);
+	stats.label_scanned   = g_label_scanned.exchange(0, std::memory_order_relaxed);
+	stats.label_raced     = g_label_raced.exchange(0, std::memory_order_relaxed);
+	stats.label_set       = g_label_set.load(std::memory_order_relaxed);
+	stats.label_evicted   = g_label_evicted.exchange(0, std::memory_order_relaxed);
+	stats.apply_waits     = g_apply_waits.exchange(0, std::memory_order_relaxed);
+	stats.apply_timeouts  = g_apply_timeouts.exchange(0, std::memory_order_relaxed);
+	stats.label_consumed  = ConsumedLabels();
 	return stats;
 }
 

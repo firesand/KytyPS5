@@ -1915,8 +1915,170 @@ void TestWriteWatchLabels() {
   Check(write_watch->WasLabelWritten(label, 8), "a label in an unregistered range must count as written");
 }
 
+// The label pass scans nearby label pages as one range; another written page it meets there is
+// reported like any collected run.
+void TestWriteWatchLabelPassMergesRanges() {
+  auto *write_watch = WriteWatch::Get();
+  constexpr uint64_t page = TRACKER_PAGE_SIZE;
+  auto view = MapWriteWatchView(8);
+  const auto first_label = view.Address() + page;
+  const auto second_label = view.Address() + 6 * page;
+  (void)write_watch->WasLabelWritten(first_label, 8); // both join the label set
+  (void)write_watch->WasLabelWritten(second_label, 8);
+  write_watch->CollectLabels([](uint64_t, uint64_t) {});
+  view.memory[3 * page] = 1; // between the labels
+  (void)WriteWatch::TakeStats();
+  std::vector<std::pair<uint64_t, uint64_t>> runs;
+  write_watch->CollectLabels(
+      [&](uint64_t start, uint64_t bytes) { runs.emplace_back(start, start + bytes); });
+  const auto stats = WriteWatch::TakeStats();
+  const auto &labels = stats.sources[static_cast<size_t>(WriteWatch::Source::Labels)];
+  Check(labels.calls == 1 && labels.ranges == 1 && labels.ioctls == 1,
+        "nearby label pages were not scanned as one range");
+  Check(runs.size() == 1 && runs[0].first == view.Address() + 3 * page &&
+            runs[0].second == view.Address() + 4 * page,
+        "the label pass did not report exactly the page written between the labels");
+  Check(!write_watch->WasLabelWritten(first_label, 8) && !write_watch->WasLabelWritten(second_label, 8),
+        "a write next to the labels made them count as written");
+  UnmapWriteWatchView(view);
+}
+
+// "consumed" label mode (the default): any page can be checked, in the bounded label set or not.
+// ng-180: the set was full and every page outside it counted as written (210 full collections per
+// 3.5 s). A page no scan re-protected since the last label pass, with its kernel bit clear, was not
+// written since; a label write a scan consumed keeps counting until the next label pass.
+void TestWriteWatchLabelsWithoutSet() {
+  auto *write_watch = WriteWatch::Get();
+  constexpr uint64_t page = TRACKER_PAGE_SIZE;
+  auto view = MapWriteWatchView(8);
+  const auto label = view.Address() + 5 * page + 16;
+  Check(write_watch->WasLabelWritten(label, 8), "a label in a freshly armed view must count as written");
+  write_watch->CollectLabels([](uint64_t, uint64_t) {});
+  // Fill the label set past its bound with pages outside every view (they count as written).
+  for (uint64_t i = 0; i < 4200; i++) {
+    (void)write_watch->WasLabelWritten(0x7f0000000000ull + i * page, 8);
+  }
+  (void)WriteWatch::TakeStats();
+  Check(!write_watch->WasLabelWritten(label, 8),
+        "an unwritten page counted as written because the label set was full");
+  *reinterpret_cast<volatile uint64_t *>(label) = 1;
+  Check(write_watch->WasLabelWritten(label, 8), "a label write was missed");
+  write_watch->Collect(view.Address(), view.size, [](uint64_t, uint64_t) {}); // consumes the write
+  Check(write_watch->WasLabelWritten(label, 8), "a label write consumed by a scan was missed");
+  write_watch->CollectLabels([](uint64_t, uint64_t) {});
+  Check(!write_watch->WasLabelWritten(label, 8), "the label pass did not start a new label epoch");
+  // label_evicted counts from the TakeStats above: re-inserting the label evicted one entry.
+  const auto stats = WriteWatch::TakeStats();
+  Check(stats.label_consumed && stats.label_set == 4096 && stats.label_evicted >= 1 &&
+            stats.label_unknown == 0,
+        "the label set did not stay bounded by eviction, or a page counted as unknown");
+  UnmapWriteWatchView(view);
+  Check(write_watch->WasLabelWritten(label, 8), "a label in an unregistered range must count as written");
+}
+
+// A collection on another thread counts as in flight until its results are applied; acquire points
+// wait for it (the kernel bits it consumed are only in its pending applies). A thread's own
+// collection does not count.
+void TestWriteWatchOtherAppliesInFlight() {
+  auto *write_watch = WriteWatch::Get();
+  constexpr uint64_t page = TRACKER_PAGE_SIZE;
+  auto view = MapWriteWatchView(4);
+  view.memory[page] = 1;
+  std::atomic<bool> in_func{false};
+  std::atomic<bool> release{false};
+  bool own_in_flight = true;
+  std::thread worker([&] {
+    write_watch->Collect(view.Address(), view.size, [&](uint64_t, uint64_t) {
+      own_in_flight = write_watch->OtherAppliesInFlight();
+      in_func = true;
+      while (!release) {
+        std::this_thread::yield();
+      }
+    });
+  });
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!in_func) {
+    if (std::chrono::steady_clock::now() > deadline) {
+      release = true;
+      worker.join();
+      Check(false, "the other thread's collection reported no write");
+    }
+    std::this_thread::yield();
+  }
+  Check(!own_in_flight, "a thread's own collection counted as another thread's");
+  Check(write_watch->OtherAppliesInFlight(), "a collection still applying was not in flight");
+  std::thread releaser([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    release = true;
+  });
+  Check(write_watch->WaitForOtherApplies() && !write_watch->OtherAppliesInFlight(),
+        "waiting did not see the other thread's apply finish");
+  worker.join();
+  releaser.join();
+  UnmapWriteWatchView(view);
+}
+
+// A BDA sync's batch: one pass over the regions it is about to upload (PrearmWrittenPages), then
+// uploads inside a PrearmScope re-arm nothing of their own. A CPU-dirty page's write before the
+// pass is the upload's to copy, a watched page's write is collected by the pass, and a write after
+// the pass comes back at the next collection.
+void TestWriteWatchPrearmedUpload() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  constexpr uint64_t page = TRACKER_PAGE_SIZE;
+  auto view = MapWriteWatchView(8);
+  const auto address = view.Address();
+  UploadAll(tracker, address, view.size);
+  view.memory[2 * page] = 1;
+  Check(CollectAndApply(tracker, address, view.size) == 1, "first write was not collected");
+  view.memory[2 * page + 8] = 2; // CPU-dirty page written again: the upload copies it
+  view.memory[5 * page] = 3;     // watched page: the pass must collect it
+  (void)WriteWatch::TakeStats();
+  std::vector<std::pair<uint64_t, uint64_t>> scanned;
+  uint64_t collected = 0;
+  tracker.PrearmWrittenPages(
+      {{address, address + view.size}},
+      [&](uint64_t start, uint64_t bytes) {
+        collected += bytes / page;
+        tracker.InvalidateWriteFault(start, bytes, [] { Check(false, "unexpected GPU download"); });
+      },
+      &scanned);
+  Check(collected == 1 && tracker.IsRegionCpuModified(address + 5 * page, page),
+        "the pre-arm pass did not collect exactly the watched page's write");
+  Check(scanned.size() == 1 && scanned[0].first <= address && address + view.size <= scanned[0].second,
+        "the pre-arm pass did not return the range it covered");
+  bool wrote = false;
+  {
+    PageManager::PrearmScope scope(std::move(scanned));
+    tracker.ForEachUploadRange(
+        address, view.size, false,
+        [&](uint64_t start, uint64_t bytes, const void *) noexcept {
+          if (start <= address + 5 * page && address + 5 * page < start + bytes) {
+            view.memory[5 * page + 8] = 4; // after the pass, while the upload runs
+            wrote = true;
+          }
+        },
+        []() noexcept {});
+  }
+  Check(wrote && !tracker.IsRegionCpuModified(address, view.size),
+        "the upload did not consume the dirty pages");
+  const auto stats = WriteWatch::TakeStats();
+  Check(stats.rearms == 0 && stats.rearm_skipped == 2,
+        "uploads inside a pre-arm scope re-armed their pages one by one");
+  Check(CollectAndApply(tracker, address, view.size) == 1 &&
+            tracker.IsRegionCpuModified(address + 5 * page, page) &&
+            !tracker.IsRegionCpuModified(address + 2 * page, page),
+        "a write before the pass came back, or the write after it was lost");
+  // Outside a scope, a page gaining its first watcher is re-armed again.
+  UploadAll(tracker, address, view.size);
+  Check(WriteWatch::TakeStats().rearms == 1, "an upload outside the scope did not re-arm");
+  tracker.UntrackMemory(address, view.size);
+  UnmapWriteWatchView(view);
+}
+
 void RunWriteWatchCases() {
   setenv("KYTY_WRITE_WATCH", "1", 1);
+  setenv("KYTY_WRITE_WATCH_LABELS", "consumed", 1); // the cases below expect the default mode
   if (WriteWatch::Get() == nullptr) {
     std::puts("MemoryTrackerTests: write-watch cases skipped (no userfaultfd WP_ASYNC / PAGEMAP_SCAN)");
     std::exit(0);
@@ -1929,6 +2091,10 @@ void RunWriteWatchCases() {
   TestWriteWatchUnalignedCollection();
   TestWriteWatchFullCollectionCrossesPlaceholders();
   TestWriteWatchLabels();
+  TestWriteWatchLabelPassMergesRanges();
+  TestWriteWatchLabelsWithoutSet();
+  TestWriteWatchOtherAppliesInFlight();
+  TestWriteWatchPrearmedUpload();
   std::puts("MemoryTrackerTests: write-watch cases passed");
   std::exit(0);
 }
@@ -1947,6 +2113,20 @@ void TestWriteWatchInChildProcess() {
 #endif
 
 int main(int argc, char **argv) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+  // KYTY_WRITE_WATCH is read once per process and turns hot pages off. The cases in this process
+  // and the death cases test the fault (mprotect) tracker and have no fault handler: under an
+  // inherited KYTY_WRITE_WATCH=1 TestHotPageSnapshotHash's page never turns hot and its direct
+  // store hits a read-only page (SIGSEGV). So a caller's value is dropped before anything reads it;
+  // the write-watch cases set it in their own child process (--write-watch).
+  if (std::getenv("KYTY_WRITE_WATCH") != nullptr) {
+    unsetenv("KYTY_WRITE_WATCH");
+    if (argc == 1) {
+      std::puts("MemoryTrackerTests: KYTY_WRITE_WATCH from the environment ignored (the write-watch "
+                "cases set it in their child process)");
+    }
+  }
+#endif
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
   }

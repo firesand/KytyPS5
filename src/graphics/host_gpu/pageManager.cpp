@@ -51,6 +51,20 @@ constexpr uint64_t REGION_COUNT = ADDRESS_SIZE / REGION_SIZE;
 
 constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
 
+// PageManager::PrearmScope: ranges a pass on this thread re-protected, sorted and disjoint.
+thread_local const std::vector<std::pair<uint64_t, uint64_t>>* t_prearmed = nullptr;
+
+// [start, end) lies inside one of the ranges.
+bool Prearmed(const std::vector<std::pair<uint64_t, uint64_t>>& ranges, uint64_t start, uint64_t end) {
+	auto it = std::upper_bound(ranges.begin(), ranges.end(), start,
+	                           [](uint64_t value, const auto& range) { return value < range.first; });
+	if (it == ranges.begin()) {
+		return false;
+	}
+	--it;
+	return start >= it->first && end <= it->second;
+}
+
 [[noreturn]] void FailFast(const char* reason = nullptr) noexcept {
 	std::fputs("PageManager fail-fast: ", stderr);
 	std::fputs(reason != nullptr ? reason : "invalid page state", stderr);
@@ -329,6 +343,12 @@ struct PageManager::Impl {
 			rearm_begin = rearm_end = 0;
 		};
 		(void)flush_rearm; // read-watcher and untrack instantiations never re-arm
+		// Pages inside a PrearmScope's ranges were re-protected by its pass: no re-arm of their own.
+		[[maybe_unused]] const auto* prearmed = (track && !is_read) ? t_prearmed : nullptr;
+		[[maybe_unused]] const bool  all_prearmed =
+		    prearmed != nullptr &&
+		    Prearmed(*prearmed, base_addr + first * PAGE_SIZE, base_addr + last * PAGE_SIZE);
+		[[maybe_unused]] uint64_t rearm_skipped = 0;
 
 		for (size_t page_index = first; page_index < last; page_index++) {
 			auto&      page    = region.pages[page_index];
@@ -358,11 +378,16 @@ struct PageManager::Impl {
 					if constexpr (track) {
 						region.write_watched.fetch_add(1, std::memory_order_acq_rel);
 						if (page_covered) {
-							if (rearm_end != page_index) {
-								flush_rearm();
-								rearm_begin = page_index;
+							if (all_prearmed ||
+							    (prearmed != nullptr && Prearmed(*prearmed, address, address + PAGE_SIZE))) {
+								rearm_skipped++;
+							} else {
+								if (rearm_end != page_index) {
+									flush_rearm();
+									rearm_begin = page_index;
+								}
+								rearm_end = page_index + 1;
 							}
-							rearm_end = page_index + 1;
 						}
 					} else {
 						region.write_watched.fetch_sub(1, std::memory_order_acq_rel);
@@ -381,6 +406,9 @@ struct PageManager::Impl {
 		release_pending();
 		if constexpr (track && !is_read) {
 			flush_rearm();
+			if (rearm_skipped != 0) {
+				WriteWatch::NoteRearmSkipped(rearm_skipped);
+			}
 		}
 	}
 
@@ -473,6 +501,15 @@ void PageManager::ForEachWriteWatchedSpan(
 void PageManager::ForEachWriteWatchedRun(
     uint64_t vaddr, uint64_t size, const std::function<void(uint64_t, uint64_t)>& func) const {
 	m_impl->ForEachWriteWatchedRun(vaddr, size, func);
+}
+
+PageManager::PrearmScope::PrearmScope(std::vector<std::pair<uint64_t, uint64_t>> ranges) noexcept
+    : m_ranges(std::move(ranges)), m_previous(t_prearmed) {
+	t_prearmed = &m_ranges;
+}
+
+PageManager::PrearmScope::~PrearmScope() {
+	t_prearmed = m_previous;
 }
 
 } // namespace Libs::Graphics

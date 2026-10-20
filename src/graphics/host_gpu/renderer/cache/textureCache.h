@@ -232,8 +232,10 @@ private:
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
-	// Protected by m_lock. Maps metadata base address -> {size, epoch}.
-	std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> m_resolved_dcc_meta;
+	// Protected by m_lock. Maps metadata base address -> {size, epoch}; ordered, so an overlap
+	// query walks only the starts within the largest size before the range (InvalidateDccMetadata).
+	std::map<uint64_t, std::pair<uint64_t, uint64_t>> m_resolved_dcc_meta;
+	uint64_t m_resolved_dcc_meta_max_size = 0; // no entry is larger (reset when the map empties)
 	uint64_t                                          m_dcc_meta_epoch = 1;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;

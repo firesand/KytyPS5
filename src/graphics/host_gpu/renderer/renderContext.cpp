@@ -14,6 +14,7 @@
 #include <vector>
 #include <string>
 #include <atomic>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 
@@ -282,6 +283,25 @@ struct FaultSampler {
 			                    wwb.fault_pass_collects, wwb.ownership_unscanned, ww.ioctls, ww.pages,
 			                    g_ww_applied_pages.exchange(0, std::memory_order_relaxed), ww.errors,
 			                    ww.ns / 1000000, ww.label_written, ww.label_checks);
+			// Per scan source: calls, ioctls, ms, MiB handed to PAGEMAP_SCAN, merged ranges, pages
+			// reported, MiB asked for before merging (full and prearm). "labels" is not in "ms"
+			// above.
+			static constexpr const char* kSources[] = {"inline", "rearm", "full", "prearm", "labels", "check"};
+			static_assert(std::size(kSources) == static_cast<size_t>(WriteWatch::Source::Count));
+			line += " | ww-src";
+			for (size_t i = 0; i < ww.sources.size(); ++i) {
+				const auto& source = ww.sources[i];
+				line += fmt::format(" {} c {} i {} ms {} MiB {} r {} p {} req {};", kSources[i], source.calls,
+				                    source.ioctls, source.ns / 1000000, source.walked >> 20, source.ranges,
+				                    source.pages, source.requested >> 20);
+			}
+			line += fmt::format(" rearm-skipped {} | ww-label-written scanning {} unknown {} flagged {} "
+			                    "uncovered {} scanned {} raced {} set {} evicted {} mode {} apply-waits {} "
+			                    "apply-timeouts {}",
+			                    ww.rearm_skipped, ww.label_scanning, ww.label_unknown, ww.label_flagged,
+			                    ww.label_uncovered, ww.label_scanned, ww.label_raced, ww.label_set,
+			                    ww.label_evicted, ww.label_consumed ? "consumed" : "set", ww.apply_waits,
+			                    ww.apply_timeouts);
 		}
 		line += fmt::format(" | host-resident binds {} bytes {} KiB fallbacks {}", resident_all.binds,
 		                    resident_all.bytes >> 10, resident_all.fallbacks);
@@ -493,6 +513,12 @@ void RenderContext::CollectSubmittedCpuWrites() {
 		m_collected_submits = submits;
 		g_ww_stream_collects.fetch_add(1, std::memory_order_relaxed);
 		CollectCpuWrites();
+		// Writes another thread's collection consumed but has not applied yet must reach this
+		// stream's first BDA sync (see NoteGuestAcquire).
+		if (!WriteWatch::Get()->WaitForOtherApplies()) {
+			m_apply_wait_timed_out = true;
+		}
+		ApplyPendingCpuWrites();
 	} else {
 		ApplyPendingCpuWrites();
 	}
@@ -588,10 +614,21 @@ void RenderContext::NoteGuestAcquire(uint64_t label_vaddr, uint64_t label_size) 
 	if (auto* write_watch = WriteWatch::Get();
 	    write_watch != nullptr && label_vaddr != 0 && WriteWatchAcquireEnabled()) {
 		// The label page was not written since the last full collection began: the label write,
-		// and every CPU write made before it, preceded that collection.
-		if (write_watch->WasLabelWritten(label_vaddr, label_size)) {
+		// and every CPU write made before it, preceded that collection. A collection on another
+		// thread (inline collections run on the scheduler's priority thread) can consume kernel
+		// bits before applying them, so every full collection waits for the ones opened before
+		// it; after a timeout the next acquire collects and starts an epoch anyway.
+		if (write_watch->WasLabelWritten(label_vaddr, label_size) || m_apply_wait_timed_out) {
 			g_ww_acquire_collects.fetch_add(1, std::memory_order_relaxed);
-			new_cpu_data = CollectCpuWrites() != 0;
+			const bool collected  = CollectCpuWrites() != 0;
+			const bool drained    = write_watch->WaitForOtherApplies();
+			const bool timed_out  = m_apply_wait_timed_out;
+			m_apply_wait_timed_out = !drained || (timed_out && write_watch->OtherAppliesInFlight());
+			ApplyPendingCpuWrites(); // what those applies queued (GPU-dirty parts flag regions)
+			// Also data collected earlier that no BDA sync took yet: a sync's pre-arm pass, an
+			// inline collection on another thread or a replayed GPU-dirty part may have consumed
+			// the kernel bits of writes this label releases.
+			new_cpu_data = collected || timed_out || !drained || m_buffer_cache.HasBdaSyncPending();
 		}
 	}
 	NoteWaitPass();
@@ -659,12 +696,34 @@ void RenderContext::SyncCpuWrites() {
 		// Only regions with new CPU-dirty pages (and regions holding hot pages), clipped to mapped
 		// memory: cached buffers can extend past the mapping and unmapped pages must not be read.
 		const bool include_hot = std::exchange(m_sync_hot_regions_pending, false);
-		m_buffer_cache.ForEachBdaSyncPendingRegion(include_hot, [this](uint64_t vaddr, uint64_t size) {
-			SyncProbe::NoteRegion();
-			m_mapped_ranges.ForEachInRange(vaddr, size, [this](uint64_t start, uint64_t end) {
-				m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-			});
+		std::vector<std::pair<uint64_t, uint64_t>> regions;
+		m_buffer_cache.ForEachBdaSyncPendingRegion(include_hot, [&regions](uint64_t vaddr, uint64_t size) {
+			regions.emplace_back(vaddr, vaddr + size);
 		});
+		// Kernel write-watch: one pass re-protects the regions before any of their pages is cleared
+		// for upload, instead of a re-arm per uploaded run (ng-168: about 2,000 per sync, 40k/s).
+		// A write after the pass comes back at the next collection, like a write after the
+		// per-run re-arm (PageManager::PrearmScope). The pass also collects the writes made since
+		// the last collection, inside these regions and in the gaps it merged across: the regions
+		// they flagged join this sync, so the pass never hides data from a later acquire's
+		// collection. GPU-dirty parts are replayed later and flag their regions then
+		// (NoteGuestAcquire).
+		std::optional<PageManager::PrearmScope> prearm;
+		if (WriteWatch::Get() != nullptr && !regions.empty()) {
+			prearm.emplace(m_buffer_cache.PrearmCpuWrites(regions));
+			m_buffer_cache.ForEachBdaSyncPendingRegion(false, [&regions](uint64_t vaddr, uint64_t size) {
+				regions.emplace_back(vaddr, vaddr + size);
+			});
+			std::sort(regions.begin(), regions.end());
+			regions.erase(std::unique(regions.begin(), regions.end()), regions.end());
+		}
+		for (const auto& [region_start, region_end]: regions) {
+			SyncProbe::NoteRegion();
+			m_mapped_ranges.ForEachInRange(region_start, region_end - region_start,
+			                               [this](uint64_t start, uint64_t end) {
+				                               m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+			                               });
+		}
 	}
 	m_buffer_cache.EndUploadBatch();
 	if (wait_pass) {

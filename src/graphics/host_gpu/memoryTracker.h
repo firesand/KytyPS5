@@ -47,6 +47,12 @@ public:
 	// one, and gaining its first watcher re-protects it anyway (PageManager).
 	void CollectWrittenPages(uint64_t vaddr, uint64_t size,
 	                         const std::function<void(uint64_t, uint64_t)>& func);
+	// The same collection over [start, end) ranges about to be uploaded, in one pass (a BDA sync's
+	// pending regions; WriteWatch Source::Prearm). scanned receives the ranges the pass
+	// re-protected, for a PageManager::PrearmScope around the uploads.
+	void PrearmWrittenPages(std::vector<std::pair<uint64_t, uint64_t>> ranges,
+	                        const std::function<void(uint64_t, uint64_t)>& func,
+	                        std::vector<std::pair<uint64_t, uint64_t>>*  scanned);
 	// Applies collected CPU writes without a download (safe inside cache operations and GPU
 	// completions): pages that are not GPU-dirty become CPU-dirty; GPU-dirty runs go to
 	// gpu_part(vaddr, size) and need a full write-fault replay at a GPU-thread safe point.
@@ -89,6 +95,9 @@ public:
 		ForEachBdaSyncPendingRegion(true, std::forward<Func>(func));
 	}
 	void MarkBdaSyncPending(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool HasBdaSyncPending() const noexcept {
+		return m_bda_pending_count.load(std::memory_order_acquire) != 0;
+	}
 	// KYTY_FAULT_AHEAD_PAGES (default 0 = off): pages a CPU write fault unprotects ahead. The
 	// window gave no measurable frame-rate gain and marks pages CPU-dirty that a pending GPU
 	// write-fault record may still own (audit 2026-10-12), so it is opt-in.

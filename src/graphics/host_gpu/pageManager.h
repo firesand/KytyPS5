@@ -7,6 +7,7 @@
 #include <functional>
 #include <memory>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -38,6 +39,23 @@ public:
 	// faulted on without write-watch: func(vaddr, size). Any thread; no lock held in func.
 	void ForEachWriteWatchedRun(uint64_t vaddr, uint64_t size,
 	                            const std::function<void(uint64_t, uint64_t)>& func) const;
+
+	// Kernel write-watch: while a scope lives, covered pages inside its ranges (sorted, disjoint)
+	// that gain their first write watcher on this thread are not re-armed run by run. The owner
+	// re-protected the ranges in one pass (WriteWatch::CollectRanges, Source::Prearm) before any of
+	// those pages was cleared, and copies each cleared page after the clear (BDA sync), so a write
+	// before the pass is in the copy and a write after it is reported later, as a write after the
+	// re-arm would be. Scopes nest; the innermost wins.
+	class PrearmScope final {
+	public:
+		explicit PrearmScope(std::vector<std::pair<uint64_t, uint64_t>> ranges) noexcept;
+		~PrearmScope();
+		KYTY_CLASS_NO_COPY(PrearmScope);
+
+	private:
+		std::vector<std::pair<uint64_t, uint64_t>>        m_ranges;
+		const std::vector<std::pair<uint64_t, uint64_t>>* m_previous = nullptr;
+	};
 
 private:
 	struct Impl;

@@ -193,6 +193,21 @@ void MemoryTracker::CollectWrittenPages(uint64_t vaddr, uint64_t size,
 	}
 }
 
+void MemoryTracker::PrearmWrittenPages(std::vector<std::pair<uint64_t, uint64_t>> ranges,
+                                       const std::function<void(uint64_t, uint64_t)>& func,
+                                       std::vector<std::pair<uint64_t, uint64_t>>*  scanned) {
+	scanned->clear();
+	auto* write_watch = WriteWatch::Get();
+	if (write_watch == nullptr) {
+		return;
+	}
+	CheckNotInUploadCallback();
+	write_watch->CollectRanges(
+	    std::move(ranges),
+	    [&](uint64_t run, uint64_t run_size) { m_page_manager.ForEachWriteWatchedRun(run, run_size, func); },
+	    WriteWatch::Source::Prearm, scanned);
+}
+
 void MemoryTracker::MarkCpuWrittenUnlessGpuModified(
     uint64_t vaddr, uint64_t size, const std::function<void(uint64_t, uint64_t)>& gpu_part) {
 	CheckNotInUploadCallback();

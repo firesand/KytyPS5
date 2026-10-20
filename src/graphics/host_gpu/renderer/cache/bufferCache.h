@@ -205,6 +205,13 @@ public:
 	                         const std::function<void(uint64_t, uint64_t)>& func) {
 		m_memory_tracker.CollectWrittenPages(vaddr, size, func);
 	}
+	// Some region gained CPU-dirty pages (or buffers) since the last BDA sync took it.
+	[[nodiscard]] bool HasBdaSyncPending() const noexcept { return m_memory_tracker.HasBdaSyncPending(); }
+	// Kernel write-watch, before a BDA sync uploads the [start, end) ranges: one pass collects
+	// their written pages (applied the inline way) and re-protects them. Returns the ranges the
+	// pass covered, for a PageManager::PrearmScope around the uploads.
+	[[nodiscard]] std::vector<std::pair<uint64_t, uint64_t>> PrearmCpuWrites(
+	    std::vector<std::pair<uint64_t, uint64_t>> ranges);
 	// Kernel write-watch diagnostics since the last call: written bindings that took GPU ownership
 	// without a scan, and the collections made by fault passes.
 	struct WriteWatchStats {
