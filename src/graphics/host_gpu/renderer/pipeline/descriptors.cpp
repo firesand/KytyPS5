@@ -562,7 +562,11 @@ struct TextureMemoEntry {
 	uint8_t                               resource_mip_mode      = 0;
 	bool                                  resource_depth_compare = false;
 	ShaderRecompiler::IR::DescriptorValue raw_tsharp             {};
+	// The resolved desc (view offsets inside the cached image) for the fast path, and the guest's own desc for a new
+	// FindImage: FindImage validates the view against the request, so the resolved one exits there once a request
+	// resolved to layer k > 0 or mip m > 0 of a larger image.
 	TextureCache::ImageDesc               desc                   {};
+	TextureCache::ImageDesc               guest_desc             {};
 	bool                                  shader_conversion      = false;
 	ImageId                               image_id               {};
 	bool                                  valid                  = false;
@@ -603,13 +607,14 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 				return {cached.image_id, nullptr, cached.desc};
 			}
 		}
-		auto desc = cached.desc;
+		auto desc = cached.guest_desc;
 		auto id = texture_cache.FindImage(desc, cached.shader_conversion);
 		auto* image = &texture_cache.GetImage(id);
 		if (image->depth_id) {
 			id = image->depth_id;
 		}
 		cached.image_id = id;
+		cached.desc     = desc; // this lookup's offsets, for the fast path
 		return {id, nullptr, std::move(desc)};
 	}
 
@@ -777,6 +782,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.view_info.base_level = view_base;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 
+	const auto guest_desc          = desc;
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
@@ -806,6 +812,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	    .resource_depth_compare = resource.depth_compare,
 	    .raw_tsharp             = value,
 	    .desc                   = desc,
+	    .guest_desc             = guest_desc,
 	    .shader_conversion      = shader_conversion,
 	    .image_id               = id,
 	    .valid                  = true,

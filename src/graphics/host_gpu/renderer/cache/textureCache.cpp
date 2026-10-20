@@ -1573,6 +1573,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		return GetNullImage(desc);
 	}
 	const auto metadata_base_layer = desc.view_info.base_layer;
+	const auto guest_base_level    = desc.view_info.base_level;
 
 	ImageId result {};
 	{
@@ -1593,15 +1594,23 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		int32_t view_layer = -1;
 		if (!result) {
 			for (const auto candidate: candidates) {
-				view_mip                = -1;
-				view_layer              = -1;
 				const auto& merged_info = result ? m_slot_images[result].info : desc.info;
 				const auto  overlap     = ResolveOverlap(merged_info, desc.type, candidate, result);
-				if (overlap.image) {
-					result     = overlap.image;
-					view_mip   = overlap.mip;
-					view_layer = overlap.layer;
+				if (!overlap.image) {
+					continue;
 				}
+				// The view offsets locate the request inside `result`. A later candidate that hands back an image with
+				// merged_info's layout (the same image as {merged_id}, or one expanded or folded from merged_info)
+				// carries no offsets and must not erase them: resetting them here made a page target that resolved to
+				// layer k of an array (overlap-use-mip) bind layer 0 whenever another image overlapped the same memory
+				// (vis-06 seq 223456-223460: a 2-layer Unorm page request at layer 2 of a 7-layer array). Offsets
+				// returned for merged_info inside a larger image compose with the ones already found.
+				if (overlap.mip >= 0 || overlap.layer >= 0) {
+					const bool nested = result && (view_mip >= 0 || view_layer >= 0);
+					view_mip   = nested ? std::max(view_mip, 0) + std::max(overlap.mip, 0) : overlap.mip;
+					view_layer = nested ? std::max(view_layer, 0) + std::max(overlap.layer, 0) : overlap.layer;
+				}
+				result = overlap.image;
 			}
 		}
 
@@ -1616,6 +1625,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				    resolved, {.request = &desc.info});
 				FreeImage(result);
 				result = {};
+			}
+			if (!result) {
+				view_mip   = -1; // the image created below is the request itself
+				view_layer = -1;
 			}
 		}
 		if (!result) {
@@ -1637,11 +1650,25 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			    {.request = &desc.info, .value0 = static_cast<uint32_t>(desc.type)});
 		}
 		auto& image = m_slot_images[result];
+		// The offsets locate the request inside `image`; the view's own base level and layer are relative to the
+		// request (vis-06 seq 223461/223468: a 2-layer page target at array layer 2, drawn with view base_layer 1, is
+		// array layer 3). A combination that leaves the image (an equal-address depth image kept with another layout)
+		// drops the offsets, as before this change.
+		if ((view_layer >= 0 && uint64_t {static_cast<uint32_t>(view_layer)} + metadata_base_layer +
+		                                desc.view_info.layer_count > image.info.resources.layers) ||
+		    (view_mip >= 0 && uint64_t {static_cast<uint32_t>(view_mip)} + guest_base_level +
+		                              desc.view_info.level_count > image.info.resources.levels)) {
+			ZeroCompanyImageLifecycle::Record(m_scheduler, "find-drop-view-offsets", result, image,
+			    {.request = &desc.info, .value0 = static_cast<uint32_t>(view_mip),
+			     .value1 = static_cast<uint32_t>(view_layer)});
+			view_mip   = -1;
+			view_layer = -1;
+		}
 		if (view_mip >= 0) {
-			desc.view_info.base_level = static_cast<uint32_t>(view_mip);
+			desc.view_info.base_level = static_cast<uint32_t>(view_mip) + guest_base_level;
 		}
 		if (view_layer >= 0) {
-			desc.view_info.base_layer = static_cast<uint32_t>(view_layer);
+			desc.view_info.base_layer = static_cast<uint32_t>(view_layer) + metadata_base_layer;
 		}
 		image.tick_accessed_last = m_scheduler.CurrentTick();
 		TouchImage(image);
