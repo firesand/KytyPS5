@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/gpuTimestamps.h"
+#include "graphics/host_gpu/hostReadStats.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -137,6 +138,7 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 		buffer = &cache.GetBuffer(cache.FindBuffer(address, size));
 		offset = buffer->Offset(address);
 	} else {
+		ReadbackTopProbe::MarkShaderBind();
 		std::tie(buffer, offset) = context.GetBufferCache().ObtainBuffer(
 		    address, size, written,
 		    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id);

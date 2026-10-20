@@ -745,6 +745,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	OpSplitProbe::Enter(OpSplitProbe::Buffers); // LDS sizing and the argument buffer, until Record
 	BindSharedMemory(m_context, input_info, bindings, args_addr);
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
+	ReadbackTopProbe::MarkShaderBind();
 	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);

@@ -175,21 +175,24 @@ void BufferCache::DeleteBuffer(BufferId id) {
 
 template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
-	DrainPendingGpuModified();
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
-	m_memory_tracker.ForEachDownloadRange<false>(
-	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
-		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
-		                                           "buffer download");
-		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
-			    copies.emplace_back(start - buffer_address, total_size, end - start);
-			    // Keep packed ranges on separate cache lines, as in shadPS4.
-			    total_size += Common::AlignUp(end - start, 64);
+	{
+		ReadbackPhaseScope phase(ReadbackSplitProbe::Tracker); // the copy list from the page state
+		DrainPendingGpuModified();
+		m_memory_tracker.ForEachDownloadRange<false>(
+		    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
+			    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
+			                                           "buffer download");
+			    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
+				    copies.emplace_back(start - buffer_address, total_size, end - start);
+				    // Keep packed ranges on separate cache lines, as in shadPS4.
+				    total_size += Common::AlignUp(end - start, 64);
+			    });
+			    m_gpu_modified_ranges.Subtract(address, bytes);
 		    });
-		    m_gpu_modified_ranges.Subtract(address, bytes);
-	    });
+	}
 	if (copies.empty()) {
 		return false;
 	}
@@ -261,6 +264,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                       {}, 0, nullptr, 1, &after, 0, nullptr); }
 	auto publish = [this, mapped, offset, total_size, buffer_address,
 	                copies = std::move(copies), owner = std::move(temporary)] {
+		ReadbackPhaseScope phase(ReadbackSplitProbe::Backing); // inline only: deferred runs are not split
 		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
 		for (const auto& copy: copies) {
 			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
@@ -279,6 +283,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		m_sync_stats.download_wait_ns += static_cast<uint64_t>(
 		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
 		        .count());
+		ReadbackSplitProbe::CountPath(ReadbackSplitProbe::Copy, total_size);
 		publish();
 	}
 	return true;
@@ -396,6 +401,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write,
 		     vaddr, size);
 	}
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, wait_reason] {
+		// Outside every op: count it (KYTY_PROBE_FAULT_HISTOGRAM budget "readback", split by phase).
+		BudgetScope        budget(BudgetProbe::Readback, true);
+		ReadbackSplitScope split;
 		WaitReasonScope reason_scope(wait_reason);
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
@@ -421,12 +429,18 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write,
 		for (;;) {
 			// Publishing an unbounded write can preserve an overlapping image, extend its
 			// buffer, and retire the previous owner. Resolve only after those mutations.
-			PrepareHostRead(publish_vaddr, publish_size);
-			PublishPendingTextureInvalidations();
+			{
+				ReadbackPhaseScope phase(ReadbackSplitProbe::Prepare);
+				PrepareHostRead(publish_vaddr, publish_size);
+				PublishPendingTextureInvalidations();
+			}
 			uint64_t expanded_vaddr = publish_vaddr;
 			uint64_t expanded_size  = publish_size;
-			sync_images = m_texture_cache.SyncGpuImagesForHostRead(
-			    current_buffer(), expanded_vaddr, expanded_size, /*record=*/false);
+			{
+				ReadbackPhaseScope phase(ReadbackSplitProbe::Images);
+				sync_images = m_texture_cache.SyncGpuImagesForHostRead(
+				    current_buffer(), expanded_vaddr, expanded_size, /*record=*/false);
+			}
 			if (!sync_images ||
 			    (expanded_vaddr == publish_vaddr && expanded_size == publish_size)) {
 				break;
@@ -436,14 +450,21 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write,
 			publish_vaddr = expanded_vaddr;
 			publish_size  = expanded_size;
 		}
-		if (sync_images && m_texture_cache.SyncGpuImagesForHostRead(
-			                   current_buffer(), publish_vaddr, publish_size, /*record=*/true)) {
+		bool images_recorded = false;
+		if (sync_images) {
+			ReadbackPhaseScope phase(ReadbackSplitProbe::Images);
+			images_recorded = m_texture_cache.SyncGpuImagesForHostRead(current_buffer(), publish_vaddr,
+			                                                           publish_size, /*record=*/true);
+		}
+		if (images_recorded) {
 			// The copy is in flight in this tick: keep TryBarReadback off the host-visible path.
 			NoteGpuWrite(publish_vaddr, publish_size, m_scheduler.CurrentTick());
 		}
 		// Image-copy preparation may wait for stream space. Do not carry a cached Buffer
 		// reference across it; download from the current owner of the complete hull.
-		if (DownloadBufferMemory<false>(current_buffer(), publish_vaddr, publish_size)) {
+		const bool downloaded = DownloadBufferMemory<false>(current_buffer(), publish_vaddr, publish_size);
+		ReadbackPhaseScope phase(ReadbackSplitProbe::Tracker);
+		if (downloaded) {
 			m_memory_tracker.UnmarkRegionAsGpuModified(publish_vaddr, publish_size);
 		}
 		if (is_write) {
@@ -770,6 +791,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
+	// readback-top: a shader or draw bind (MarkShaderBind), counted once a cache buffer serves it.
+	const bool shader_bind = std::exchange(ReadbackTopProbe::t_shader_bind, false);
 
 	if (allow_stream && !is_written && size <= CACHING_PAGESIZE &&
 	    m_memory_tracker.IsRegionCpuModifiedNotGpuModified(vaddr, size)) {
@@ -787,6 +810,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		}
 	}
 
+	if (shader_bind) {
+		ReadbackTopProbe::NoteBind(vaddr, size, is_written);
+	}
 	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
 		id = FindBuffer(vaddr, size);
 	}
@@ -1035,7 +1061,12 @@ bool BufferCache::TryBarReadback(const Buffer& buffer, std::span<const vk::Buffe
 	const auto copy_begin = ProbeEnabled::Get() ? std::chrono::steady_clock::now()
 	                                            : std::chrono::steady_clock::time_point {};
 	constexpr uint64_t kBounceBytes = 256 * 1024;
+	uint64_t           bar_bytes    = 0;
+	uint64_t           read_begin   = UINT64_MAX;
+	uint64_t           read_end     = 0;
 	for (const auto& copy: copies) {
+		read_begin = std::min(read_begin, address + copy.srcOffset);
+		read_end   = std::max(read_end, address + copy.srcOffset + copy.size);
 		if (!buffer.IsCoherent()) {
 			const_cast<Buffer&>(buffer).Invalidate(copy.srcOffset, copy.size);
 		}
@@ -1044,17 +1075,28 @@ bool BufferCache::TryBarReadback(const Buffer& buffer, std::span<const vk::Buffe
 			if (m_bar_bounce.size() < bytes) {
 				m_bar_bounce.resize(kBounceBytes);
 			}
-			CopyFromWriteCombined(m_bar_bounce.data(), buffer.Mapped().data() + copy.srcOffset + done, bytes,
-			                      streaming);
-			Libs::LibKernel::Memory::WriteBacking(address + copy.srcOffset + done, m_bar_bounce.data(), bytes);
+			{
+				ReadbackPhaseScope phase(ReadbackSplitProbe::BarRead);
+				CopyFromWriteCombined(m_bar_bounce.data(), buffer.Mapped().data() + copy.srcOffset + done,
+				                      bytes, streaming);
+			}
+			{
+				ReadbackPhaseScope phase(ReadbackSplitProbe::Backing);
+				Libs::LibKernel::Memory::WriteBacking(address + copy.srcOffset + done, m_bar_bounce.data(),
+				                                      bytes);
+			}
 			done += bytes;
 		}
 		m_sync_stats.bar_readback_bytes += copy.size;
+		bar_bytes += copy.size;
 	}
 	if (ProbeEnabled::Get()) {
-		m_sync_stats.bar_readback_ns += static_cast<uint64_t>(
+		const auto copy_ns = static_cast<uint64_t>(
 		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - copy_begin)
 		        .count());
+		m_sync_stats.bar_readback_ns += copy_ns;
+		ReadbackSplitProbe::CountPath(ReadbackSplitProbe::Bar, bar_bytes);
+		ReadbackTopProbe::NoteBar(address, address + buffer.Size(), read_begin, read_end, bar_bytes, copy_ns);
 	}
 	m_sync_stats.bar_readbacks++;
 	m_last_download_bar = true;
