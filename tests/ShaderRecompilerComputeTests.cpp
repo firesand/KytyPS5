@@ -4419,6 +4419,149 @@ public:
     std::printf("[gpu]     %-32s ok (fault path %s)\n", name, path);
   }
 
+  // KYTY_PROBE_FAULT_HISTOGRAM: a guest thread's readback is counted in the budget ("readback" inside
+  // "command", waits subtracted), split by phase, attributed to its guest range, and timed as a guest
+  // SendCommandSync; the next window counts binds of that range.
+  void CheckReadbackCounters() {
+    constexpr const char *name = "ReadbackCounters";
+    using Libs::Graphics::BudgetProbe;
+    using Libs::Graphics::GuestSyncProbe;
+    using Libs::Graphics::ReadbackSplitProbe;
+    using Libs::Graphics::ReadbackTopProbe;
+    if (!Libs::Graphics::ProbeEnabled::Get()) {
+      std::printf("[gpu]     %-32s SKIP KYTY_PROBE_FAULT_HISTOGRAM off\n", name);
+      return;
+    }
+    constexpr uintptr_t base = 0x000000020a800000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t fill_offset = 0x10000;
+    constexpr uint64_t fill_size = 0x8000;
+    constexpr uint32_t fill_value = 0x600dcafeu;
+
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "readback-counter direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "readback-counter fixed direct-memory mapping failed");
+    std::memset(reinterpret_cast<void *>(base), 0x3c, allocation_size);
+
+    const char *path = "?";
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      // A GPU fill: the written binding takes GPU ownership (FillBuffer fills untracked memory on
+      // the CPU, and then nothing is read back).
+      (void)cache.ObtainBuffer(base + fill_offset, fill_size, true, false);
+      cache.FillBuffer(base + fill_offset, fill_size, fill_value, false);
+      scheduler.Finish();
+      // Start a window: no scheduler work between here and the takes below (a garbage-collector pass
+      // would hand these counters to the histogram dump).
+      (void)BudgetProbe::Take();
+      (void)ReadbackSplitProbe::Take();
+      (void)ReadbackTopProbe::Take();
+      (void)ReadbackTopProbe::Take(); // no watched ranges either
+      (void)GuestSyncProbe::Take();
+      Require(name, "test thread", !Libs::Graphics::GuestGpu::IsGpuThread(),
+              "the test thread is the GPU thread; the readback would not be a guest command");
+      cache.ReadMemory(base + fill_offset, fill_size); // a guest read: SendCommandSync to the GPU thread
+      const auto budget = BudgetProbe::Take();
+      const auto split = ReadbackSplitProbe::Take();
+      const auto top = ReadbackTopProbe::Take();
+      const auto sync = GuestSyncProbe::Take();
+      const auto &readback = budget.categories[BudgetProbe::Readback];
+      const auto &command = budget.categories[BudgetProbe::Command];
+      Require(name, "readback budget",
+              readback.calls == 1 && readback.exclusive_ns != 0 &&
+                  readback.inclusive_ns >= readback.exclusive_ns,
+              "the readback was not counted once in the budget's readback column");
+      Require(name, "command budget",
+              command.calls >= 1 && command.inclusive_ns >= readback.inclusive_ns &&
+                  command.exclusive_ns + readback.inclusive_ns <= command.inclusive_ns + 1000,
+              "the guest command around the readback was not counted, or not as its parent");
+      uint64_t phases = 0;
+      for (const auto ns : split.ns) {
+        phases += ns;
+      }
+      const auto bar = split.calls[ReadbackSplitProbe::Bar];
+      const auto copy = split.calls[ReadbackSplitProbe::Copy];
+      path = bar != 0 ? "bar" : copy != 0 ? "copy" : "?";
+      // The phases partition the readback's exclusive time; allow clock reads between the scopes.
+      Require(name, "readback split",
+              phases != 0 && phases <= readback.exclusive_ns + 1000 &&
+                  phases + 50000 >= readback.exclusive_ns && bar + copy == 1 &&
+                  split.bytes[ReadbackSplitProbe::Bar] + split.bytes[ReadbackSplitProbe::Copy] >=
+                      fill_size &&
+                  (bar == 0 || split.ns[ReadbackSplitProbe::BarRead] != 0),
+              "the readback phases did not add up, or the path or its bytes were not counted");
+      Require(name, "readback top",
+              bar == 0 || (top.count == 1 && top.top[0].readbacks == 1 &&
+                           top.top[0].begin <= base + fill_offset &&
+                           top.top[0].end >= base + fill_offset + fill_size &&
+                           top.top[0].read_begin == base + fill_offset &&
+                           top.top[0].read_end == base + fill_offset + fill_size),
+              "the BAR readback was not attributed to its guest range");
+      Require(name, "guest sync",
+              sync[0] >= 1 && sync[2] != 0 && sync[1] >= sync[2],
+              "the guest thread's SendCommandSync wait or the command's run time was not counted");
+      // The next window watches the top range: one written and one read shader bind of it count; a
+      // cache-internal bind, a bind the stream buffer serves and a bind outside the range do not.
+      if (bar != 0) {
+        Require(name, "stream-served page",
+                context.HandleFault(PageFaultAccess::Write, base + fill_offset + 0x7000),
+                "a write fault on a clean page was not handled");
+        ReadbackTopProbe::MarkShaderBind();
+        (void)cache.ObtainBuffer(base + fill_offset, 4, true);
+        ReadbackTopProbe::MarkShaderBind();
+        (void)cache.ObtainBuffer(base + fill_offset + 4, 4, false);
+        (void)cache.ObtainBuffer(base + fill_offset + 8, 4, false); // not marked: a cache's own bind
+        ReadbackTopProbe::MarkShaderBind();
+        (void)cache.ObtainBuffer(base + fill_offset + 0x7000, 4, false); // CPU-dirty: the stream buffer
+        ReadbackTopProbe::MarkShaderBind();
+        (void)cache.ObtainBuffer(base + 0x100000, 4, false); // outside the range
+        const auto next = ReadbackTopProbe::Take();
+        Require(name, "top binds",
+                next.watched_count == 1 && next.watched[0].written == 1 && next.watched[0].read == 1,
+                "only the marked shader binds served by a cache buffer inside the range may count");
+        cache.ReadMemory(base + fill_offset, fill_size); // the written bind left the page GPU-owned
+      }
+      std::vector<uint32_t> guest(fill_size / sizeof(uint32_t));
+      Require(name, "read guest",
+              Libs::LibKernel::Memory::TryReadBacking(base + fill_offset, guest.data(), fill_size),
+              "the guest backing could not be read");
+      for (const auto word : guest) {
+        Require(name, "filled bytes", word == fill_value, "a filled dword did not come back exactly");
+      }
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "readback-counter direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "readback-counter direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok (readback %s)\n", name, path);
+  }
+
   void CheckBufferCacheDirtyGarbageCollection() {
     constexpr const char *name = "BufferCacheDirtyGarbageCollection";
     constexpr uintptr_t base = 0x0000000200700000ull;
@@ -48459,6 +48602,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckBarReadbackBytes();
     vulkan.CheckImageSyncStamp();
+    vulkan.CheckReadbackCounters();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--op-split-only") == 0) {

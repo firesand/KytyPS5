@@ -1,9 +1,11 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_HOSTREADSTATS_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_HOSTREADSTATS_H_
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <utility>
@@ -306,7 +308,9 @@ struct BudgetCounters {
 };
 
 struct BudgetProbe {
-	enum Category : uint32_t { Wait = 0, Sync, Draw, Dispatch, Protect, Submit, CategoryCount };
+	// Readback: BufferCache::ReadMemory's GPU-thread body (guest-fault readbacks). Command: every
+	// guest-thread command the GPU thread runs from its queue (SendCommand / SendCommandSync).
+	enum Category : uint32_t { Wait = 0, Sync, Draw, Dispatch, Protect, Submit, Readback, Command, CategoryCount };
 	struct Entry {
 		uint64_t calls = 0, inclusive_ns = 0, exclusive_ns = 0;
 	};
@@ -618,6 +622,245 @@ struct BarrierProbe {
 		    "dispatch", "dispatch-indirect", "draw-post", "draw-indirect-args",
 		    "flush-end-rendering", "flush-foreign", "flush-draw", "flush-submit"};
 		return names[kind];
+	}
+};
+
+// KYTY_PROBE_FAULT_HISTOGRAM: the Readback budget scope's exclusive time split into phases, printed as
+// "| readback-split ms". Own thread-local state, not OpSplitProbe's: a readback can run inline inside
+// a draw, whose op split is suspended while a nested budget scope is open (OpSplitProbe::Here). Nested
+// budget scopes (download waits, submits) are subtracted as there; a readback nested in another one
+// is not split again (its time stays in the budget's readback column).
+//   prepare   PrepareHostRead and PublishPendingTextureInvalidations (unbounded-write passes, drains)
+//   images    SyncGpuImagesForHostRead (hull search, image->buffer copies)
+//   bar-read  the uncached read of host-visible device memory (CopyFromWriteCombined)
+//   backing   writing the guest backing (BAR loop, the copy path's publish)
+//   tracker   page state (download ranges, pending GPU marks, Unmark/Mark)
+//   other     everything else (buffer lookup, copy recording)
+struct ReadbackSplitProbe {
+	enum Phase : uint32_t { Other = 0, Prepare, Images, BarRead, Backing, Tracker, PhaseCount };
+	static constexpr auto kPhaseNames =
+	    std::to_array<const char*>({"other", "prepare", "images", "bar-read", "backing", "tracker"});
+	static_assert(kPhaseNames.size() == PhaseCount, "ReadbackSplitProbe phase / name table mismatch");
+	enum Path : uint32_t { Bar = 0, Copy, PathCount };
+	struct Snapshot {
+		std::array<uint64_t, PhaseCount> ns {};
+		std::array<uint64_t, PathCount>  calls {};
+		std::array<uint64_t, PathCount>  bytes {};
+	};
+	inline static std::array<std::atomic<uint64_t>, PhaseCount> s_ns {};
+	inline static std::array<std::atomic<uint64_t>, PathCount>  s_calls {};
+	inline static std::array<std::atomic<uint64_t>, PathCount>  s_bytes {};
+
+	// The open readback on this thread.
+	inline static thread_local bool                                  t_active      = false;
+	inline static thread_local uint32_t                              t_phase       = Other;
+	inline static thread_local uint32_t                              t_depth       = 0;
+	inline static thread_local uint64_t                              t_last_nested = 0;
+	inline static thread_local std::chrono::steady_clock::time_point t_last {};
+
+	// True when a switch here belongs to the open readback (not inside a nested budget scope).
+	static bool Here() noexcept { return t_active && BudgetProbe::s_depth == t_depth; }
+	static void Charge() noexcept {
+		const auto now     = std::chrono::steady_clock::now();
+		const auto elapsed = static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(now - t_last).count());
+		const auto nested = BudgetProbe::s_nested_ns - t_last_nested;
+		s_ns[t_phase].fetch_add(elapsed > nested ? elapsed - nested : 0, std::memory_order_relaxed);
+		t_last        = now;
+		t_last_nested = BudgetProbe::s_nested_ns;
+	}
+	static void Enter(uint32_t phase) noexcept {
+		if (Here() && t_phase != phase) {
+			Charge();
+			t_phase = phase;
+		}
+	}
+	static void CountPath(Path path, uint64_t bytes) noexcept {
+		if (ProbeEnabled::Get()) {
+			s_calls[path].fetch_add(1, std::memory_order_relaxed);
+			s_bytes[path].fetch_add(bytes, std::memory_order_relaxed);
+		}
+	}
+	static Snapshot Take() noexcept {
+		Snapshot snapshot;
+		for (uint32_t phase = 0; phase < PhaseCount; ++phase) {
+			snapshot.ns[phase] = s_ns[phase].exchange(0, std::memory_order_relaxed);
+		}
+		for (uint32_t path = 0; path < PathCount; ++path) {
+			snapshot.calls[path] = s_calls[path].exchange(0, std::memory_order_relaxed);
+			snapshot.bytes[path] = s_bytes[path].exchange(0, std::memory_order_relaxed);
+		}
+		return snapshot;
+	}
+};
+
+// Opens the split for one readback; declare it right after the Readback BudgetScope.
+class ReadbackSplitScope {
+public:
+	ReadbackSplitScope() noexcept
+	    : m_enabled(ProbeEnabled::Get() && !ReadbackSplitProbe::t_active && BudgetProbe::s_depth != 0) {
+		if (m_enabled) {
+			ReadbackSplitProbe::t_active      = true;
+			ReadbackSplitProbe::t_phase       = ReadbackSplitProbe::Other;
+			ReadbackSplitProbe::t_depth       = BudgetProbe::s_depth;
+			ReadbackSplitProbe::t_last_nested = BudgetProbe::s_nested_ns;
+			ReadbackSplitProbe::t_last        = std::chrono::steady_clock::now();
+		}
+	}
+	~ReadbackSplitScope() {
+		if (m_enabled) {
+			ReadbackSplitProbe::Charge();
+			ReadbackSplitProbe::t_active = false;
+		}
+	}
+	ReadbackSplitScope(const ReadbackSplitScope&)            = delete;
+	ReadbackSplitScope& operator=(const ReadbackSplitScope&) = delete;
+
+private:
+	bool m_enabled;
+};
+
+// Switches the readback split to `phase` for a region and back; nothing outside a split readback.
+class ReadbackPhaseScope {
+public:
+	explicit ReadbackPhaseScope(ReadbackSplitProbe::Phase phase) noexcept
+	    : m_enabled(ReadbackSplitProbe::Here()), m_previous(ReadbackSplitProbe::t_phase) {
+		if (m_enabled) {
+			ReadbackSplitProbe::Enter(phase);
+		}
+	}
+	~ReadbackPhaseScope() {
+		if (m_enabled) {
+			ReadbackSplitProbe::Enter(m_previous);
+		}
+	}
+	ReadbackPhaseScope(const ReadbackPhaseScope&)            = delete;
+	ReadbackPhaseScope& operator=(const ReadbackPhaseScope&) = delete;
+
+private:
+	bool     m_enabled;
+	uint32_t m_previous;
+};
+
+// KYTY_PROBE_FAULT_HISTOGRAM: the guest ranges whose BAR readbacks cost the most time this window
+// ("| readback-top"; the owning buffers' extent and the span actually read), and how shaders and draws
+// bound the previous window's top ranges (written / read). Only binds marked by MarkShaderBind count
+// (descriptor, vertex, index and argument buffers), not the caches' own ObtainBuffer calls, and only
+// those served by a cache buffer (not the stream buffer). GPU-indirect draws re-obtain their storage
+// buffers after the arguments (RebindScope): counted once. Unsynced whole-heap reads (FindBuffer,
+// descriptors.cpp) and BDA page-table accesses are not seen, so it is a lower bound of their GPU use. Keyed by guest range and merged by intersection, never by buffer:
+// joins rebuild buffers at new addresses, GC deletes them and slot ids are reused. GPU thread only,
+// like the readbacks, ObtainBuffer and the histogram dump (RunGarbageCollector).
+// At namespace scope: the probe's static arrays need these complete, with their initializers.
+struct ReadbackTopEntry {
+	uint64_t begin = 0, end = 0, readbacks = 0, bytes = 0, ns = 0;
+	uint64_t read_begin = 0, read_end = 0; // span of the bytes read back
+};
+struct ReadbackTopWatched {
+	uint64_t begin = 0, end = 0, written = 0, read = 0;
+};
+inline constexpr size_t kReadbackTop = 4;
+struct ReadbackTopSnapshot {
+	std::array<ReadbackTopEntry, kReadbackTop>   top {};
+	size_t                                       count = 0;
+	std::array<ReadbackTopWatched, kReadbackTop> watched {}; // the previous window's top, with this window's binds
+	size_t                                       watched_count = 0;
+};
+struct ReadbackTopProbe {
+	static constexpr size_t kEntries = 64;
+	static constexpr size_t kTop     = kReadbackTop;
+	using Entry    = ReadbackTopEntry;
+	using Watched  = ReadbackTopWatched;
+	using Snapshot = ReadbackTopSnapshot;
+	inline static std::array<Entry, kEntries> s_entries {};
+	inline static size_t                      s_used = 0;
+	inline static std::array<Watched, kTop>   s_watched {};
+	inline static size_t                      s_watched_count = 0;
+	inline static thread_local bool           t_shader_bind = false; // set by MarkShaderBind
+	inline static thread_local bool           t_rebinding   = false; // inside a RebindScope
+
+	static void NoteBar(uint64_t begin, uint64_t end, uint64_t read_begin, uint64_t read_end, uint64_t bytes,
+	                    uint64_t ns) noexcept {
+		// Absorb every entry the range touches (after a join one buffer spans several earlier ones),
+		// so the top list never shows overlapping ranges or counts one bind twice.
+		Entry merged {begin, end, 1, bytes, ns, read_begin, read_end};
+		for (size_t i = 0; i < s_used;) {
+			const auto& entry = s_entries[i];
+			if (merged.begin < entry.end && entry.begin < merged.end) {
+				merged.begin      = std::min(merged.begin, entry.begin);
+				merged.end        = std::max(merged.end, entry.end);
+				merged.read_begin = std::min(merged.read_begin, entry.read_begin);
+				merged.read_end   = std::max(merged.read_end, entry.read_end);
+				merged.readbacks += entry.readbacks;
+				merged.bytes += entry.bytes;
+				merged.ns += entry.ns;
+				s_entries[i] = s_entries[--s_used];
+				i            = 0; // the grown range may touch entries already passed
+				continue;
+			}
+			++i;
+		}
+		if (s_used < kEntries) {
+			s_entries[s_used++] = merged;
+			return;
+		}
+		auto* cheapest = std::min_element(s_entries.begin(), s_entries.end(),
+		                                  [](const Entry& a, const Entry& b) { return a.ns < b.ns; });
+		if (cheapest->ns < merged.ns) {
+			*cheapest = merged;
+		}
+	}
+	// Marks the next ObtainBuffer on this thread as a shader or draw bind (call right before it).
+	static void MarkShaderBind() noexcept { t_shader_bind = !t_rebinding && ProbeEnabled::Get(); }
+	// Re-obtains bindings this op already counted: marks inside it do not count again.
+	class RebindScope {
+	public:
+		RebindScope() noexcept: m_outer(t_rebinding) { t_rebinding = true; }
+		~RebindScope() { t_rebinding = m_outer; }
+		RebindScope(const RebindScope&)            = delete;
+		RebindScope& operator=(const RebindScope&) = delete;
+
+	private:
+		bool m_outer;
+	};
+	static void NoteBind(uint64_t vaddr, uint64_t size, bool written) noexcept {
+		for (size_t i = 0; i < s_watched_count; ++i) {
+			auto& watched = s_watched[i];
+			if (vaddr < watched.end && watched.begin < vaddr + size) {
+				(written ? watched.written : watched.read)++;
+			}
+		}
+	}
+	// This window's top entries by time and the previous top's binds; the new top is watched next.
+	static Snapshot Take() noexcept {
+		Snapshot snapshot;
+		snapshot.watched       = s_watched;
+		snapshot.watched_count = s_watched_count;
+		snapshot.count         = std::min(kTop, s_used);
+		std::partial_sort(s_entries.begin(), s_entries.begin() + static_cast<std::ptrdiff_t>(snapshot.count),
+		                  s_entries.begin() + static_cast<std::ptrdiff_t>(s_used),
+		                  [](const Entry& a, const Entry& b) { return a.ns > b.ns; });
+		for (size_t i = 0; i < snapshot.count; ++i) {
+			snapshot.top[i] = s_entries[i];
+			s_watched[i]    = {s_entries[i].begin, s_entries[i].end, 0, 0};
+		}
+		std::fill(s_watched.begin() + static_cast<std::ptrdiff_t>(snapshot.count), s_watched.end(), Watched {});
+		s_watched_count = snapshot.count;
+		s_used          = 0;
+		return snapshot;
+	}
+};
+
+// KYTY_PROBE_FAULT_HISTOGRAM: SendCommandSync from guest threads ("| guest-sync"). The caller's whole
+// wait and the command's run time on the GPU thread; the difference is the time it sat in the queue
+// behind other GPU-thread work (the faulting thread's stall beyond the readback itself).
+struct GuestSyncProbe {
+	inline static std::atomic<uint64_t> s_calls {0};
+	inline static std::atomic<uint64_t> s_wait_ns {0};
+	inline static std::atomic<uint64_t> s_run_ns {0};
+	static std::array<uint64_t, 3> Take() noexcept {
+		return {s_calls.exchange(0, std::memory_order_relaxed), s_wait_ns.exchange(0, std::memory_order_relaxed),
+		        s_run_ns.exchange(0, std::memory_order_relaxed)};
 	}
 };
 

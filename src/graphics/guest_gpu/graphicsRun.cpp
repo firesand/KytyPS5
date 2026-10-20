@@ -132,6 +132,7 @@ void GuestGpu::ProcessCommands() {
 			m_commands.pop_front();
 			EXIT_IF(m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 		}
+		BudgetScope budget(BudgetProbe::Command, true); // a guest thread's command
 		command();
 	}
 }
@@ -147,12 +148,27 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 		command();
 		return;
 	}
+	// KYTY_PROBE_FAULT_HISTOGRAM: the caller's wait and the command's run time (GuestSyncProbe).
+	const bool probe = ProbeEnabled::Get();
+	const auto since = [](std::chrono::steady_clock::time_point begin) {
+		return static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count());
+	};
+	const auto begin = probe ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	std::binary_semaphore done {0};
-	SendCommand([operation = std::move(command), &done]() mutable {
+	SendCommand([operation = std::move(command), &done, probe, since]() mutable {
+		const auto run_begin = probe ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 		operation();
+		if (probe) {
+			GuestSyncProbe::s_run_ns.fetch_add(since(run_begin), std::memory_order_relaxed);
+		}
 		done.release();
 	});
 	done.acquire();
+	if (probe) {
+		GuestSyncProbe::s_calls.fetch_add(1, std::memory_order_relaxed);
+		GuestSyncProbe::s_wait_ns.fetch_add(since(begin), std::memory_order_relaxed);
+	}
 }
 
 void GuestGpu::Submit(std::span<const uint32_t> draw_commands,
@@ -618,7 +634,10 @@ void GuestGpu::ThreadRun(void* data) {
 
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
-			command();
+			{
+				BudgetScope budget(BudgetProbe::Command, true); // a guest thread's command, run while idle
+				command();
+			}
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			gpu->m_processing = false;

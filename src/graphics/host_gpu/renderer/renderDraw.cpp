@@ -852,6 +852,7 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 			}
 			HostResidentProbe::NoteFallback();
 		}
+		ReadbackTopProbe::MarkShaderBind();
 		range.binding      = cache.ObtainBuffer(range.base_address, size, false);
 	}
 
@@ -1101,6 +1102,7 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 			prepared.buffer = nullptr;
 			HostResidentProbe::NoteFallback();
 		}
+		ReadbackTopProbe::MarkShaderBind();
 		auto [buffer_ptr, offset] = cache.ObtainBuffer(source.address, source.size, false);
 		prepared.buffer = buffer_ptr->Handle();
 		prepared.offset = offset;
@@ -1354,15 +1356,18 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (gpu_indirect != nullptr) {
 		auto& cache   = m_context.GetBufferCache();
 		const OpPhaseScope buffers(OpSplitProbe::Buffers);
+		ReadbackTopProbe::MarkShaderBind();
 		indirect_args = cache.ObtainBuffer(gpu_indirect->args_addr, indirect_args_bytes, false, false,
 		                                   {}, !args_unpublished);
 		EXIT_IF(indirect_args.first == nullptr || (indirect_args.second & 3u) != 0);
 		if (gpu_indirect->count_addr != 0) {
+			ReadbackTopProbe::MarkShaderBind();
 			indirect_count = cache.ObtainBuffer(gpu_indirect->count_addr, sizeof(uint32_t), false, false,
 			                                    {}, !count_unpublished);
 			EXIT_IF(indirect_count.first == nullptr || (indirect_count.second & 3u) != 0);
 		}
 		// Obtaining the arguments can merge cache buffers; finalize shader bindings afterward.
+		const ReadbackTopProbe::RebindScope rebind; // already counted by readback-top above
 		for (auto* stage_bindings: stages) {
 			RebindBuffers(*stage_bindings);
 		}

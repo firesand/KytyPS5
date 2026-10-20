@@ -343,11 +343,43 @@ struct FaultSampler {
 		};
 		line += fmt::format(" | wall {} ms | gpu-thread cpu user {} sys {} ms | process cpu user {} sys {} ms"
 		                    " | gpu-thread budget incl/excl ms (calls): wait {} sync {} draw {} dispatch {}"
-		                    " protect {} submit {}",
+		                    " protect {} submit {} readback {} command {}",
 		                    wall_ms, cpu_delta.thread_user_ms, cpu_delta.thread_sys_ms,
 		                    cpu_delta.process_user_ms, cpu_delta.process_sys_ms, cat(BudgetProbe::Wait),
 		                    cat(BudgetProbe::Sync), cat(BudgetProbe::Draw), cat(BudgetProbe::Dispatch),
-		                    cat(BudgetProbe::Protect), cat(BudgetProbe::Submit));
+		                    cat(BudgetProbe::Protect), cat(BudgetProbe::Submit), cat(BudgetProbe::Readback),
+		                    cat(BudgetProbe::Command));
+		// The readback budget's exclusive time by phase (its "sum" should match that column), its
+		// paths, the guest ranges with the most BAR read time, and the guest threads' sync waits.
+		{
+			const auto rs  = ReadbackSplitProbe::Take();
+			const auto fms = [](uint64_t ns) { return static_cast<double>(ns) / 1e6; };
+			uint64_t   sum = 0;
+			for (const auto ns: rs.ns) {
+				sum += ns;
+			}
+			line += fmt::format(" | readback-split ms: sum {:.1f}", fms(sum));
+			for (uint32_t phase = 0; phase < ReadbackSplitProbe::PhaseCount; ++phase) {
+				line += fmt::format(" {} {:.1f}", ReadbackSplitProbe::kPhaseNames[phase], fms(rs.ns[phase]));
+			}
+			line += fmt::format("; bar {} ({} KiB) copy {} ({} KiB)", rs.calls[ReadbackSplitProbe::Bar],
+			                    rs.bytes[ReadbackSplitProbe::Bar] >> 10, rs.calls[ReadbackSplitProbe::Copy],
+			                    rs.bytes[ReadbackSplitProbe::Copy] >> 10);
+			const auto top = ReadbackTopProbe::Take();
+			line += " | readback-top range (read span) readbacks/KiB/ms:";
+			for (size_t i = 0; i < top.count; ++i) {
+				const auto& e = top.top[i];
+				line += fmt::format(" 0x{:x}+0x{:x} (0x{:x}+0x{:x}) {}/{}/{:.1f}", e.begin, e.end - e.begin,
+				                    e.read_begin, e.read_end - e.read_begin, e.readbacks, e.bytes >> 10, fms(e.ns));
+			}
+			line += "; previous top shader binds written/read:";
+			for (size_t i = 0; i < top.watched_count; ++i) {
+				const auto& w = top.watched[i];
+				line += fmt::format(" 0x{:x}+0x{:x} {}/{}", w.begin, w.end - w.begin, w.written, w.read);
+			}
+			const auto gs = GuestSyncProbe::Take();
+			line += fmt::format(" | guest-sync {} wait {:.1f} run {:.1f} ms", gs[0], fms(gs[1]), fms(gs[2]));
+		}
 		// KYTY_PROBE_OP_SPLIT: the draw / dispatch exclusive time above split into phases
 		// (hostReadStats.h OpSplitProbe); "sum" should match the budget's exclusive column.
 		if (OpSplitProbe::Enabled()) {
