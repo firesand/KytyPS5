@@ -535,10 +535,10 @@ ResourcePlan::EvaluationContext& SrtWalker::AcquireContext() {
 }
 
 void SrtWalker::ResetUnknowns() {
+	// Completed unknowns carry their context's epoch (EvaluateWide), so bumping it retires them
+	// without a scan of the memo (ng-181: the scans were a third of RefreshFlatBuffer's own time).
 	for (auto& context: m_program.evaluation_contexts) {
-		if (context.session != m_session) continue;
-		for (auto& entry: context.values)
-			if (entry.generation == (context.generation | 2u)) entry.generation = 0;
+		if (context.session == m_session) ++context.unknown_epoch;
 	}
 }
 
@@ -580,9 +580,11 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 		return true;
 	}
 	// Visiting and completed-unknown entries both stop repeated evaluation in this
-	// context. Only completed unknowns are retried when reachability becomes tighter.
+	// context. Only completed unknowns are retried when reachability becomes tighter:
+	// ResetUnknowns bumps the epoch they carry.
 	if (m_context.values[index].generation == (m_context.generation | 1u) ||
-	    m_context.values[index].generation == (m_context.generation | 2u)) {
+	    (m_context.values[index].generation == (m_context.generation | 2u) &&
+	     m_context.values[index].value == m_context.unknown_epoch)) {
 		return false;
 	}
 	m_context.values[index].generation = m_context.generation | 1u;
@@ -591,6 +593,7 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 	// Recursive evaluation may grow the dense memo vector.
 	auto& memo = m_context.values[index];
 	if (!evaluated) {
+		memo.value      = m_context.unknown_epoch;
 		memo.generation = m_context.generation | 2u;
 		return false;
 	}
@@ -1176,11 +1179,32 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		return m_program.srt_code->getCode<Walker>()(m_runtime.user_data.data(), flat.data(),
 		    m_context.values.data(), m_context.generation, m_runtime.user_data.size());
 	}
+	if (!m_program.walk_tables_ready || m_program.srt_read_clean.size() != m_program.srt_reads.size() ||
+	    m_program.active_template.size() != m_program.descriptor_sources.size()) {
+		m_program.walk_tables_ready = true;
+		m_program.walk_tables_valid = true;
+		auto& clean_reads = m_program.srt_read_clean;
+		clean_reads.resize(m_program.srt_reads.size());
+		for (size_t slot = 0; slot < m_program.srt_reads.size(); ++slot) {
+			const auto* inst = m_program.srt_reads[slot].value.ResolveInstruction();
+			clean_reads[slot] = inst != nullptr && inst->Flags<SrtReadFlags>().clean != 0u ? 1u : 0u;
+		}
+		auto& base = m_program.active_template;
+		base.assign(m_program.descriptor_sources.size(), 1u);
+		for (const auto& block: m_program.control_flow) {
+			for (const auto source: block.sources) {
+				if (source < base.size()) {
+					base[source] = 0u;
+				} else {
+					m_program.walk_tables_valid = false; // plan/source mismatch
+				}
+			}
+		}
+	}
 	const auto refresh = [&](uint32_t slot) {
 		if (slot >= m_program.srt_reads.size()) return false;
 		const auto& read = m_program.srt_reads[slot];
-		const auto* inst = read.value.ResolveInstruction();
-		const bool clean = inst != nullptr && inst->Flags<SrtReadFlags>().clean != 0u;
+		const bool  clean = m_program.srt_read_clean[slot] != 0u;
 		if (clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr))
 			return false;
 		auto& evaluator = clean ? *m_clean_evaluator : *this;
@@ -1195,14 +1219,7 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		}
 		return true;
 	}
-	flat.assign(m_program.srt_reads.size(), 0u);
-	active.assign(m_program.descriptor_sources.size(), 1u);
-	for (const auto& block: m_program.control_flow) {
-		for (const auto source: block.sources) {
-			if (source >= active.size()) return false; // plan/source mismatch, same verdict as at()
-			active[source] = 0u;
-		}
-	}
+	if (!m_program.walk_tables_valid) return false; // same verdict as at()
 	auto& visited = m_program.visited_blocks;
 	auto& reachable = m_program.reachable_blocks;
 	auto& pending = m_program.pending_blocks;
@@ -1233,18 +1250,19 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 				pending.insert(pending.end(), block.successors.begin(), block.successors.end());
 			}
 		}
+		if (m_program.control_phi_predecessors.empty()) {
+			visited.swap(reachable); // without control Phis one pass is final
+			break;
+		}
 		if (reachable == visited) break;
 		visited.swap(reachable);
-		if (m_program.control_phi_predecessors.empty()) break;
 		// Only unknown values need another evaluation: successful Phi facts remain
 		// true as their possible predecessors shrink. Keep uniform-read memos stable.
 		ResetUnknowns();
 		if (m_clean_evaluator != nullptr) m_clean_evaluator->ResetUnknowns();
 	}
 	flat.assign(m_program.srt_reads.size(), 0u);
-	active.assign(m_program.descriptor_sources.size(), 1u);
-	for (const auto& block: m_program.control_flow)
-		for (const auto source: block.sources) active.at(source) = 0u;
+	active = m_program.active_template;
 	for (uint32_t index = 0; index < visited.size(); ++index) {
 		if (!visited[index]) continue;
 		const auto& block = m_program.control_flow[index];

@@ -596,6 +596,8 @@ struct ResourcePlan {
 
 		std::vector<Entry> values;
 		uint64_t           generation = 0;
+		// Completed unknowns store this in Entry::value; bumping it retires them all at once.
+		uint64_t           unknown_epoch = 0;
 		const SrtWalker*   session = nullptr;
 		Value              active_mask;
 		uint8_t            read_policy = 0;
@@ -639,6 +641,14 @@ struct ResourcePlan {
 	mutable std::vector<uint8_t>            reachable_blocks;
 	mutable std::vector<uint32_t>           pending_blocks;
 	mutable std::vector<uint32_t>           material_keys;
+	// Built by the first flat refresh: the clean-reader flag per SRT read, and the activity template
+	// (0 = some block uses the source, so only reachable blocks activate it; 1 = no block does).
+	// srt_reads with their SrtReadFlags, descriptor_sources and control_flow are fixed once
+	// ExtractResourcePlan returns; a size mismatch (a test growing a plan) rebuilds them.
+	mutable bool                            walk_tables_ready = false;
+	mutable bool                            walk_tables_valid = false;
+	mutable std::vector<uint8_t>            srt_read_clean;
+	mutable std::vector<uint8_t>            active_template;
 };
 
 struct Program: ResourcePlan {

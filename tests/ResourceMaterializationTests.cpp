@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
+#include <array>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
@@ -846,6 +847,113 @@ void TestNestedExecPredicatesReuseReads() {
   }
 }
 
+// Reachability refinement: block 0 branches on `count != 0` to blocks 1 or 2, which merge in
+// block 3 with x = phi(1: 7, 2: 9); block 3 branches on `x == 7` to block 4 (stores through
+// source 0) or block 5 (source 1). The first pass treats both Phi predecessors as reachable, so
+// x is unknown; once the count prunes one arm, the retired unknown must be evaluated again to
+// prune block 4 or 5. Repeated walks reuse the plan's evaluation contexts.
+// masked: block 3 branches on `lane != 0 && (lane != 0 ? x == 9 : true)` instead. The opaque lane
+// leaves the conjunction to an active-mask sub-walker, whose memo context must be retired too:
+// count != 0 then prunes block 4 (x == 9 is false under the mask); count == 0 keeps both.
+void TestPhiRefinementRetriesUnknowns(bool masked) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  std::array<Block *, 6> blocks{};
+  for (auto &block : blocks) block = &AddValueBlock(program);
+  program.memory_info.push_back({.kind = ResourceKind::ScalarAddress});
+  const auto load = [&](uint32_t address) -> Inst & {
+    auto &handle = blocks[0]->AppendNewInst(ValueOpcode::GetAddressResource,
+                                            {Value(address), Value(0u)});
+    auto &read = blocks[0]->AppendNewInst(ValueOpcode::LoadAddressU32,
+        {Value(&handle), Value(0u), Value(0u), Value(false)});
+    read.SetFlags(MemoryFlags{.index = 0});
+    return read;
+  };
+  auto &count = load(0x2000u);
+  for (const uint32_t source : {0u, 1u}) {
+    auto &base = load(source == 0u ? 0x3000u : 0x4000u);
+    DescriptorSource descriptor;
+    descriptor.dwords = {Value(&base), Value(0u), Value(4u), Value(0u)};
+    descriptor.dword_count = 4;
+    program.descriptor_sources.push_back(descriptor);
+    program.info.buffers.push_back({.source = source, .written = true});
+    program.memory_info.push_back({.kind = ResourceKind::Buffer, .resource = source});
+    auto &target = *blocks[4u + source];
+    auto &output = target.AppendNewInst(ValueOpcode::GetBufferResource,
+        {descriptor.dwords[0], descriptor.dwords[1], descriptor.dwords[2], descriptor.dwords[3]});
+    target.AppendNewInst(ValueOpcode::StoreBufferU32,
+        {Value(&output), Value(0u), Value(0u), Value(0u), Value(1u), Value(true)})
+        .SetFlags(MemoryFlags{.index = 1u + source});
+  }
+  auto &nonzero = blocks[0]->AppendNewInst(ValueOpcode::INotEqual32, {Value(&count), Value(0u)});
+  auto &phi = blocks[3]->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+  phi.AddPhiOperand(blocks[1], Value(7u));
+  phi.AddPhiOperand(blocks[2], Value(9u));
+  Value decision;
+  if (masked) {
+    auto &lane = blocks[3]->AppendNewInst(ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+    auto &mask = blocks[3]->AppendNewInst(ValueOpcode::INotEqual32, {Value(&lane), Value(0u)});
+    auto &nine = blocks[3]->AppendNewInst(ValueOpcode::IEqual32, {Value(&phi), Value(9u)});
+    auto &select =
+        blocks[3]->AppendNewInst(ValueOpcode::SelectU1, {Value(&mask), Value(&nine), Value(true)});
+    decision = Value(&blocks[3]->AppendNewInst(ValueOpcode::LogicalAnd,
+                                               {Value(&mask), Value(&select)}));
+  } else {
+    decision = Value(&blocks[3]->AppendNewInst(ValueOpcode::IEqual32, {Value(&phi), Value(7u)}));
+  }
+  const auto branch = [&](uint32_t from, uint32_t taken, uint32_t other, Value condition) {
+    blocks[from]->AddBranch(blocks[taken]);
+    blocks[from]->AddBranch(blocks[other]);
+    blocks[from]->condition = condition;
+    blocks[from]->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                                .true_block = blocks[taken],
+                                .false_block = blocks[other]};
+  };
+  branch(0, 1, 2, Value(&nonzero));
+  branch(3, 4, 5, decision);
+  for (const uint32_t arm : {1u, 2u}) {
+    blocks[arm]->AddBranch(blocks[3]);
+    blocks[arm]->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = blocks[3]};
+  }
+  blocks[4]->terminator.kind = CFG::TerminatorKind::Return;
+  blocks[5]->terminator.kind = CFG::TerminatorKind::Return;
+  const auto plan = ExtractResourcePlan(program);
+  Check(plan.control_flow.size() == 6u && !plan.control_phi_predecessors.empty(),
+        "merge-block Phi did not produce a refinable reachability predicate");
+
+  uint32_t count_value = 0;
+  const auto read = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+    switch (address) {
+      case 0x2000u: words[0] = *static_cast<uint32_t *>(data); return true;
+      case 0x3000u: words[0] = 0x8000u; return true;
+      case 0x4000u: words[0] = 0x9000u; return true;
+      default: return false;
+    }
+  };
+  const SrtRuntime runtime{
+      .read_memory = read, .userdata = &count_value, .read_specialization_memory = read};
+  for (const uint32_t value : {5u, 0u, 5u, 0u}) {
+    count_value = value;
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    // Unmasked: x == 7 selects exactly one body. Masked: only x == 7 (count != 0) decides it.
+    const bool block4 = masked ? value == 0u : value != 0u;
+    const bool block5 = masked ? true : value == 0u;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              plan.active_sources.size() == 2u &&
+              plan.active_sources[0] == (block4 ? 1u : 0u) &&
+              plan.active_sources[1] == (block5 ? 1u : 0u) &&
+              snapshot.buffers[0].dwords[0] == (block4 ? 0x8000u : 0u) &&
+              snapshot.buffers[1].dwords[0] == (block5 ? 0x9000u : 0u),
+          "Phi refinement kept a retired unknown or pruned the wrong arm");
+  }
+}
+
 } // namespace
 
 namespace Common {
@@ -876,6 +984,8 @@ int main() {
   TestFailedMaterializationRejectsStage();
   TestFiniteImageRefreshReusesScalarReads();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
+  for (const bool masked : {false, true})
+    TestPhiRefinementRetriesUnknowns(masked);
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }
