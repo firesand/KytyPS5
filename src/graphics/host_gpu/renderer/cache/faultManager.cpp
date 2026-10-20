@@ -33,6 +33,10 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
                         2 * MaxPendingFaults * PageFaultAreaSize) {
 	SetVulkanObjectNameF(m_graphics.device, m_fault_buffer.Handle(), "Fault Buffer");
+	// Device memory starts undefined and the parser reports every set bit. The renderer is created
+	// before guest commands bind the scheduler, so the clear has its own submission (upstream #1294).
+	m_fault_buffer.Fill(m_scheduler.BeginCommand(), 0, m_fault_buffer.Size(), 0);
+	m_scheduler.Submit();
 
 	const vk::DescriptorSetLayoutBinding bindings[] {
 	    {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
@@ -189,7 +193,8 @@ void FaultManager::Process(bool write_faults) {
 			m_download_buffer.Invalidate(offset, PageFaultAreaSize);
 			RangeSet    fault_ranges;
 			const auto* faults = std::bit_cast<const uint64_t*>(mapped);
-			const auto  count  = static_cast<uint32_t>(faults[0]);
+			const auto  count  = std::min<uint32_t>(static_cast<uint32_t>(faults[0]),
+			                                        static_cast<uint32_t>(MaxPageFaults - 1));
 			for (uint32_t index = 1; index <= count; ++index) {
 				const auto address = BufferCache::GuestAddress(faults[index]);
 				fault_ranges.Add(address, BufferCache::CACHING_PAGESIZE);

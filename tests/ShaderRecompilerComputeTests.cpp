@@ -32197,7 +32197,8 @@ TestCase BufferLoadsGpuSelectedDescriptors(u32 width) {
   } else {
     test.opcodes.insert(test.opcodes.end(), {O::BUFFER_LOAD_DWORDX4, O::BUFFER_LOAD_DWORDX2});
   }
-  test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer"};
+  // A missing page records its fault bit with an atomic OR: concurrent lanes share the word.
+  test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer", "OpAtomicOr"};
   return test;
 }
 
