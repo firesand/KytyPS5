@@ -46,6 +46,8 @@ public:
 	[[nodiscard]] uint64_t           Size() const noexcept { return m_size; }
 	[[nodiscard]] std::span<uint8_t> Mapped() const noexcept { return m_mapped; }
 	[[nodiscard]] bool               IsCoherent() const noexcept { return m_coherent; }
+	// KYTY_READBACK_COPY: a game buffer shared with the transfer-only readback queue.
+	[[nodiscard]] bool               IsConcurrent() const noexcept { return m_concurrent; }
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
 	[[nodiscard]] vk::DeviceAddress BufferDeviceAddress() const noexcept;
@@ -105,6 +107,7 @@ private:
 	VmaAllocation                 m_allocation = nullptr;
 	uint64_t                      m_size;
 	bool                          m_coherent = false;
+	bool                          m_concurrent = false;
 	std::span<uint8_t>            m_mapped;
 };
 

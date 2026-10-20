@@ -304,6 +304,9 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	if (HostResidentRequested()) {
 		m_host_resident = std::make_unique<HostResidentMemory>(graphics);
 	}
+	if (ReadbackCopyRequested() && graphics.readback_queue != nullptr) {
+		m_readback_copier = std::make_unique<ReadbackCopier>(graphics, scheduler);
+	}
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
@@ -1057,6 +1060,37 @@ bool BufferCache::TryBarReadback(const Buffer& buffer, std::span<const vk::Buffe
 		// Still in flight, or recorded into the open command buffer (not even submitted).
 		m_last_bar_reason = latest >= m_scheduler.CurrentTick() ? 4 : 3;
 		return false;
+	}
+	// KYTY_READBACK_COPY: every write is complete (the gate above), so the transfer-only queue copies
+	// the ranges into host-cached staging instead of the uncached BAR read below. A readback larger
+	// than the staging falls through to BAR.
+	if (m_readback_copier != nullptr) {
+		const auto queue_begin = ProbeEnabled::Get() ? std::chrono::steady_clock::now()
+		                                             : std::chrono::steady_clock::time_point {};
+		bool copied = false;
+		{
+			ReadbackPhaseScope phase(ReadbackSplitProbe::CopyQueue);
+			copied = m_readback_copier->Copy(buffer, address, copies);
+		}
+		if (copied) {
+			if (ProbeEnabled::Get()) {
+				uint64_t bytes      = 0;
+				uint64_t read_begin = UINT64_MAX;
+				uint64_t read_end   = 0;
+				for (const auto& copy: copies) {
+					bytes += copy.size;
+					read_begin = std::min(read_begin, address + copy.srcOffset);
+					read_end   = std::max(read_end, address + copy.srcOffset + copy.size);
+				}
+				const auto ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+				                                          std::chrono::steady_clock::now() - queue_begin)
+				                                          .count());
+				ReadbackSplitProbe::CountPath(ReadbackSplitProbe::Queue, bytes);
+				ReadbackTopProbe::NoteBar(address, address + buffer.Size(), read_begin, read_end, bytes, ns);
+			}
+			m_last_download_bar = true; // the same finished-producer decision as a BAR read
+			return true;
+		}
 	}
 	// The mapping is uncached for CPU reads (no HOST_CACHED): stream it into a cached bounce
 	// buffer (writeCombinedCopy.h), then write the guest backing from there.

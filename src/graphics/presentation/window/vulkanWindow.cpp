@@ -25,6 +25,7 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
@@ -419,6 +420,31 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	queue_create_info.queueFamilyIndex = queue_family;
 	queue_create_info.queueCount       = 1;
 	queue_create_info.pQueuePriorities = &queue_priority;
+	// KYTY_READBACK_COPY: one queue of the first transfer-only family (the copy engines: no graphics,
+	// compute, video decode 0x20, video encode 0x40 or optical flow 0x100 bit). Off: one queue as before.
+	std::array<vk::DeviceQueueCreateInfo, 2> queue_create_infos {queue_create_info, vk::DeviceQueueCreateInfo {}};
+	uint32_t                                 queue_create_count = 1;
+	if (ReadbackCopyRequested()) {
+		const auto families = physical_device.getQueueFamilyProperties();
+		constexpr VkQueueFlags engines =
+		    VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | 0x20u | 0x40u | 0x100u;
+		for (uint32_t i = 0; i < families.size(); i++) {
+			const auto flags = static_cast<VkQueueFlags>(families[i].queueFlags);
+			if ((flags & VK_QUEUE_TRANSFER_BIT) != 0u && (flags & engines) == 0u && i != queue_family) {
+				graphics.readback_queue_family = i;
+				break;
+			}
+		}
+		if (graphics.readback_queue_family != static_cast<uint32_t>(-1)) {
+			auto& info            = queue_create_infos[queue_create_count++];
+			info.queueFamilyIndex = graphics.readback_queue_family;
+			info.queueCount       = 1;
+			info.pQueuePriorities = &queue_priority;
+			LOGF("ReadbackCopy: transfer-only queue family %u requested\n", graphics.readback_queue_family);
+		} else {
+			LOGF("ReadbackCopy: requested, but the device has no transfer-only queue family; staying off\n");
+		}
+	}
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.colorWriteEnable = VK_TRUE;
@@ -733,8 +759,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		create_info.pNext                            = &executable_properties;
 		LOGF("Vulkan pipeline executable statistics enabled\n");
 	}
-	create_info.pQueueCreateInfos       = &queue_create_info;
-	create_info.queueCreateInfoCount    = 1;
+	create_info.pQueueCreateInfos       = queue_create_infos.data();
+	create_info.queueCreateInfoCount    = queue_create_count;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
 	create_info.ppEnabledExtensionNames = device_extensions.data();
 	create_info.pEnabledFeatures        = &device_features;
@@ -1204,6 +1230,10 @@ void WindowContext::CreateVulkan() {
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	if (graphic_ctx.readback_queue_family != static_cast<uint32_t>(-1)) {
+		graphic_ctx.device.getQueue(graphic_ctx.readback_queue_family, 0, &graphic_ctx.readback_queue);
+		EXIT_IF(graphic_ctx.readback_queue == nullptr);
+	}
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");

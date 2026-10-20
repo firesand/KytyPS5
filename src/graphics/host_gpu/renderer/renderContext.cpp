@@ -362,9 +362,10 @@ struct FaultSampler {
 			for (uint32_t phase = 0; phase < ReadbackSplitProbe::PhaseCount; ++phase) {
 				line += fmt::format(" {} {:.1f}", ReadbackSplitProbe::kPhaseNames[phase], fms(rs.ns[phase]));
 			}
-			line += fmt::format("; bar {} ({} KiB) copy {} ({} KiB)", rs.calls[ReadbackSplitProbe::Bar],
+			line += fmt::format("; bar {} ({} KiB) copy {} ({} KiB) queue {} ({} KiB)", rs.calls[ReadbackSplitProbe::Bar],
 			                    rs.bytes[ReadbackSplitProbe::Bar] >> 10, rs.calls[ReadbackSplitProbe::Copy],
-			                    rs.bytes[ReadbackSplitProbe::Copy] >> 10);
+			                    rs.bytes[ReadbackSplitProbe::Copy] >> 10, rs.calls[ReadbackSplitProbe::Queue],
+			                    rs.bytes[ReadbackSplitProbe::Queue] >> 10);
 			const auto top = ReadbackTopProbe::Take();
 			line += " | readback-top range (read span) readbacks/KiB/ms:";
 			for (size_t i = 0; i < top.count; ++i) {

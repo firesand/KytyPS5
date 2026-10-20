@@ -4562,6 +4562,143 @@ public:
     std::printf("[gpu]     %-32s ok (readback %s)\n", name, path);
   }
 
+  // KYTY_READBACK_COPY (ReadbackCopier), run with the flag off and on:
+  // - game buffers are concurrent exactly when the transfer readback queue exists (exclusive when off);
+  // - a readback of finished GPU writes takes the transfer-queue copy (path queue) with the flag on,
+  //   and the BAR read with it off;
+  // - one whose writes are still open keeps the queue-0 copy path either way (the finished-producer
+  //   gate);
+  // - two ranges in one readback come back through the packed staging;
+  // - a readback larger than the staging falls back to BAR.
+  // The guest gets the GPU-written bytes on every path.
+  void CheckReadbackCopy() {
+    constexpr const char *name = "ReadbackCopy";
+    using Libs::Graphics::ReadbackSplitProbe;
+    if (!Libs::Graphics::ProbeEnabled::Get()) {
+      std::printf("[gpu]     %-32s SKIP KYTY_PROBE_FAULT_HISTOGRAM off\n", name);
+      return;
+    }
+    constexpr uintptr_t base = 0x000000020ac00000ull;
+    constexpr uint64_t allocation_size = 0x1000000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+
+    EnsureRuntimeContext();
+    const bool copy_active = Libs::Graphics::ReadbackCopyRequested() && m_runtime_context.readback_queue != nullptr;
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "readback-copy direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "readback-copy fixed direct-memory mapping failed");
+    std::memset(reinterpret_cast<void *>(base), 0x3c, allocation_size);
+
+    bool host_visible = false;
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      // A GPU fill: the written binding takes GPU ownership (FillBuffer fills untracked memory on
+      // the CPU).
+      const auto gpu_fill = [&](uint64_t offset, uint64_t size, uint32_t value) {
+        (void)cache.ObtainBuffer(base + offset, size, true, false);
+        cache.FillBuffer(base + offset, size, value, false);
+      };
+      const auto paths = [] {
+        const auto split = ReadbackSplitProbe::Take();
+        return std::array<uint64_t, 3>{split.calls[ReadbackSplitProbe::Bar], split.calls[ReadbackSplitProbe::Copy],
+                                       split.calls[ReadbackSplitProbe::Queue]};
+      };
+      const auto check_words = [&](uint64_t offset, uint64_t size, uint32_t value) {
+        std::vector<uint32_t> words(size / sizeof(uint32_t));
+        Require(name, "read guest",
+                Libs::LibKernel::Memory::TryReadBacking(base + offset, words.data(), size),
+                "the guest backing could not be read");
+        for (const auto word : words) {
+          Require(name, "bytes", word == value, "a readback did not publish the expected bytes");
+        }
+      };
+
+      // 1. Sharing mode of a game buffer.
+      const auto obtained = cache.ObtainBuffer(base + 0x10000, 0x1000, true, false);
+      Require(name, "sharing", obtained.first != nullptr && obtained.first->IsConcurrent() == copy_active,
+              "a game buffer's sharing mode does not follow the readback queue");
+      host_visible = !obtained.first->Mapped().empty();
+
+      // 2. Finished producer: the transfer-queue copy (flag on) or the BAR read (flag off).
+      gpu_fill(0x10000, 0x8000, 0x11111111u);
+      scheduler.Finish();
+      (void)paths();
+      cache.ReadMemory(base + 0x10000, 0x8000);
+      auto p = paths();
+      Require(name, "finished producer path",
+              host_visible ? (copy_active ? p[2] == 1 && p[0] == 0 : p[0] == 1 && p[2] == 0) : p[1] == 1,
+              "a readback of finished writes took the wrong path");
+      check_words(0x10000, 0x8000, 0x11111111u);
+
+      // 3. Open producer: the queue-0 copy path, never the transfer queue.
+      gpu_fill(0x20000, 0x4000, 0x22222222u);
+      (void)paths();
+      cache.ReadMemory(base + 0x20000, 0x4000);
+      p = paths();
+      Require(name, "open producer path", p[1] == 1 && p[0] == 0 && p[2] == 0,
+              "a readback of unsubmitted writes did not take the queue-0 copy path");
+      check_words(0x20000, 0x4000, 0x22222222u);
+
+      // 4. Two ranges in one readback (the page between them is not GPU-written). One buffer covers all
+      // three pages first, so the readback joins nothing (an open join copy would fail the gate).
+      (void)cache.ObtainBuffer(base + 0x30000, 0x3000, false, false);
+      scheduler.Finish();
+      gpu_fill(0x30000, 0x1000, 0x33333333u);
+      gpu_fill(0x32000, 0x1000, 0x44444444u);
+      scheduler.Finish();
+      (void)paths();
+      cache.ReadMemory(base + 0x30000, 0x3000);
+      p = paths();
+      Require(name, "two-range path",
+              host_visible ? (copy_active ? p[2] == 1 : p[0] == 1) : p[1] == 1,
+              "a two-range readback took the wrong path");
+      check_words(0x30000, 0x1000, 0x33333333u);
+      check_words(0x31000, 0x1000, 0x3c3c3c3cu);
+      check_words(0x32000, 0x1000, 0x44444444u);
+
+      // 5. Larger than the 4 MiB staging: the BAR read.
+      gpu_fill(0x400000, 0x500000, 0x55555555u);
+      scheduler.Finish();
+      (void)paths();
+      cache.ReadMemory(base + 0x400000, 0x500000);
+      p = paths();
+      Require(name, "over-capacity path", host_visible ? p[0] == 1 && p[2] == 0 : p[1] == 1,
+              "a readback larger than the staging did not fall back");
+      check_words(0x400000, 0x500000, 0x55555555u);
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "readback-copy direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "readback-copy direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok (readback copy %s, cache buffers %s)\n", name,
+                copy_active ? "on" : "off", host_visible ? "host-visible" : "device-only");
+  }
+
   void CheckBufferCacheDirtyGarbageCollection() {
     constexpr const char *name = "BufferCacheDirtyGarbageCollection";
     constexpr uintptr_t base = 0x0000000200700000ull;
@@ -21555,6 +21692,8 @@ private:
     m_runtime_context.physical_device_memory_properties = m_memory_properties;
     m_runtime_context.queue_family = m_queue_family;
     m_runtime_context.queue = m_queue;
+    m_runtime_context.readback_queue_family = m_readback_queue_family;
+    m_runtime_context.readback_queue = m_readback_queue;
     m_runtime_context.shader_image_int64_atomics_enabled = true;
     m_runtime_context.external_memory_host_enabled = m_host_memory_ext;
     m_runtime_context.min_imported_host_pointer_alignment = m_host_pointer_alignment;
@@ -21810,10 +21949,33 @@ private:
     queue_info.queueCount = 1;
     queue_info.pQueuePriorities = &priority;
 
+    // KYTY_READBACK_COPY (ReadbackCopier): one queue of the first transfer-only family, as
+    // VulkanCreateDevice requests it. Off: the device is unchanged.
+    std::array<vk::DeviceQueueCreateInfo, 2> queue_infos{queue_info, vk::DeviceQueueCreateInfo{}};
+    uint32_t queue_info_count = 1;
+    if (Libs::Graphics::ReadbackCopyRequested()) {
+      const auto queue_families = m_physical_device.getQueueFamilyProperties();
+      constexpr VkQueueFlags engines = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | 0x20u | 0x40u | 0x100u;
+      for (u32 i = 0; i < queue_families.size(); i++) {
+        const auto flags = static_cast<VkQueueFlags>(queue_families[i].queueFlags);
+        if ((flags & VK_QUEUE_TRANSFER_BIT) != 0u && (flags & engines) == 0u && i != m_queue_family) {
+          m_readback_queue_family = i;
+          break;
+        }
+      }
+      if (m_readback_queue_family != UINT32_MAX) {
+        auto &info = queue_infos[queue_info_count++];
+        info.sType = vk::StructureType::eDeviceQueueCreateInfo;
+        info.queueFamilyIndex = m_readback_queue_family;
+        info.queueCount = 1;
+        info.pQueuePriorities = &priority;
+      }
+    }
+
     vk::DeviceCreateInfo device_info{};
     device_info.sType = vk::StructureType::eDeviceCreateInfo;
-    device_info.queueCreateInfoCount = 1;
-    device_info.pQueueCreateInfos = &queue_info;
+    device_info.queueCreateInfoCount = queue_info_count;
+    device_info.pQueueCreateInfos = queue_infos.data();
     auto device_features11 = WindowContext::RequiredVulkan11Features();
     auto device_features12 = WindowContext::RequiredVulkan12Features();
     device_features12.shaderSharedInt64Atomics = true;
@@ -21923,6 +22085,9 @@ private:
               "vkCreateDevice");
     VULKAN_HPP_DEFAULT_DISPATCHER.init(m_device);
     m_device.getQueue(m_queue_family, 0, &m_queue);
+    if (m_readback_queue_family != UINT32_MAX) {
+      m_device.getQueue(m_readback_queue_family, 0, &m_readback_queue);
+    }
 
     vk::CommandPoolCreateInfo pool_info{};
     pool_info.sType = vk::StructureType::eCommandPoolCreateInfo;
@@ -22238,6 +22403,8 @@ private:
   vk::Queue m_queue = nullptr;
   vk::CommandPool m_command_pool = nullptr;
   u32 m_queue_family = 0;
+  u32 m_readback_queue_family = UINT32_MAX; // KYTY_READBACK_COPY only
+  vk::Queue m_readback_queue = nullptr;
   vk::PhysicalDeviceMemoryProperties m_memory_properties{};
   Buffer m_bda_pagetable_buffer;
   Buffer m_fault_buffer;
@@ -48603,6 +48770,7 @@ int main(int argc, char **argv) {
     vulkan.CheckBarReadbackBytes();
     vulkan.CheckImageSyncStamp();
     vulkan.CheckReadbackCounters();
+    vulkan.CheckReadbackCopy();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--op-split-only") == 0) {

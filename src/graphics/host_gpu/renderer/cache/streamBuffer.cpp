@@ -2,6 +2,7 @@
 #include "graphics/host_gpu/hostReadStats.h"
 #include "graphics/host_gpu/renderer/gpuTimestamps.h"
 #include <cstdlib>
+#include <array>
 #include <atomic>
 
 #include "common/logging/log.h"
@@ -74,6 +75,17 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	vk::BufferCreateInfo buffer_info {};
 	buffer_info.size        = size;
 	buffer_info.usage       = flags;
+	// KYTY_READBACK_COPY: game buffers are also read by the transfer-only readback queue
+	// (ReadbackCopier); concurrent sharing avoids an ownership transfer, which would need a queue-0
+	// submit per copy. Without the readback queue: exclusive, as before.
+	const std::array<uint32_t, 2> sharing_families {graphics.queue_family, graphics.readback_queue_family};
+	m_concurrent = usage == MemoryUsage::DeviceLocal && cpu_address != 0 && graphics.readback_queue != nullptr &&
+	               graphics.readback_queue_family != graphics.queue_family;
+	if (m_concurrent) {
+		buffer_info.sharingMode           = vk::SharingMode::eConcurrent;
+		buffer_info.queueFamilyIndexCount = static_cast<uint32_t>(sharing_families.size());
+		buffer_info.pQueueFamilyIndices   = sharing_families.data();
+	}
 
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
 	VmaAllocationCreateInfo allocation_info {};

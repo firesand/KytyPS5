@@ -635,13 +635,16 @@ struct BarrierProbe {
 //   bar-read  the uncached read of host-visible device memory (CopyFromWriteCombined)
 //   backing   writing the guest backing (BAR loop, the copy path's publish)
 //   tracker   page state (download ranges, pending GPU marks, Unmark/Mark)
+//   copy-queue  KYTY_READBACK_COPY: the transfer-queue copy replacing bar-read (record, submit, wait,
+//             staging -> guest backing)
 //   other     everything else (buffer lookup, copy recording)
 struct ReadbackSplitProbe {
-	enum Phase : uint32_t { Other = 0, Prepare, Images, BarRead, Backing, Tracker, PhaseCount };
-	static constexpr auto kPhaseNames =
-	    std::to_array<const char*>({"other", "prepare", "images", "bar-read", "backing", "tracker"});
+	enum Phase : uint32_t { Other = 0, Prepare, Images, BarRead, Backing, Tracker, CopyQueue, PhaseCount };
+	static constexpr auto kPhaseNames = std::to_array<const char*>(
+	    {"other", "prepare", "images", "bar-read", "backing", "tracker", "copy-queue"});
 	static_assert(kPhaseNames.size() == PhaseCount, "ReadbackSplitProbe phase / name table mismatch");
-	enum Path : uint32_t { Bar = 0, Copy, PathCount };
+	// Bar: BAR read; Copy: the queue-0 copy path; Queue: the KYTY_READBACK_COPY transfer-queue copy.
+	enum Path : uint32_t { Bar = 0, Copy, Queue, PathCount };
 	struct Snapshot {
 		std::array<uint64_t, PhaseCount> ns {};
 		std::array<uint64_t, PathCount>  calls {};

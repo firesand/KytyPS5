@@ -6,6 +6,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <tuple>
@@ -17,6 +18,17 @@ namespace Libs::Graphics {
 struct VulkanImage;
 
 inline constexpr uint32_t VULKAN_TARGET_API_VERSION = VK_API_VERSION_1_3;
+
+// KYTY_READBACK_COPY=1 (default off): device creation adds a queue of the first transfer-only family,
+// game buffers become concurrent between it and the main family, and guest-fault readbacks of finished
+// GPU writes are copied on it (ReadbackCopier). Off (unset or any other value): the device is unchanged.
+inline bool ReadbackCopyRequested() noexcept {
+	static const bool requested = [] {
+		const char* value = std::getenv("KYTY_READBACK_COPY");
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
+	}();
+	return requested;
+}
 
 struct GraphicContext {
 	vk::Instance                       instance                              = nullptr;
@@ -52,6 +64,10 @@ struct GraphicContext {
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
+	// KYTY_READBACK_COPY only: the transfer-only queue ReadbackCopier submits to (one user, the GPU
+	// thread, so no mutex); null otherwise.
+	uint32_t                           readback_queue_family = static_cast<uint32_t>(-1);
+	vk::Queue                          readback_queue        = nullptr;
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;

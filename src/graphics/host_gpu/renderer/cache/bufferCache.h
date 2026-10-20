@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/gpuWriteTicks.h"
 #include "graphics/host_gpu/renderer/cache/hostResidentMemory.h"
+#include "graphics/host_gpu/renderer/cache/readbackCopier.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
@@ -370,6 +371,7 @@ private:
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
 	std::unique_ptr<HostResidentMemory>               m_host_resident;
+	std::unique_ptr<ReadbackCopier>                   m_readback_copier; // KYTY_READBACK_COPY only
 	TextureCache&                                     m_texture_cache;
 	RangeSet                                          m_write_fault_ranges;
 	bool                                              m_write_faults_dirty = false;
