@@ -2343,7 +2343,12 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 		}
 	}
 	buffer.last_gpu_write_tick = m_scheduler.CurrentTick(); // the image->buffer copy recorded below
+	const auto copied_address  = image.info.data.address;
 	m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, std::move(transfer));
+	// TryBarReadback decides on page stamps and ready_tick, not on last_gpu_write_tick: stamp the
+	// copied pages, or a guest fault on them before the copy lands reads the old bytes over BAR.
+	// Taken after the recording, so a submit inside it cannot leave the stamp a tick early.
+	NoteGpuWrite(copied_address, copy_size, m_scheduler.CurrentTick());
 	return true;
 }
 
