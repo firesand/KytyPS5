@@ -4502,17 +4502,21 @@ public:
       }
       const auto bar = split.calls[ReadbackSplitProbe::Bar];
       const auto copy = split.calls[ReadbackSplitProbe::Copy];
-      path = bar != 0 ? "bar" : copy != 0 ? "copy" : "?";
+      const auto queue = split.calls[ReadbackSplitProbe::Queue]; // KYTY_READBACK_COPY: replaces bar
+      const auto finished = bar + queue; // BAR read or transfer-queue copy: both recorded in readback-top
+      path = bar != 0 ? "bar" : queue != 0 ? "queue" : copy != 0 ? "copy" : "?";
       // The phases partition the readback's exclusive time; allow clock reads between the scopes.
       Require(name, "readback split",
               phases != 0 && phases <= readback.exclusive_ns + 1000 &&
-                  phases + 50000 >= readback.exclusive_ns && bar + copy == 1 &&
-                  split.bytes[ReadbackSplitProbe::Bar] + split.bytes[ReadbackSplitProbe::Copy] >=
+                  phases + 50000 >= readback.exclusive_ns && bar + copy + queue == 1 &&
+                  split.bytes[ReadbackSplitProbe::Bar] + split.bytes[ReadbackSplitProbe::Copy] +
+                          split.bytes[ReadbackSplitProbe::Queue] >=
                       fill_size &&
-                  (bar == 0 || split.ns[ReadbackSplitProbe::BarRead] != 0),
+                  (bar == 0 || split.ns[ReadbackSplitProbe::BarRead] != 0) &&
+                  (queue == 0 || split.ns[ReadbackSplitProbe::CopyQueue] != 0),
               "the readback phases did not add up, or the path or its bytes were not counted");
       Require(name, "readback top",
-              bar == 0 || (top.count == 1 && top.top[0].readbacks == 1 &&
+              finished == 0 || (top.count == 1 && top.top[0].readbacks == 1 &&
                            top.top[0].begin <= base + fill_offset &&
                            top.top[0].end >= base + fill_offset + fill_size &&
                            top.top[0].read_begin == base + fill_offset &&
@@ -4523,7 +4527,7 @@ public:
               "the guest thread's SendCommandSync wait or the command's run time was not counted");
       // The next window watches the top range: one written and one read shader bind of it count; a
       // cache-internal bind, a bind the stream buffer serves and a bind outside the range do not.
-      if (bar != 0) {
+      if (finished != 0) {
         Require(name, "stream-served page",
                 context.HandleFault(PageFaultAccess::Write, base + fill_offset + 0x7000),
                 "a write fault on a clean page was not handled");
@@ -4584,6 +4588,10 @@ public:
 
     EnsureRuntimeContext();
     const bool copy_active = Libs::Graphics::ReadbackCopyRequested() && m_runtime_context.readback_queue != nullptr;
+    // Requested on a device with a transfer-only family: the queue must exist (no silent BAR fallback).
+    Require(name, "readback queue",
+            !Libs::Graphics::ReadbackCopyRequested() || m_readback_queue_family == UINT32_MAX || copy_active,
+            "KYTY_READBACK_COPY=1 on a device with a transfer-only family, but no readback queue");
     RenderContext context(m_runtime_context);
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};

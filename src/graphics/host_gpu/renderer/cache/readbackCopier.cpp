@@ -45,8 +45,8 @@ ReadbackCopier::ReadbackCopier(GraphicContext& graphics, CommandScheduler& sched
 	vk::SemaphoreCreateInfo semaphore_info {};
 	semaphore_info.pNext = &type_info;
 	EXIT_NOT_IMPLEMENTED(graphics.device.createSemaphore(&semaphore_info, nullptr, &m_done) != vk::Result::eSuccess);
-	LOGF("ReadbackCopy: enabled, transfer queue family %u, %" PRIu64 " KiB host-%s staging\n",
-	     graphics.readback_queue_family, kStagingBytes >> 10u, m_staging->IsCoherent() ? "coherent" : "cached");
+	LOGF("ReadbackCopy: enabled, transfer queue family %u, %" PRIu64 " KiB staging (host random access, %s)\n",
+	     graphics.readback_queue_family, kStagingBytes >> 10u, m_staging->IsCoherent() ? "coherent" : "non-coherent");
 }
 
 ReadbackCopier::~ReadbackCopier() {
@@ -127,13 +127,24 @@ bool ReadbackCopier::Copy(const Buffer& source, uint64_t cpu_address, std::span<
 		if (value >= signal_value || std::chrono::steady_clock::now() >= spin_until) break;
 	}
 	if (value < signal_value) {
+		// Block in 1 s slices: a copy that never completes is reported (device fault, then exit)
+		// instead of freezing the GPU thread out of reach of the master semaphore's watchdog.
 		vk::SemaphoreWaitInfo wait {};
 		wait.semaphoreCount = 1;
 		wait.pSemaphores    = &m_done;
 		wait.pValues        = &signal_value;
-		const auto waited   = device.waitSemaphores(&wait, UINT64_MAX);
-		if (waited != vk::Result::eSuccess) {
-			EXIT("ReadbackCopy: vkWaitSemaphores failed: %s\n", vk::to_string(waited).c_str());
+		for (int seconds = 1;; seconds++) {
+			const auto waited = device.waitSemaphores(&wait, 1000000000ull);
+			if (waited == vk::Result::eSuccess) break;
+			if (waited != vk::Result::eTimeout) {
+				ReportDeviceFault(device, m_graphics.readback_queue);
+				EXIT("ReadbackCopy: vkWaitSemaphores failed: %s\n", vk::to_string(waited).c_str());
+			}
+			LOGF("ReadbackCopy: transfer copy %" PRIu64 " not complete after %d s\n", signal_value, seconds);
+			if (seconds >= 10) {
+				ReportDeviceFault(device, m_graphics.readback_queue);
+				EXIT("ReadbackCopy: transfer copy did not complete in 10 s\n");
+			}
 		}
 	}
 
