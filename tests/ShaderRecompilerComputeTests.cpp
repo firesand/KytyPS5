@@ -4570,11 +4570,16 @@ public:
   // - game buffers are concurrent exactly when the transfer readback queue exists (exclusive when off);
   // - a readback of finished GPU writes takes the transfer-queue copy (path queue) with the flag on,
   //   and the BAR read with it off;
-  // - one whose writes are still open keeps the queue-0 copy path either way (the finished-producer
-  //   gate);
+  // - after the GPU rewrites a range, a second readback returns the new bytes, not staging leftovers;
+  // - one whose writes are still open, or submitted but not complete, keeps the queue-0 copy path
+  //   either way (the finished-producer gate);
   // - two ranges in one readback come back through the packed staging;
   // - a readback larger than the staging falls back to BAR.
-  // The guest gets the GPU-written bytes on every path.
+  // The guest gets the GPU-written bytes on every path. Not tested: the staging Invalidate for
+  // non-coherent memory. This device has no non-coherent host-visible type (all of 2, 3, 4 are
+  // HOST_COHERENT), and Buffer::Invalidate and vmaInvalidateAllocation are no-ops on coherent memory, so
+  // a forcing hook would run nothing real. The call is the same one the queue-0 copy path makes on its
+  // Download staging (DownloadBufferMemory's publish).
   void CheckReadbackCopy() {
     constexpr const char *name = "ReadbackCopy";
     using Libs::Graphics::ReadbackSplitProbe;
@@ -4657,6 +4662,18 @@ public:
               "a readback of finished writes took the wrong path");
       check_words(0x10000, 0x8000, 0x11111111u);
 
+      // 2b. The GPU rewrites the same range after that readback: the second readback, on the same path,
+      // must return the new bytes, not what the staging held from the first.
+      gpu_fill(0x10000, 0x8000, 0x12121212u);
+      scheduler.Finish();
+      (void)paths();
+      cache.ReadMemory(base + 0x10000, 0x8000);
+      p = paths();
+      Require(name, "rewrite path",
+              host_visible ? (copy_active ? p[2] == 1 && p[0] == 0 : p[0] == 1 && p[2] == 0) : p[1] == 1,
+              "the second readback of a rewritten range took the wrong path");
+      check_words(0x10000, 0x8000, 0x12121212u);
+
       // 3. Open producer: the queue-0 copy path, never the transfer queue.
       gpu_fill(0x20000, 0x4000, 0x22222222u);
       (void)paths();
@@ -4665,6 +4682,34 @@ public:
       Require(name, "open producer path", p[1] == 1 && p[0] == 0 && p[2] == 0,
               "a readback of unsubmitted writes did not take the queue-0 copy path");
       check_words(0x20000, 0x4000, 0x22222222u);
+
+      // 3b. Submitted but not complete: ~16 GiB of fills recorded ahead of the producer (tens of ms of
+      // GPU work) keep its tick in flight when the readback runs right after the submit. The gate
+      // refuses (classification in flight), and the queue-0 copy path waits for the producer.
+      {
+        Libs::Graphics::Buffer busy(m_runtime_context, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
+                                    256ull << 20);
+        auto &command = scheduler.Current();
+        command.EndRendering();
+        const auto native = command.Handle();
+        for (u32 i = 0; i < 64; i++) {
+          native.fillBuffer(busy.Handle(), 0, 256ull << 20, i);
+        }
+        gpu_fill(0x50000, 0x4000, 0x66666666u);
+        scheduler.Flush(); // submitted, not waited for
+        (void)paths();
+        (void)Libs::Graphics::ReadbackProbe::Take();
+        cache.ReadMemory(base + 0x50000, 0x4000);
+        p = paths();
+        const auto classified = Libs::Graphics::ReadbackProbe::Take();
+        const auto &k = classified[Libs::Graphics::WaitReasonProbe::Download];
+        Require(name, "in-flight producer path",
+                p[1] == 1 && p[0] == 0 && p[2] == 0 &&
+                    (!host_visible || k[Libs::Graphics::ReadbackProbe::CopyInFlight] == 1),
+                "a readback of submitted but incomplete writes did not take the queue-0 copy path");
+        check_words(0x50000, 0x4000, 0x66666666u);
+        scheduler.Finish(); // the fills finish before `busy` is destroyed
+      }
 
       // 4. Two ranges in one readback (the page between them is not GPU-written). One buffer covers all
       // three pages first, so the readback joins nothing (an open join copy would fail the gate).
